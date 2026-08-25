@@ -3,10 +3,12 @@
 #include "network-monitor.hpp"
 
 #include <obs.h>
+#include <obs-encoder.h>
 #include <obs-frontend-api.h>
 
 #include <QCheckBox>
 #include <QAbstractItemView>
+#include <QComboBox>
 #include <QFormLayout>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -25,11 +27,88 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 extern "C" std::uint64_t srtla_output_link_id(const char *adapter_id);
 extern "C" int srtla_output_set_link_enabled(struct obs_output *output, std::uint64_t link_id, bool enabled);
 extern "C" int srtla_output_update_adapters(struct obs_output *output);
 extern "C" std::size_t srtla_output_copy_stats_json(struct obs_output *output, char *buffer, std::size_t capacity);
+
+namespace {
+
+bool is_supported_video_codec(const char *codec)
+{
+	return codec && (strcmp(codec, "h264") == 0 || strcmp(codec, "hevc") == 0);
+}
+
+bool is_supported_audio_codec(const char *codec)
+{
+	return codec && (strcmp(codec, "aac") == 0 || strcmp(codec, "opus") == 0);
+}
+
+void add_encoder_choices(QComboBox *combo, enum obs_encoder_type type)
+{
+	for (size_t index = 0;; ++index) {
+		const char *id = nullptr;
+		if (!obs_enum_encoder_types(index, &id))
+			break;
+		if (!id || obs_get_encoder_type(id) != type)
+			continue;
+		const char *codec = obs_get_encoder_codec(id);
+		if ((type == OBS_ENCODER_VIDEO && !is_supported_video_codec(codec)) ||
+		    (type == OBS_ENCODER_AUDIO && !is_supported_audio_codec(codec)))
+			continue;
+		const char *display_name = obs_encoder_get_display_name(id);
+		combo->addItem(QString::fromUtf8(display_name && *display_name ? display_name : id),
+			QString::fromUtf8(id));
+	}
+}
+
+void select_combo_data(QComboBox *combo, const QString &value)
+{
+	if (!value.isEmpty()) {
+		const int index = combo->findData(value);
+		if (index >= 0)
+			combo->setCurrentIndex(index);
+	}
+}
+
+obs_output_t *get_encoder_source_output(const QString &source)
+{
+	if (source == QStringLiteral("recording"))
+		return obs_frontend_get_recording_output();
+	return obs_frontend_get_streaming_output();
+}
+
+obs_encoder_t *create_custom_video_encoder(const QString &id, int bitrate_kbps)
+{
+	const QByteArray encoder_id = id.toUtf8();
+	obs_data_t *settings = obs_encoder_defaults(encoder_id.constData());
+	if (!settings)
+		settings = obs_data_create();
+	obs_data_set_int(settings, "bitrate", bitrate_kbps);
+	obs_encoder_t *encoder = obs_video_encoder_create(encoder_id.constData(), "srtla_custom_video", settings, nullptr);
+	obs_data_release(settings);
+	if (encoder)
+		obs_encoder_set_video(encoder, obs_get_video());
+	return encoder;
+}
+
+obs_encoder_t *create_custom_audio_encoder(const QString &id, int bitrate_kbps)
+{
+	const QByteArray encoder_id = id.toUtf8();
+	obs_data_t *settings = obs_encoder_defaults(encoder_id.constData());
+	if (!settings)
+		settings = obs_data_create();
+	obs_data_set_int(settings, "bitrate", bitrate_kbps);
+	obs_encoder_t *encoder = obs_audio_encoder_create(encoder_id.constData(), "srtla_custom_audio", settings, 0, nullptr);
+	obs_data_release(settings);
+	if (encoder)
+		obs_encoder_set_audio(encoder, obs_get_audio());
+	return encoder;
+}
+
+} // namespace
 
 SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 {
@@ -38,6 +117,14 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	auto *controls = new QFormLayout();
 	startStop_ = new QPushButton(tr("Start"), this);
 	url_ = new QLineEdit(QStringLiteral("srtla://receiver.example:5000"), this);
+	encoderSource_ = new QComboBox(this);
+	encoderSource_->addItem(tr("Streaming"), QStringLiteral("streaming"));
+	encoderSource_->addItem(tr("Recording"), QStringLiteral("recording"));
+	encoderSource_->addItem(tr("Custom"), QStringLiteral("custom"));
+	customVideoEncoder_ = new QComboBox(this);
+	add_encoder_choices(customVideoEncoder_, OBS_ENCODER_VIDEO);
+	customAudioEncoder_ = new QComboBox(this);
+	add_encoder_choices(customAudioEncoder_, OBS_ENCODER_AUDIO);
 	autoBitrate_ = new QCheckBox(tr("Auto bitrate"), this);
 	autoBitrate_->setChecked(true);
 	manualBitrate_ = new QSpinBox(this);
@@ -45,18 +132,31 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	manualBitrate_->setValue(1500);
 	manualBitrate_->setSuffix(tr(" kb/s"));
 	manualBitrate_->setEnabled(false);
+	maxBitrate_ = new QSpinBox(this);
+	maxBitrate_->setRange(500, 200000);
+	maxBitrate_->setValue(100000);
+	maxBitrate_->setSingleStep(50);
+	maxBitrate_->setSuffix(tr(" kb/s"));
 	state_ = new QLabel(tr("Idle"), this);
 	metrics_ = new QLabel(tr("Capacity: -- | Used: -- | Active links: 0"), this);
 	{
 		QSettings settings;
 		url_->setText(settings.value(QStringLiteral("obs-srtla/url"), url_->text()).toString());
+		select_combo_data(encoderSource_, settings.value(QStringLiteral("obs-srtla/encoder_source"), QStringLiteral("streaming")).toString());
+		select_combo_data(customVideoEncoder_, settings.value(QStringLiteral("obs-srtla/custom_video_encoder")).toString());
+		select_combo_data(customAudioEncoder_, settings.value(QStringLiteral("obs-srtla/custom_audio_encoder")).toString());
 		autoBitrate_->setChecked(settings.value(QStringLiteral("obs-srtla/auto_bitrate"), true).toBool());
 		manualBitrate_->setValue(settings.value(QStringLiteral("obs-srtla/bitrate"), 1500).toInt());
+		maxBitrate_->setValue(settings.value(QStringLiteral("obs-srtla/max_bitrate"), 100000).toInt());
 	}
 	controls->addRow(tr("State"), state_);
 	controls->addRow(tr("SRTLA URL"), url_);
+	controls->addRow(tr("Encoder"), encoderSource_);
+	controls->addRow(tr("Custom video encoder"), customVideoEncoder_);
+	controls->addRow(tr("Custom audio encoder"), customAudioEncoder_);
 	controls->addRow(tr("Bitrate"), autoBitrate_);
 	controls->addRow(tr("Manual"), manualBitrate_);
+	controls->addRow(tr("Maximum"), maxBitrate_);
 	layout->addLayout(controls);
 	layout->addWidget(metrics_);
 	layout->addWidget(startStop_);
@@ -87,6 +187,15 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 
 	connect(startStop_, &QPushButton::clicked, this, &SrtlaDock::toggleOutput);
 	connect(autoBitrate_, &QCheckBox::toggled, manualBitrate_, &QSpinBox::setDisabled);
+	connect(encoderSource_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+		const bool custom = encoderSource_->currentData().toString() == QStringLiteral("custom");
+		customVideoEncoder_->setEnabled(custom);
+		customAudioEncoder_->setEnabled(custom);
+	});
+	manualBitrate_->setEnabled(!autoBitrate_->isChecked());
+	const bool custom = encoderSource_->currentData().toString() == QStringLiteral("custom");
+	customVideoEncoder_->setEnabled(custom);
+	customAudioEncoder_->setEnabled(custom);
 	timer_ = new QTimer(this);
 	timer_->setInterval(1000);
 	connect(timer_, &QTimer::timeout, this, [this] {
@@ -152,17 +261,80 @@ void SrtlaDock::toggleOutput()
 		return;
 	}
 
-	// The dock is a real OBS output owner.  It uses the configured streaming
-	// encoders when available; OBS refuses a shared encoder that is already in
-	// use, which is the documented v1 safety rule.
 	if (!settings_)
 		settings_ = obs_data_create();
+
+	const QString encoder_source = encoderSource_->currentData().toString();
+	const bool custom_encoder = encoder_source == QStringLiteral("custom");
+	obs_output_t *source_output = nullptr;
+	obs_encoder_t *video_encoder = nullptr;
+	obs_encoder_t *audio_encoder = nullptr;
+
+	if (!custom_encoder) {
+		source_output = get_encoder_source_output(encoder_source);
+		if (!source_output) {
+			state_->setText(tr("Error: selected OBS output unavailable"));
+			return;
+		}
+		if (obs_output_active(source_output)) {
+			obs_output_release(source_output);
+			state_->setText(tr("Error: stop the selected OBS output first"));
+			return;
+		}
+		video_encoder = obs_output_get_video_encoder(source_output);
+		audio_encoder = obs_output_get_audio_encoder(source_output, 0);
+	} else {
+		const QString video_id = customVideoEncoder_->currentData().toString();
+		if (video_id.isEmpty()) {
+			state_->setText(tr("Error: no custom video encoder available"));
+			return;
+		}
+		video_encoder = create_custom_video_encoder(video_id, manualBitrate_->value());
+		if (!video_encoder) {
+			state_->setText(tr("Error: custom video encoder could not be created"));
+			return;
+		}
+		const QString audio_id = customAudioEncoder_->currentData().toString();
+		if (!audio_id.isEmpty())
+			audio_encoder = create_custom_audio_encoder(audio_id, 128);
+		if (!audio_id.isEmpty() && !audio_encoder) {
+			obs_encoder_release(video_encoder);
+			state_->setText(tr("Error: custom audio encoder could not be created"));
+			return;
+		}
+	}
+
+	if (!video_encoder || !is_supported_video_codec(obs_encoder_get_codec(video_encoder))) {
+		if (custom_encoder && video_encoder)
+			obs_encoder_release(video_encoder);
+		if (custom_encoder && audio_encoder)
+			obs_encoder_release(audio_encoder);
+		if (source_output)
+			obs_output_release(source_output);
+		state_->setText(tr("Error: selected video encoder is not supported"));
+		return;
+	}
+	if (audio_encoder && !is_supported_audio_codec(obs_encoder_get_codec(audio_encoder))) {
+		if (custom_encoder)
+			obs_encoder_release(video_encoder);
+		if (custom_encoder)
+			obs_encoder_release(audio_encoder);
+		if (source_output)
+			obs_output_release(source_output);
+		state_->setText(tr("Error: selected audio encoder is not supported"));
+		return;
+	}
+
 	obs_data_set_string(settings_, "url", url_->text().toUtf8().constData());
 	{
 		QSettings settings;
 		settings.setValue(QStringLiteral("obs-srtla/url"), url_->text());
+		settings.setValue(QStringLiteral("obs-srtla/encoder_source"), encoder_source);
+		settings.setValue(QStringLiteral("obs-srtla/custom_video_encoder"), customVideoEncoder_->currentData().toString());
+		settings.setValue(QStringLiteral("obs-srtla/custom_audio_encoder"), customAudioEncoder_->currentData().toString());
 		settings.setValue(QStringLiteral("obs-srtla/auto_bitrate"), autoBitrate_->isChecked());
 		settings.setValue(QStringLiteral("obs-srtla/bitrate"), manualBitrate_->value());
+		settings.setValue(QStringLiteral("obs-srtla/max_bitrate"), maxBitrate_->value());
 	}
 	std::string enabled_links;
 	for (const auto &[id, enabled] : selected_) {
@@ -176,38 +348,38 @@ void SrtlaDock::toggleOutput()
 	obs_data_set_bool(settings_, "auto_bitrate", autoBitrate_->isChecked());
 	obs_data_set_int(settings_, "bitrate", manualBitrate_->value());
 	obs_data_set_int(settings_, "min_bitrate", 500);
-	obs_data_set_int(settings_, "max_bitrate", 100000);
+	obs_data_set_int(settings_, "max_bitrate", maxBitrate_->value());
 	obs_data_set_int(settings_, "audio_bitrate", 128);
 	obs_data_set_double(settings_, "safety_margin", 0.80);
 	obs_data_set_int(settings_, "latency_ms", 2000);
 	obs_data_set_int(settings_, "pbkeylen", 16);
 	obs_data_set_string(settings_, "scheduler", "enhanced");
-	// The dock attaches the current OBS stream encoders below, therefore this
-	// owner is explicitly the shared-encoder mode.  A future settings-only
-	// output can select dedicated encoders without changing the transport.
-	obs_data_set_string(settings_, "encoder_mode", "shared");
-	if (obs_output_t *main_output = obs_frontend_get_streaming_output()) {
-		if (obs_output_active(main_output)) {
-			obs_output_release(main_output);
-			state_->setText(tr("Error: stop the main stream first"));
-			return;
-		}
-		if (!output_)
-			output_ = obs_output_create("obs_srtla_output", "SRTLA Output", settings_, nullptr);
-		if (output_) {
-			if (auto *video = obs_output_get_video_encoder(main_output))
-				obs_output_set_video_encoder(output_, video);
-			if (auto *audio = obs_output_get_audio_encoder(main_output, 0))
-				obs_output_set_audio_encoder(output_, audio, 0);
-		}
-		obs_output_release(main_output);
-	} else if (!output_) {
+	obs_data_set_string(settings_, "encoder_source", encoder_source.toUtf8().constData());
+	obs_data_set_string(settings_, "encoder_mode", custom_encoder ? "dedicated" : "shared");
+	obs_data_set_string(settings_, "video_codec", obs_encoder_get_codec(video_encoder));
+	if (audio_encoder)
+		obs_data_set_string(settings_, "audio_codec", obs_encoder_get_codec(audio_encoder));
+
+	if (!output_)
 		output_ = obs_output_create("obs_srtla_output", "SRTLA Output", settings_, nullptr);
-	}
 	if (!output_) {
+		if (custom_encoder)
+			obs_encoder_release(video_encoder);
+		if (custom_encoder && audio_encoder)
+			obs_encoder_release(audio_encoder);
+		if (source_output)
+			obs_output_release(source_output);
 		state_->setText(tr("Error: OBS output unavailable"));
 		return;
 	}
+	obs_output_set_video_encoder(output_, video_encoder);
+	obs_output_set_audio_encoder(output_, audio_encoder, 0);
+	if (custom_encoder)
+		obs_encoder_release(video_encoder);
+	if (custom_encoder && audio_encoder)
+		obs_encoder_release(audio_encoder);
+	if (source_output)
+		obs_output_release(source_output);
 	obs_output_update(output_, settings_);
 	if (!obs_output_start(output_)) {
 		state_->setText(tr("Error: output start failed"));

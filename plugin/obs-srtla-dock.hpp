@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 class QCheckBox;
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -28,8 +29,12 @@ private:
 
 	QPushButton *startStop_ = nullptr;
 	QLineEdit *url_ = nullptr;
+	QComboBox *encoderSource_ = nullptr;
+	QComboBox *customVideoEncoder_ = nullptr;
+	QComboBox *customAudioEncoder_ = nullptr;
 	QCheckBox *autoBitrate_ = nullptr;
 	QSpinBox *manualBitrate_ = nullptr;
+	QSpinBox *maxBitrate_ = nullptr;
 	QLabel *state_ = nullptr;
 	QLabel *metrics_ = nullptr;
 	QTableWidget *links_ = nullptr;

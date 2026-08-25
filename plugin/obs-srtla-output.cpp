@@ -62,6 +62,7 @@ struct SrtlaOutput {
 	bool opus = false;
 	bool auto_bitrate = true;
 	bool shared_encoder = false;
+	std::string encoder_source = "streaming";
 	int manual_bitrate_kbps = 1500;
 	int min_bitrate_kbps = 500;
 	int max_bitrate_kbps = 100000;
@@ -284,6 +285,8 @@ static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 	data->auto_bitrate = !settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate");
 	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
 	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
+	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
+	data->encoder_source = encoder_source && *encoder_source ? encoder_source : "streaming";
 	data->manual_bitrate_kbps = settings && obs_data_has_user_value(settings, "bitrate") ? static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500;
 	data->min_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "min_bitrate")) : 500;
 	data->max_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "max_bitrate")) : 100000;
@@ -334,6 +337,8 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	data->auto_bitrate = !settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate");
 	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
 	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
+	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
+	data->encoder_source = encoder_source && *encoder_source ? encoder_source : "streaming";
 	data->manual_bitrate_kbps = settings && obs_data_has_user_value(settings, "bitrate") ? static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500;
 	data->min_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "min_bitrate")) : 500;
 	data->max_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "max_bitrate")) : 100000;
@@ -555,9 +560,11 @@ static bool srtla_output_start(void *opaque)
 	if (!data->output || !obs_output_get_video_encoder(data->output))
 		return false;
 	if (data->shared_encoder) {
-		if (auto *main_output = obs_frontend_get_streaming_output()) {
-			const bool busy = main_output != data->output && obs_output_active(main_output);
-			obs_output_release(main_output);
+		obs_output_t *source_output = data->encoder_source == "recording" ? obs_frontend_get_recording_output() :
+			obs_frontend_get_streaming_output();
+		if (source_output) {
+			const bool busy = source_output != data->output && obs_output_active(source_output);
+			obs_output_release(source_output);
 			if (busy)
 				return false;
 		}
@@ -672,6 +679,7 @@ static void srtla_output_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "safety_margin", 0.80);
 	obs_data_set_default_bool(settings, "auto_bitrate", true);
 	obs_data_set_default_string(settings, "encoder_mode", "dedicated");
+	obs_data_set_default_string(settings, "encoder_source", "streaming");
 	obs_data_set_default_string(settings, "audio_mix", "track_1");
 	obs_data_set_default_int(settings, "pbkeylen", 16);
 	obs_data_set_default_string(settings, "scheduler", "enhanced");
@@ -695,6 +703,10 @@ static obs_properties_t *srtla_output_properties(void *)
 	obs_properties_add_int(props, "audio_bitrate", "Audio bitrate (kb/s)", 32, 512, 8);
 	obs_properties_add_float(props, "safety_margin", "Safety margin", 0.50, 0.95, 0.01);
 	obs_properties_add_bool(props, "auto_bitrate", "Automatic bitrate");
+	auto *encoder_source = obs_properties_add_list(props, "encoder_source", "Encoder source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(encoder_source, "Streaming", "streaming");
+	obs_property_list_add_string(encoder_source, "Recording", "recording");
+	obs_property_list_add_string(encoder_source, "Custom", "custom");
 	auto *encoder_mode = obs_properties_add_list(props, "encoder_mode", "Encoder mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(encoder_mode, "Dedicated", "dedicated");
 	obs_property_list_add_string(encoder_mode, "Shared", "shared");
