@@ -1,0 +1,457 @@
+mod connections;
+mod housekeeping;
+mod packet_handler;
+mod rehome;
+mod reload;
+mod sequence;
+mod status;
+mod uplink;
+mod uplink_recv;
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow};
+// Re-export connection management functions for tests
+#[allow(unused_imports)]
+pub use connections::{
+    PendingConnectionChanges, apply_connection_changes, create_connections_from_ips,
+    recover_connection,
+};
+// Re-export public items used by tests
+#[allow(unused_imports)]
+pub use housekeeping::{GLOBAL_TIMEOUT_MS, handle_housekeeping};
+use packet_handler::handle_srt_packet;
+// Re-exported for the NAK-attribution conformance tests so they drive the real
+// production path rather than a mirrored copy.
+#[allow(unused_imports)]
+pub(crate) use packet_handler::{attribute_nak, process_connection_events};
+pub use packet_handler::{
+    drain_packet_queue, flush_all_batches, handle_srt_datagram, handle_uplink_packet,
+};
+// Scripted resolver seam for tests that drive the re-home trigger policy.
+#[cfg(any(test, feature = "test-internals"))]
+pub use rehome::StubResolver;
+#[allow(unused_imports)]
+pub use rehome::{REHOME_MIN_INTERVAL_MS, ReceiverResolver, RehomeGate};
+#[allow(unused_imports)]
+pub use sequence::{SEQ_TRACKING_SIZE, SEQUENCE_TRACKING_MAX_AGE_MS, SequenceTracker};
+use smallvec::SmallVec;
+use srtla_core::registration::SrtlaRegistrationManager;
+use status::log_connection_status;
+use tokio::net::UdpSocket;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::time::{self, Duration, Instant};
+use tracing::{debug, info, warn};
+// `ConnIo` is constructed only by tests (production builds it inside
+// `connections::connect_uplink`); re-export it just for the test surface.
+#[cfg(any(test, feature = "test-internals"))]
+pub use uplink::ConnIo;
+use uplink::ConnectionId;
+pub use uplink::{ConnIoMap, ReaderHandle, create_uplink_channel, sync_readers};
+// Re-exported so the handshake-sniffing tests drive the real receive path.
+#[allow(unused_imports)]
+pub(crate) use uplink_recv::process_uplink_packet;
+
+use crate::config::DynamicConfig;
+use crate::stats::SharedStats;
+
+pub const HOUSEKEEPING_INTERVAL_MS: u64 = 1000;
+const STATUS_LOG_INTERVAL_MS: u64 = 30_000;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sender_with_config(
+    local_srt_port: u16,
+    receiver_host: &str,
+    receiver_port: u16,
+    ips_file: &str,
+    config: DynamicConfig,
+    shared_stats: SharedStats,
+    critical_window: srtla_core::priority::CriticalWindow,
+    subscription_hub: crate::subscriptions::SubscriptionHub,
+    binder: std::sync::Arc<dyn crate::net::UplinkBinder>,
+) -> Result<()> {
+    info!(
+        "starting srtla_send: local_srt_port={}, receiver={}:{}, ips_file={}, mode={}",
+        local_srt_port,
+        receiver_host,
+        receiver_port,
+        ips_file,
+        config.mode()
+    );
+    // Bind the local SRT listener FIRST, ahead of reading the ips file and
+    // dialing any uplink. An encoder is typically pointed at this port the
+    // moment the process is spawned, with no readiness handshake, so every
+    // await before the bind is a window where that connect finds a closed port.
+    // Uplink setup is the worst offender: it resolves the receiver and dials
+    // each bonded link sequentially, so with a hostname receiver the window is
+    // one uncached DNS lookup per modem and grows with the size of the bond —
+    // exactly the multi-link case this sender exists for. Binding a UDP port
+    // needs nothing from the uplinks, so it belongs up here.
+    //
+    // It also removes a rare startup failure: an uplink's ephemeral source port
+    // landing on `local_srt_port` used to make this wildcard bind fail with
+    // AddrInUse.
+    let local_listener = UdpSocket::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, local_srt_port)))
+        .await
+        .context("bind local SRT UDP listener")?;
+    info!("listening for SRT on [::]:{}", local_srt_port);
+
+    let ips = read_ip_list(ips_file).await?;
+    debug!(
+        "uplink IPs loaded: {}",
+        ips.iter()
+            .map(|i| i.to_string())
+            .collect::<SmallVec<_, 4>>()
+            .join(", ")
+    );
+    if ips.is_empty() {
+        return Err(anyhow!("no IPs in list: {}", ips_file));
+    }
+
+    // Shell-owned I/O half of every connection, keyed by conn_id (never by
+    // index — so no lockstep with the connections vec through add/remove).
+    let mut conn_io: ConnIoMap = std::collections::HashMap::new();
+    let mut connections =
+        create_connections_from_ips(&ips, receiver_host, receiver_port, &binder, &mut conn_io)
+            .await;
+    if connections.is_empty() {
+        return Err(anyhow!("no uplinks available"));
+    }
+
+    let mut reg = SrtlaRegistrationManager::new();
+
+    // Send the initial RTT probes the (pure) probing state machine emitted.
+    let probes = reg.start_probing(&mut connections, srtla_core::utils::now_ms());
+    for (idx, pkt) in probes {
+        if let Some(conn) = connections.get(idx)
+            && let Some(io) = conn_io.get(&conn.conn_id)
+        {
+            let _ = io.socket.send(&pkt).await;
+        }
+    }
+
+    let (packet_tx, mut packet_rx) = create_uplink_channel();
+    let mut reader_handles: HashMap<ConnectionId, ReaderHandle> = HashMap::new();
+    sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+
+    // Create instant ACK forwarding channel (sends client addr with packet)
+    let (instant_tx, mut instant_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(SocketAddr, SmallVec<u8, 64>)>();
+
+    // Wrap local_listener in Arc for sharing
+    let local_listener = Arc::new(local_listener);
+
+    // Spawn instant forwarding task
+    {
+        let local_listener_clone = local_listener.clone();
+        tokio::spawn(async move {
+            while let Some((client_addr, ack_packet)) = instant_rx.recv().await {
+                let _ = local_listener_clone.send_to(&ack_packet, client_addr).await;
+            }
+        });
+    }
+
+    let mut recv_buf = vec![0u8; srtla_protocol::MTU];
+    let mut housekeeping_timer = time::interval_at(
+        Instant::now() + Duration::from_millis(HOUSEKEEPING_INTERVAL_MS),
+        Duration::from_millis(HOUSEKEEPING_INTERVAL_MS),
+    );
+    housekeeping_timer.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+    // Batch flush timer (15ms interval like Moblin)
+    // This ensures packets are sent even when traffic is light
+    const BATCH_FLUSH_INTERVAL_MS: u64 = 15;
+    let mut batch_flush_timer = time::interval_at(
+        Instant::now() + Duration::from_millis(BATCH_FLUSH_INTERVAL_MS),
+        Duration::from_millis(BATCH_FLUSH_INTERVAL_MS),
+    );
+    batch_flush_timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+
+    let mut status_elapsed_ms: u64 = 0;
+    let mut last_client_addr: Option<SocketAddr> = None;
+    // Zero-allocation ring buffer for sequence tracking
+    let mut seq_tracker = SequenceTracker::new();
+    let mut last_selected_idx: Option<usize> = None;
+    let mut all_failed_at: Option<u64> = None;
+    // Whole-bond re-home: only ever consulted once every uplink has been down
+    // past the all-failed window, and only then to follow the receiver hostname
+    // to a genuinely new address. `--no-rehome` turns it off entirely.
+    let mut rehome = RehomeGate::new(config.rehome_on_failure());
+    let mut pending_changes: Option<PendingConnectionChanges> = None;
+    // Weak-link classifier. Its per-link `weak` verdict is consumed by
+    // Enhanced selection as an admission gate.
+    let mut weak_link_filter = srtla_core::selection::classifier::WeakLinkFilter::new();
+    // Per-link CC soft-cap controller. `cc_target_bps` feeds the soft-cap
+    // multiplier and in-flight cap; `loss_degraded` feeds the loss gate.
+    let mut link_cc_controller = srtla_core::selection::link_cc::LinkCcController::new();
+
+    // Prepare SIGHUP stream (Unix only) or a never-completing future (non-Unix)
+    #[cfg(unix)]
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    // Main loop - run housekeeping frequently like C version
+    // Run housekeeping once before entering the main event loop so we start in a clean state.
+    {
+        let classic = config.mode().is_classic();
+        if let Err(err) = handle_housekeeping(
+            &mut connections,
+            &mut conn_io,
+            &mut reg,
+            &mut seq_tracker,
+            receiver_host,
+            classic,
+            srtla_core::utils::now_ms(),
+            &mut all_failed_at,
+            &mut reader_handles,
+            &packet_tx,
+            &mut rehome,
+        )
+        .await
+        {
+            warn!("initial housekeeping failed: {err}");
+        }
+    }
+
+    // Use a macro to avoid duplicating the event loop for Unix/non-Unix
+    // The only difference is SIGHUP handling on Unix
+    macro_rules! event_loop {
+        ($($sighup_branch:tt)*) => {
+            loop {
+                tokio::select! {
+                    res = local_listener.recv_from(&mut recv_buf) => {
+                        let config_snap = config.snapshot();
+                        handle_srt_packet(
+                            res,
+                            &mut recv_buf,
+                            &mut connections,
+                            &conn_io,
+                            &mut last_selected_idx,
+                            &mut seq_tracker,
+                            &mut last_client_addr,
+                            reg.has_connected,
+                            &config_snap,
+                            &critical_window,
+                        )
+                        .await;
+                        drain_packet_queue(
+                            &mut packet_rx,
+                            &mut connections,
+                            &conn_io,
+                            &mut reg,
+                            &instant_tx,
+                            last_client_addr,
+                            &seq_tracker,
+                            &config_snap,
+                            &config,
+                        )
+                        .await;
+                    }
+                    packet = packet_rx.recv() => {
+                        let config_snap = config.snapshot();
+                        if let Some(packet) = packet {
+                            handle_uplink_packet(
+                                packet,
+                                &mut connections,
+                                &conn_io,
+                                &mut reg,
+                                &instant_tx,
+                                last_client_addr,
+                                &seq_tracker,
+                                &config_snap,
+                                &config,
+                            ).await;
+                            drain_packet_queue(
+                                &mut packet_rx,
+                                &mut connections,
+                                &conn_io,
+                                &mut reg,
+                                &instant_tx,
+                                last_client_addr,
+                                &seq_tracker,
+                                &config_snap,
+                                &config,
+                            ).await;
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    _ = housekeeping_timer.tick() => {
+                        let classic = config.mode().is_classic();
+                        if let Err(err) = handle_housekeeping(
+                            &mut connections,
+                            &mut conn_io,
+                            &mut reg,
+                            &mut seq_tracker,
+                            receiver_host,
+                            classic,
+                            srtla_core::utils::now_ms(),
+                            &mut all_failed_at,
+                            &mut reader_handles,
+                            &packet_tx,
+                            &mut rehome,
+                        ).await {
+                            warn!("housekeeping failed: {err}");
+                        }
+
+                        // Run the weak-link classifier and per-link CC
+                        // controller, stamp results onto each connection
+                        // for selection to consume, and surface via stats.
+                        let housekeeping_snap = config.snapshot();
+                        let classification = weak_link_filter
+                            .classify(&connections, housekeeping_snap.negotiated_latency_ms);
+                        let link_cc_snapshots = link_cc_controller
+                            .tick_all(&connections, srtla_core::utils::now_ms());
+                        for conn in connections.iter_mut() {
+                            let entry = classification
+                                .per_link
+                                .iter()
+                                .find(|e| e.conn_id == conn.conn_id);
+                            conn.weak = entry.map(|e| e.weak).unwrap_or(false);
+                            // Selection needs the reason, not just the verdict:
+                            // a late link is kept off unique payload entirely,
+                            // an under-used one keeps a trickle of it.
+                            conn.weak_reason = entry
+                                .map(|e| e.reason)
+                                .unwrap_or(srtla_core::selection::classifier::WeakReason::Healthy);
+                            let cc_snap = link_cc_snapshots.get(&conn.conn_id);
+                            conn.cc_backing_off = cc_snap
+                                .map(|s| s.state == srtla_core::selection::link_cc::CcState::BackingOff)
+                                .unwrap_or(false);
+                            conn.cc_target_bps = cc_snap.map(|s| s.target_bps).unwrap_or(0);
+                            conn.loss_degraded =
+                                cc_snap.map(|s| s.loss_degraded).unwrap_or(false);
+                        }
+                        shared_stats.update(
+                            &connections,
+                            &housekeeping_snap,
+                            Some(&classification),
+                            Some(&link_cc_snapshots),
+                        );
+
+                        // Fan the fresh snapshot out to any `stats` subscribers
+                        // on the async control socket. Cheap no-op if no one
+                        // is subscribed.
+                        let snap = shared_stats.get();
+                        if let Ok(value) = serde_json::to_value(&snap) {
+                            subscription_hub.publish("stats", value).await;
+                        }
+
+                        if let Some(changes) = pending_changes.take()
+                            && let Some(new_ips) = changes.new_ips
+                        {
+                            info!("applying queued connection changes: {} IPs", new_ips.len());
+                            apply_connection_changes(
+                                &mut connections,
+                                &mut conn_io,
+                                &new_ips,
+                                &changes.receiver_host,
+                                changes.receiver_port,
+                                &mut last_selected_idx,
+                                &mut seq_tracker,
+                                &binder,
+                            ).await;
+                            info!("connection changes applied successfully");
+                            sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+                        }
+
+                        status_elapsed_ms = status_elapsed_ms.saturating_add(HOUSEKEEPING_INTERVAL_MS);
+                        if status_elapsed_ms >= STATUS_LOG_INTERVAL_MS {
+                            log_connection_status(&connections, last_selected_idx, &config);
+                            status_elapsed_ms = status_elapsed_ms.saturating_sub(STATUS_LOG_INTERVAL_MS);
+                        }
+
+                        sync_readers(&connections, &conn_io, &mut reader_handles, &packet_tx);
+                        let config_snap = config.snapshot();
+                        drain_packet_queue(
+                            &mut packet_rx,
+                            &mut connections,
+                            &conn_io,
+                            &mut reg,
+                            &instant_tx,
+                            last_client_addr,
+                            &seq_tracker,
+                            &config_snap,
+                            &config,
+                        )
+                        .await;
+                    }
+                    $($sighup_branch)*
+                    _ = batch_flush_timer.tick() => {
+                        flush_all_batches(&mut connections, &conn_io, &mut seq_tracker).await;
+                    }
+                }
+            }
+        };
+    }
+
+    #[cfg(unix)]
+    event_loop! {
+        _ = sighup.recv() => {
+            info!("received SIGHUP - evaluating uplink IP reload from {}", ips_file);
+            // Guard against a reload that resolves to zero usable IPs (missing,
+            // empty, or all-garbage file): refuse it and keep the current links
+            // up rather than queuing an empty list, which would tear down every
+            // connection in apply_connection_changes. Mirrors the C sender.
+            match reload::analyze_ip_reload(ips_file) {
+                reload::IpReload::Apply { ips, first_invalid_line } => {
+                    if let Some(line) = first_invalid_line {
+                        warn!(
+                            "ips file has an invalid entry starting at line {line}; applying valid IPs only"
+                        );
+                    }
+                    pending_changes = Some(PendingConnectionChanges {
+                        new_ips: Some(ips),
+                        receiver_host: receiver_host.to_string(),
+                        receiver_port,
+                    });
+                    info!("uplink IP changes queued for next processing cycle");
+                }
+                reload::IpReload::Refuse(reason) => {
+                    warn!(
+                        "refusing SIGHUP reload ({reason:?}); keeping current connections"
+                    );
+                }
+            }
+            let config_snap = config.snapshot();
+            drain_packet_queue(
+                &mut packet_rx,
+                &mut connections,
+                &conn_io,
+                &mut reg,
+                &instant_tx,
+                last_client_addr,
+                &seq_tracker,
+                &config_snap,
+                &config,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    event_loop! {}
+}
+
+pub async fn read_ip_list(path: &str) -> Result<SmallVec<IpAddr, 4>> {
+    let text = std::fs::read_to_string(Path::new(path)).context("read IPs file")?;
+    // Shares the SIGHUP reload guard's parser so startup and reload agree on what
+    // counts as a valid IP. At startup an empty or all-invalid file is tolerated
+    // (returns an empty list); the zero-valid-IP refusal only matters on reload,
+    // where dropping every live link would be worse than ignoring a bad edit.
+    match reload::analyze_ip_reload_text(&text) {
+        reload::IpReload::Apply {
+            ips,
+            first_invalid_line,
+        } => {
+            if let Some(line) = first_invalid_line {
+                warn!("ips file has an invalid entry starting at line {line}; skipping it");
+            }
+            Ok(ips)
+        }
+        reload::IpReload::Refuse(_) => Ok(SmallVec::new()),
+    }
+}

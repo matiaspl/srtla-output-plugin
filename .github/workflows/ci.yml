@@ -1,0 +1,36 @@
+name: obs-srtla-output
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
+      - run: cargo test --manifest-path engine/Cargo.toml
+      - run: cargo test --manifest-path third_party/srtla_send/Cargo.toml --workspace
+
+  native:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Configure
+        run: cmake -S . -B build -DOBS_SRTLA_BUILD_TESTS=ON -DOBS_SRTLA_BUILD_VENDOR_SRT=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure

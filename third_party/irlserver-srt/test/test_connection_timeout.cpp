@@ -1,0 +1,419 @@
+#include <chrono>
+#include <thread>
+#include <gtest/gtest.h>
+#include "test_env.h"
+
+#ifdef _WIN32
+#define INC_SRT_WIN_WINTIME // exclude gettimeofday from srt headers
+#else
+typedef int SOCKET;
+#define INVALID_SOCKET ((SOCKET)-1)
+#define closesocket close
+#endif
+
+#include"platform_sys.h"
+#include "srt.h"
+#include "netinet_any.h"
+#include "common.h"
+
+using namespace std;
+using namespace srt_logging;
+
+class TestConnectionTimeout
+    : public ::srt::Test
+{
+protected:
+    TestConnectionTimeout()
+    {
+        // initialization code here
+    }
+
+    ~TestConnectionTimeout()
+    {
+        // cleanup any pending stuff, but no exceptions allowed
+    }
+
+protected:
+
+    // SetUp() is run immediately before a test starts.
+    void setup() override
+    {
+        m_sa.sin_family = AF_INET;
+        m_sa.sin_addr.s_addr = INADDR_ANY;
+        m_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        ASSERT_NE(m_udp_sock, -1);
+
+        // Find unused a port not used by any other service.
+        // Otherwise srt_connect may actually connect.
+        int bind_res = -1;
+        const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
+        for (int port = 5000; port <= 5555; ++port)
+        {
+            m_sa.sin_port = htons(port);
+            bind_res = ::bind(m_udp_sock, psa, sizeof m_sa);
+            if (bind_res >= 0)
+            {
+                cerr << "Running test on port " << port << "\n";
+                break;
+            }
+        }
+
+        ASSERT_GE(bind_res, 0);
+        ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &m_sa.sin_addr), 1);
+    }
+
+    void teardown() override
+    {
+        // Code here will be called just after the test completes.
+        // OK to throw exceptions from here if needed.
+        EXPECT_NE(closesocket(m_udp_sock), -1);
+    }
+
+protected:
+
+    SOCKET m_udp_sock = INVALID_SOCKET;
+    sockaddr_in m_sa = sockaddr_in();
+
+};
+
+
+
+/**
+ * The test creates a socket and tries to connect to a localhost port 5555
+ * in a non-blocking mode. This means we wait on epoll for a notification
+ * about SRT_EPOLL_OUT | SRT_EPOLL_ERR events on the socket calling srt_epoll_wait(...).
+ * The test expects a connection timeout to happen within the time,
+ * set with SRTO_CONNTIMEO (500 ms).
+ * The expected behavior is to return from srt_epoll_wait(...)
+ *
+ * @remarks  Inspired by Max Tomilov (maxtomilov) in issue #468
+*/
+TEST_F(TestConnectionTimeout, Nonblocking) {
+
+    const SRTSOCKET client_sock = srt_create_socket();
+    ASSERT_GT(client_sock, 0);    // socket_id should be > 0
+
+    // First let's check the default connection timeout value.
+    // It should be 3 seconds (3000 ms)
+    int conn_timeout     = 0;
+    int conn_timeout_len = sizeof conn_timeout;
+    EXPECT_EQ(srt_getsockopt(client_sock, 0, SRTO_CONNTIMEO, &conn_timeout, &conn_timeout_len), SRT_SUCCESS);
+    EXPECT_EQ(conn_timeout, 3000);
+
+    // Set connection timeout to 500 ms to reduce the test execution time
+    const int connection_timeout_ms = 300;
+    EXPECT_EQ(srt_setsockopt(client_sock, 0, SRTO_CONNTIMEO, &connection_timeout_ms, sizeof connection_timeout_ms), SRT_SUCCESS);
+
+    const int yes = 1;
+    const int no = 0;
+    ASSERT_EQ(srt_setsockopt(client_sock, 0, SRTO_RCVSYN,    &no,  sizeof no),  SRT_SUCCESS); // for async connect
+    ASSERT_EQ(srt_setsockopt(client_sock, 0, SRTO_SNDSYN,    &no,  sizeof no),  SRT_SUCCESS); // for async connect
+    ASSERT_EQ(srt_setsockopt(client_sock, 0, SRTO_TSBPDMODE, &yes, sizeof yes), SRT_SUCCESS);
+    ASSERT_EQ(srt_setsockflag(client_sock,   SRTO_SENDER,    &yes, sizeof yes), SRT_SUCCESS);
+
+    const int pollid = srt_epoll_create();
+    ASSERT_GE(pollid, 0);
+    const int epoll_out = SRT_EPOLL_OUT | SRT_EPOLL_ERR;
+    ASSERT_NE(srt_epoll_add_usock(pollid, client_sock, &epoll_out), SRT_ERROR);
+
+    const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
+    ASSERT_NE(srt_connect(client_sock, psa, sizeof m_sa), SRT_ERROR);
+
+    // Socket readiness for connection is checked by polling on WRITE allowed sockets.
+    {
+        int rlen = 2;
+        SRTSOCKET read[2];
+
+        int wlen = 2;
+        SRTSOCKET write[2];
+
+        const chrono::steady_clock::time_point chrono_ts_start = chrono::steady_clock::now();
+
+        // Here we check the connection timeout.
+        // Epoll timeout is set 100 ms greater than socket's TTL
+        EXPECT_EQ(srt_epoll_wait(pollid, read, &rlen,
+                                 write, &wlen,
+                                 connection_timeout_ms + 100,   // +100 ms
+                                 0, 0, 0, 0)
+        /* Expected return value is 2. We have only 1 socket, but
+         * sockets with exceptions are returned to both read and write sets.
+        */
+                 , 2);
+        // Check the actual timeout
+        const chrono::steady_clock::time_point chrono_ts_end = chrono::steady_clock::now();
+        const auto delta_ms = chrono::duration_cast<chrono::milliseconds>(chrono_ts_end - chrono_ts_start).count();
+        // Confidence interval border : +/-80 ms
+        EXPECT_LE(delta_ms, connection_timeout_ms + 80) << "Timeout was: " << delta_ms;
+        EXPECT_GE(delta_ms, connection_timeout_ms - 80) << "Timeout was: " << delta_ms;
+
+        EXPECT_EQ(rlen, 1);
+        EXPECT_EQ(read[0], client_sock);
+        EXPECT_EQ(wlen, 1);
+        EXPECT_EQ(write[0], client_sock);
+    }
+
+    EXPECT_EQ(srt_epoll_remove_usock(pollid, client_sock), SRT_SUCCESS);
+    EXPECT_EQ(srt_close(client_sock), SRT_SUCCESS);
+    (void)srt_epoll_release(pollid);
+}
+
+/**
+ * The test creates a socket and tries to connect to a localhost port 5555
+ * in a blocking mode. The srt_connect function is expected to return
+ * SRT_ERROR, and the error_code should be SRT_ENOSERVER, meaning a
+ * connection timeout.
+ * This test is a regression test for an issue described in PR #833.
+ * Under certain conditions m_bConnecting variable on a socket
+ * might not be reset to false after a connection attempt has failed.
+ * In that case any further call to srt_connect will return SRT_ECONNSOCK:
+ * Operation not supported: Cannot do this operation on a CONNECTED socket
+ *
+*/
+TEST_F(TestConnectionTimeout, BlockingLoop)
+{
+    const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
+    const int connection_timeout_ms = 999;
+    cout << "[          ]\r[" << flush;
+
+    for (int i = 0; i < 10; ++i)
+    {
+        const SRTSOCKET client_sock = srt_create_socket();
+        EXPECT_GT(client_sock, 0);    // socket_id should be > 0
+        if (client_sock <= 0)
+        {
+            cout << "!\n";
+            break;
+        }
+
+        cout << "." << flush;
+
+        // Set connection timeout to 999 ms to reduce the test execution time.
+        // Also need to hit a time point between two threads:
+        // srt_connect will check TTL every second,
+        // CRcvQueue::worker will wait on a socket for 10 ms.
+        // Need to have a condition, when srt_connect will process the timeout.
+        EXPECT_EQ(srt_setsockopt(client_sock, 0, SRTO_CONNTIMEO, &connection_timeout_ms, sizeof connection_timeout_ms), SRT_SUCCESS);
+
+        const chrono::steady_clock::time_point chrono_ts_start = chrono::steady_clock::now();
+        EXPECT_EQ(srt_connect(client_sock, psa, sizeof m_sa), SRT_ERROR);
+
+        const auto delta_ms = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - chrono_ts_start).count();
+        // Confidence interval border : +/-200 ms
+        EXPECT_LE(delta_ms, connection_timeout_ms + 200) << "Timeout was: " << delta_ms;
+        EXPECT_GE(delta_ms, connection_timeout_ms - 200) << "Timeout was: " << delta_ms;
+
+        const int error_code = srt_getlasterror(nullptr);
+        EXPECT_EQ(error_code, SRT_ENOSERVER);
+        if (error_code != SRT_ENOSERVER)
+        {
+            cout << "!\nConnection attempt no. " << i << " resulted with: "
+                << error_code << " " << srt_getlasterror_str() << "\n";
+            break;
+        }
+
+        EXPECT_EQ(srt_close(client_sock), SRT_SUCCESS);
+    }
+    cout << endl;
+}
+
+TEST_F(TestConnectionTimeout, BlockingInterrupted)
+{
+    const SRTSOCKET client_sock = srt_create_socket();
+    EXPECT_GT(client_sock, 0);    // socket_id should be > 0
+
+    const int connection_timeout_ms = 10000;
+    EXPECT_EQ(srt_setsockopt(client_sock, 0, SRTO_CONNTIMEO, &connection_timeout_ms, sizeof connection_timeout_ms), SRT_SUCCESS);
+
+    using namespace std::chrono;
+
+    steady_clock::time_point begin = steady_clock::now();
+
+    std::thread interrupter ( [client_sock] () {
+        cout << "[T] START: Waiting 1s\n";
+        std::this_thread::sleep_for(seconds(1));
+        steady_clock::time_point b = steady_clock::now();
+
+        cout << "[T] CLOSING @" << client_sock << "\n";
+        srt_close(client_sock);
+        steady_clock::time_point e = steady_clock::now();
+        auto passed = duration_cast<milliseconds>(e - b);
+        int close_time_passed_ms = passed.count();
+        EXPECT_LT(close_time_passed_ms, 2000);
+
+        cout << "[T] Thread exit\n";
+    });
+
+    const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
+    cout << "START: Connect @" << client_sock << " blind\n";
+    EXPECT_EQ(srt_connect(client_sock, psa, sizeof m_sa), SRT_ERROR);
+    cout << "STOP: Connect\n";
+
+    steady_clock::time_point end = steady_clock::now();
+    auto passed = duration_cast<milliseconds>(end - begin);
+    int time_passed_ms = passed.count();
+    cout << "Interrupted after " << time_passed_ms << "ms\n";
+
+    EXPECT_LT(time_passed_ms, 8000);
+
+    interrupter.join();
+}
+
+TEST_F(TestConnectionTimeout, NonblockingInterrupted)
+{
+    const SRTSOCKET client_sock = srt_create_socket();
+    // const SRTSOCKET extra_sock = srt_create_socket();
+    EXPECT_GT(client_sock, 0);    // socket_id should be > 0
+
+    const int connection_timeout_ms = 10000;
+    EXPECT_EQ(srt_setsockopt(client_sock, 0, SRTO_CONNTIMEO, &connection_timeout_ms, sizeof connection_timeout_ms), SRT_SUCCESS);
+
+    const bool non_blocking = false;
+    EXPECT_EQ(srt_setsockflag(client_sock, SRTO_RCVSYN, &non_blocking, sizeof non_blocking), SRT_SUCCESS);
+    EXPECT_EQ(srt_setsockflag(client_sock, SRTO_SNDSYN, &non_blocking, sizeof non_blocking), SRT_SUCCESS);
+
+    using namespace std::chrono;
+
+    int eid = srt_epoll_create();
+
+    int conn_err = SRT_EPOLL_OUT | SRT_EPOLL_ERR;
+
+    srt_epoll_add_usock(eid, client_sock, &conn_err);
+    // srt_epoll_add_usock(eid, extra_sock, &conn_err);
+
+    steady_clock::time_point begin = steady_clock::now();
+
+    std::thread interrupter ( [client_sock] () {
+        cout << "[T] START: Waiting 1s\n";
+        std::this_thread::sleep_for(seconds(1));
+        steady_clock::time_point b = steady_clock::now();
+
+        cout << "[T] CLOSING @" << client_sock << "\n";
+        srt_close(client_sock);
+        steady_clock::time_point e = steady_clock::now();
+        auto passed = duration_cast<milliseconds>(e - b);
+        int close_time_passed_ms = passed.count();
+        EXPECT_LT(close_time_passed_ms, 2000);
+
+        cout << "[T] Thread exit\n";
+    });
+
+    const sockaddr* psa = reinterpret_cast<const sockaddr*>(&m_sa);
+    cout << "START: Connect @" << client_sock << " blind\n";
+
+    // Result should be CONNREQ because this is non-blocking connect
+    EXPECT_EQ(srt_connect(client_sock, psa, sizeof m_sa), 0);
+
+    cout << "EPOLL - wait for connect\n";
+
+    // Expect uwait to return -1 because all sockets have been
+    // removed from EID, so the call would block forever.
+    SRT_EPOLL_EVENT fdset[2];
+    EXPECT_EQ(srt_epoll_uwait(eid, fdset, 2, 3000), -1);
+    SRT_SOCKSTATUS socket_status = srt_getsockstate(client_sock);
+
+    steady_clock::time_point end = steady_clock::now();
+    auto passed = duration_cast<milliseconds>(end - begin);
+    int time_passed_ms = passed.count();
+    cout << "Interrupted after " << time_passed_ms << "ms\n";
+
+    EXPECT_LT(time_passed_ms, 8000);
+
+    interrupter.join();
+
+    cout << "SOCKET STATUS: " << SockStatusStr(socket_status) << endl;
+    EXPECT_GE(socket_status, SRTS_CLOSED);
+
+    // srt_close(extra_sock);
+}
+
+TEST(TestConnectionAPI, Accept)
+{
+    using namespace std::chrono;
+    using namespace srt;
+
+    srt_startup();
+
+    const SRTSOCKET caller_sock = srt_create_socket();
+    const SRTSOCKET listener_sock = srt_create_socket();
+
+    const int eidl = srt_epoll_create();
+    const int eidc = srt_epoll_create();
+    const int ev_conn = SRT_EPOLL_OUT | SRT_EPOLL_ERR;
+    srt_epoll_add_usock(eidc, caller_sock, &ev_conn);
+    const int ev_acp = SRT_EPOLL_IN | SRT_EPOLL_ERR;
+    srt_epoll_add_usock(eidl, listener_sock, &ev_acp);
+
+    sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+
+    ASSERT_NE(srt_bind(listener_sock, sa.get(), sa.size()), -1);
+    ASSERT_NE(srt_listen(listener_sock, 1), -1);
+
+    // Set non-blocking mode so that you can wait for readiness
+    bool no = false;
+    srt_setsockflag(caller_sock, SRTO_RCVSYN, &no, sizeof no);
+    srt_setsockflag(listener_sock, SRTO_RCVSYN, &no, sizeof no);
+
+    srt_connect(caller_sock, sa.get(), sa.size());
+
+    SRT_EPOLL_EVENT ready[2];
+    int nready = srt_epoll_uwait(eidl, ready, 2, 1000); // Wait 1s
+    EXPECT_EQ(nready, 1);
+    EXPECT_EQ(ready[0].fd, listener_sock);
+    // EXPECT_EQ(ready[0].events, SRT_EPOLL_IN);
+
+    // Now call the accept function incorrectly
+    int size = 0;
+    sockaddr_storage saf;
+
+    EXPECT_EQ(srt_accept(listener_sock, (sockaddr*)&saf, &size), SRT_ERROR);
+
+    std::this_thread::sleep_for(seconds(1));
+
+    // Set correctly
+    size = sizeof (sockaddr_in6);
+    EXPECT_NE(srt_accept(listener_sock, (sockaddr*)&saf, &size), SRT_ERROR);
+
+    // Ended up with error, but now you should also expect error on the caller side.
+
+    // Wait 5s until you get a connection broken.
+    nready = srt_epoll_uwait(eidc, ready, 2, 5000);
+    EXPECT_EQ(nready, 1);
+    if (nready == 1)
+    {
+        // Do extra checks only if you know that this was returned.
+        EXPECT_EQ(ready[0].fd, caller_sock);
+        EXPECT_EQ(ready[0].events & SRT_EPOLL_ERR, 0u);
+    }
+    srt_close(caller_sock);
+    srt_close(listener_sock);
+
+    srt_cleanup();
+}
+
+TEST(TestConnectionAPI, Listen)
+{
+    using namespace std::chrono;
+    using namespace srt;
+    srt_startup();
+
+    SRTSOCKET s = srt_create_socket();
+    int listen_stat1, listen_stat2, listen_stat3;
+
+    sockaddr_any sa = srt::CreateAddr("localhost", 5555, AF_INET);
+
+    ASSERT_NE(srt_bind(s, sa.get(), sa.size()), -1);
+    listen_stat1 = srt_listen(s, 1);
+    listen_stat2 = srt_listen(s, 5);
+    srt_close(s);
+    listen_stat3 = srt_listen(s, 5);
+
+    int err = srt_getlasterror(NULL);
+    std::cout << "Listen after close error: " << srt_strerror(err, 0) << std::endl;
+
+    EXPECT_EQ(listen_stat1, 0);
+    EXPECT_EQ(listen_stat2, 0);
+    EXPECT_EQ(listen_stat3, -1);
+
+    srt_cleanup();
+}
+

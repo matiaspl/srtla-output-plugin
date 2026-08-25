@@ -1,0 +1,90 @@
+[workspace]
+members = ["crates/network-sim", "crates/srtla-core", "crates/srtla-protocol"]
+
+[package]
+resolver = "3"
+name = "srtla_send"
+version = "3.0.0"
+edition = "2024"
+description = "SRT transport proxy with link aggregation for connection bonding (sender-side)"
+license = "MIT"
+authors = ["Thomas Lekanger <mail@datagutt.no>"]
+repository = "https://github.com/irlserver/srtla_send"
+homepage = "https://github.com/irlserver/srtla_send"
+readme = "README.md"
+keywords = ["srt", "streaming", "bonding", "aggregation", "networking"]
+categories = ["network-programming", "multimedia"]
+rust-version = "1.88"
+
+[dependencies]
+srtla-core = { path = "crates/srtla-core" }
+srtla-protocol = { path = "crates/srtla-protocol" }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.9"
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tokio = { version = "1.49", features = [
+	"rt-multi-thread",
+	"macros",
+	"net",
+	"time",
+	"io-util",
+	"signal",
+	"sync",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+socket2 = { version = "0.6", features = ["all"] }
+bytes = "1.11.0"
+smallvec = "=2.0.0-alpha.12"
+mimalloc = { version = "0.1", default-features = false, features = [
+	"secure",
+	"v3",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# test_helpers exposes advance_test_clock(), which calls tokio::time::advance —
+# only available with tokio's test-util. Pull it here so the test-internals
+# surface compiles standalone (e.g. `cargo build --all-features`), not just under
+# `cargo test` where dev-deps happen to unify test-util in. Forward to srtla-core
+# so its cross-crate test surface (public fields, construction helpers) is exposed.
+test-internals = ["srtla-core/test-internals", "tokio/test-util"]
+
+[lib]
+name = "srtla_send"
+path = "src/lib.rs"
+
+[[bin]]
+name = "srtla_send"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Enable srtla-core's test-internals surface for our own cross-crate tests
+# (public struct fields, construction helpers, pub(crate) predicates).
+srtla-core = { path = "crates/srtla-core", features = ["test-internals"] }
+tokio-test = "0.4"
+tempfile = "3"
+assert_matches = "1"
+network-sim = { path = "crates/network-sim" }
+proptest = "1.11.0"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release-debug]
+inherits = "release"
+strip = false
+debug = true
+lto = "thin"
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+debug = false
+strip = true

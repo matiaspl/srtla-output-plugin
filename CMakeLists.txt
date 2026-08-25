@@ -1,0 +1,222 @@
+cmake_minimum_required(VERSION 3.28)
+project(obs-srtla-output VERSION 0.1.0 LANGUAGES C CXX)
+
+if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "obs-srtla-output v1 supports Windows x64 only")
+endif()
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+option(OBS_SRTLA_BUILD_TESTS "Build native unit tests" ON)
+option(OBS_SRTLA_BUILD_VENDOR_SRT "Build the vendored libsrt fork" ON)
+option(OBS_SRTLA_USE_OBS_RUNTIME_DEPS
+       "Use Qt/FFmpeg/libobs DLLs supplied by the installed OBS runtime" ON)
+set(OBS_SRTLA_OBS_PLUGIN_DIR "obs-plugins/64bit" CACHE PATH "OBS plugin install directory")
+set(_ffmpeg_root_default "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev/include/libavformat/avformat.h")
+  set(_ffmpeg_root_default "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev")
+endif()
+set(OBS_SRTLA_FFMPEG_ROOT "${_ffmpeg_root_default}" CACHE PATH
+    "FFmpeg development prefix used by the OBS plugin")
+
+# OBS builds its Windows SRT dependency with mbedTLS.  Keep the same crypto
+# provider for the embedded SRT fork so the plugin does not need OpenSSL DLLs
+# and so the provider is identical across the OBS integration and this target.
+set(_mbedtls_root_default "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/vcpkg/installed/x64-windows/include/mbedtls/aes.h")
+  set(_mbedtls_root_default
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/vcpkg/installed/x64-windows")
+endif()
+set(OBS_SRTLA_MBEDTLS_ROOT "${_mbedtls_root_default}" CACHE PATH
+    "mbedTLS development prefix used by the vendored SRT fork")
+
+if(OBS_SRTLA_MBEDTLS_ROOT)
+  # The vendored SRT tree uses its legacy FindMbedTLS.cmake module, which
+  # expects a prefix containing include/ and lib/.  Make the same prefix
+  # explicit for both that module and our direct MSVC test/plugin links.
+  set(MBEDTLS_PREFIX "${OBS_SRTLA_MBEDTLS_ROOT}" CACHE PATH
+      "The path of mbedTLS" FORCE)
+  list(PREPEND CMAKE_PREFIX_PATH "${OBS_SRTLA_MBEDTLS_ROOT}")
+  find_path(OBS_SRTLA_MBEDTLS_INCLUDE_DIR
+            NAMES mbedtls/aes.h
+            HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/include"
+            NO_DEFAULT_PATH)
+  find_library(OBS_SRTLA_MBEDTLS_LIBRARY
+               NAMES mbedtls
+               HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/lib"
+               NO_DEFAULT_PATH)
+  find_library(OBS_SRTLA_MBEDCRYPTO_LIBRARY
+               NAMES mbedcrypto
+               HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/lib"
+               NO_DEFAULT_PATH)
+  find_library(OBS_SRTLA_MBEDX509_LIBRARY
+               NAMES mbedx509
+               HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/lib"
+               NO_DEFAULT_PATH)
+  if(OBS_SRTLA_MBEDTLS_LIBRARY AND OBS_SRTLA_MBEDCRYPTO_LIBRARY AND
+     OBS_SRTLA_MBEDX509_LIBRARY)
+    set(OBS_SRTLA_MBEDTLS_LIBRARIES
+        "${OBS_SRTLA_MBEDTLS_LIBRARY}"
+        "${OBS_SRTLA_MBEDCRYPTO_LIBRARY}"
+        "${OBS_SRTLA_MBEDX509_LIBRARY}")
+    if(WIN32)
+      list(APPEND OBS_SRTLA_MBEDTLS_LIBRARIES bcrypt)
+    endif()
+  endif()
+endif()
+
+# The binary OBS distribution contains the runtime DLLs, but deliberately does
+# not ship headers or import libraries.  When building on Windows we can use
+# the matching OBS source tree for headers and generate/import the two small
+# import libraries from the installed DLLs.  This keeps libobs dynamically
+# linked to the OBS process instead of embedding a second copy of libobs.
+set(_obs_source_default "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-source/libobs/obs.h")
+  set(_obs_source_default "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-source")
+endif()
+set(_obs_import_default "")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-dev/obs.lib")
+  set(_obs_import_default "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-dev")
+endif()
+set(_obs_runtime_default "")
+if(WIN32 AND EXISTS "C:/Program Files/obs-studio/bin/64bit/obs.dll")
+  set(_obs_runtime_default "C:/Program Files/obs-studio/bin/64bit")
+endif()
+set(OBS_SRTLA_OBS_SOURCE_DIR "${_obs_source_default}" CACHE PATH
+    "OBS source tree used for plugin headers")
+set(OBS_SRTLA_OBS_IMPORT_LIB_DIR "${_obs_import_default}" CACHE PATH
+    "Directory containing obs.lib and obs-frontend-api.lib")
+set(OBS_SRTLA_OBS_RUNTIME_DIR "${_obs_runtime_default}" CACHE PATH
+    "Directory containing the OBS runtime DLLs")
+
+if(OBS_SRTLA_USE_OBS_RUNTIME_DEPS AND DEFINED VCPKG_APPLOCAL_DEPS)
+  # Do not let vcpkg copy Qt/FFmpeg into the plugin directory.  OBS already
+  # owns those DLLs and the plugin must resolve them from OBS's bin/64bit.
+  set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL "" FORCE)
+endif()
+
+find_package(Threads REQUIRED)
+find_package(Qt6 QUIET COMPONENTS Widgets)
+find_program(OBS_SRTLA_CARGO_EXECUTABLE NAMES cargo cargo.exe REQUIRED)
+
+add_subdirectory(engine)
+
+if(OBS_SRTLA_BUILD_VENDOR_SRT)
+  set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+  set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
+  set(ENABLE_APPS OFF CACHE BOOL "" FORCE)
+  set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(ENABLE_UNITTESTS OFF CACHE BOOL "" FORCE)
+  set(USE_ENCLIB "mbedtls" CACHE STRING "The crypto library that SRT uses" FORCE)
+  set(ENABLE_AEAD_API_PREVIEW OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/irlserver-srt EXCLUDE_FROM_ALL)
+  if(MSVC AND TARGET srt_virtual)
+    # The vendored SRT sources use C++ exceptions in the MSVC build.  OBS's
+    # own dependency toolchain enables this flag globally; mirror it here so
+    # a clean provider switch does not depend on an inherited developer shell.
+    target_compile_options(srt_virtual PRIVATE /EHsc)
+  endif()
+endif()
+
+set(CPACK_PACKAGE_NAME "obs-srtla-output")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_GENERATOR "ZIP")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+include(CPack)
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output")
+install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/VENDORING.md"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/irlserver-srt/LICENSE"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/srtla_send/LICENSE"
+        DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output/licenses")
+
+if(NOT TARGET OBS::libobs)
+  find_package(libobs CONFIG QUIET)
+endif()
+
+# Fallback for the normal OBS installer.  It has obs.dll and
+# obs-frontend-api.dll but no CMake package.  The generated import libraries
+# are ordinary MSVC import libs and do not copy or statically link OBS code.
+if(NOT TARGET OBS::libobs AND WIN32 AND
+   EXISTS "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/obs.h" AND
+   EXISTS "${OBS_SRTLA_OBS_IMPORT_LIB_DIR}/obs.lib" AND
+   EXISTS "${OBS_SRTLA_OBS_IMPORT_LIB_DIR}/obs-frontend-api.lib")
+  set(_obs_include_dirs
+      "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs"
+      "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/media-io"
+      "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/util"
+      "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/graphics"
+      "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/callback")
+
+  add_library(OBS::libobs SHARED IMPORTED GLOBAL)
+  set_target_properties(OBS::libobs PROPERTIES
+    IMPORTED_IMPLIB "${OBS_SRTLA_OBS_IMPORT_LIB_DIR}/obs.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${_obs_include_dirs}")
+  if(EXISTS "${OBS_SRTLA_OBS_RUNTIME_DIR}/obs.dll")
+    set_property(TARGET OBS::libobs PROPERTY IMPORTED_LOCATION
+                 "${OBS_SRTLA_OBS_RUNTIME_DIR}/obs.dll")
+  endif()
+
+  add_library(OBS::frontend-api SHARED IMPORTED GLOBAL)
+  set_target_properties(OBS::frontend-api PROPERTIES
+    IMPORTED_IMPLIB "${OBS_SRTLA_OBS_IMPORT_LIB_DIR}/obs-frontend-api.lib"
+    INTERFACE_INCLUDE_DIRECTORIES
+      "${OBS_SRTLA_OBS_SOURCE_DIR}/frontend/api;${_obs_include_dirs}"
+    INTERFACE_LINK_LIBRARIES OBS::libobs)
+  if(EXISTS "${OBS_SRTLA_OBS_RUNTIME_DIR}/obs-frontend-api.dll")
+    set_property(TARGET OBS::frontend-api PROPERTY IMPORTED_LOCATION
+                 "${OBS_SRTLA_OBS_RUNTIME_DIR}/obs-frontend-api.dll")
+  endif()
+  message(STATUS "Using OBS runtime DLLs with generated import libraries from ${OBS_SRTLA_OBS_IMPORT_LIB_DIR}")
+endif()
+
+if(NOT TARGET OBS::libobs)
+  message(WARNING "OBS development targets were not found; only the Rust/ABR slice can be built.")
+elseif(NOT TARGET Qt6::Widgets)
+  message(WARNING "Qt6 Widgets was not found; OBS plugin target is disabled.")
+else()
+  find_path(OBS_SRTLA_FFMPEG_INCLUDE_DIR
+            NAMES libavformat/avformat.h
+            HINTS "${OBS_SRTLA_FFMPEG_ROOT}/include" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/include")
+  find_library(OBS_SRTLA_FFMPEG_AVFORMAT
+               NAMES avformat avformat-61 avformat-60 avformat-59
+               HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+  find_library(OBS_SRTLA_FFMPEG_AVCODEC
+               NAMES avcodec avcodec-61 avcodec-60 avcodec-59
+               HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+  find_library(OBS_SRTLA_FFMPEG_AVUTIL
+               NAMES avutil avutil-59 avutil-58 avutil-57
+               HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+  if(NOT OBS_SRTLA_FFMPEG_INCLUDE_DIR OR NOT OBS_SRTLA_FFMPEG_AVFORMAT OR
+     NOT OBS_SRTLA_FFMPEG_AVCODEC OR NOT OBS_SRTLA_FFMPEG_AVUTIL)
+    message(WARNING "FFmpeg development headers/libraries were not found; the OBS plugin target is disabled. Set OBS_SRTLA_FFMPEG_ROOT to an FFmpeg development prefix.")
+  else()
+    set(OBS_SRTLA_FFMPEG_LIBRARIES
+        "${OBS_SRTLA_FFMPEG_AVFORMAT}"
+        "${OBS_SRTLA_FFMPEG_AVCODEC}"
+        "${OBS_SRTLA_FFMPEG_AVUTIL}")
+    add_subdirectory(plugin)
+  endif()
+endif()
+
+if(OBS_SRTLA_BUILD_TESTS)
+  enable_testing()
+  add_test(NAME srtla_engine_rust_tests
+           COMMAND "${OBS_SRTLA_CARGO_EXECUTABLE}" test --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/engine/Cargo.toml")
+  if(TARGET srt_static)
+    add_executable(srt_transport_abi_test tests/srt_transport_abi_test.cpp)
+    target_include_directories(srt_transport_abi_test PRIVATE
+      third_party/irlserver-srt/srtcore
+      third_party/irlserver-srt/common
+      "${CMAKE_CURRENT_BINARY_DIR}/third_party/irlserver-srt")
+    target_link_libraries(srt_transport_abi_test PRIVATE srt_static Threads::Threads)
+    if(OBS_SRTLA_MBEDTLS_LIBRARIES)
+      target_link_libraries(srt_transport_abi_test PRIVATE ${OBS_SRTLA_MBEDTLS_LIBRARIES})
+    endif()
+    add_test(NAME srt_transport_abi_test COMMAND srt_transport_abi_test)
+  endif()
+endif()

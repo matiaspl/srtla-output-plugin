@@ -1,0 +1,15 @@
+build/
+build-*/
+out-obs-srtla/
+out-obs-srtla-*/
+_CPack_Packages/
+*.zip
+out/
+tools/
+__cmake_systeminformation/
+rustup-init.exe
+engine/target/
+third_party/srtla_send/target/
+*.user
+*.suo
+*.vcxproj.user

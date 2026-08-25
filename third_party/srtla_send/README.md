@@ -1,0 +1,416 @@
+# SRTLA Sender (Rust)
+
+[![CI](https://github.com/irlserver/srtla_send/actions/workflows/ci.yml/badge.svg)](https://github.com/irlserver/srtla_send/actions/workflows/ci.yml)
+[![Build Debian Packages](https://github.com/irlserver/srtla_send/actions/workflows/build-debian.yml/badge.svg)](https://github.com/irlserver/srtla_send/actions/workflows/build-debian.yml)
+
+A Rust implementation of the SRTLA bonding sender. SRTLA is a SRT transport proxy with link aggregation for connection bonding that can transport [SRT](https://github.com/Haivision/srt/) traffic over multiple network links for capacity aggregation and redundancy. Traffic is balanced dynamically, depending on the network conditions. The intended application is bonding mobile modems for live streaming.
+
+This application is experimental. Be prepared to troubleshoot it and experiment with various settings for your needs.
+
+## Credits & Acknowledgments
+
+This Rust implementation builds upon several open source projects and ideas:
+
+- **[Moblin](https://github.com/eerimoq/moblin)** - Inspired by ideas and algorithms
+- **[Original SRTLA](https://github.com/BELABOX/srtla)** - The foundational SRTLA protocol and reference implementation by Belabox
+
+## Features
+
+### Core SRTLA Functionality
+
+- Multi-uplink bonding using a list of local source IPs
+- Registration flow (REG1/REG2/REG3) with ID propagation
+- SRT ACK and NAK handling (with correct NAK attribution to sending uplink)
+- Dynamic path selection with automatic load distribution across all connections
+- Keepalives with RTT measurement and time-based window recovery
+- Live IP list reload on Unix via SIGHUP
+- Runtime configuration via stdin or Unix socket (no restart required)
+
+### Scheduling Modes
+
+The sender supports two mutually exclusive scheduling modes:
+
+#### Enhanced Mode (Default)
+
+- **Exponential NAK Decay**: Smooth recovery from packet loss over ~8 seconds
+- **NAK Burst Detection**: Extra penalties for connections experiencing severe packet loss (≥5 NAKs)
+- **RTT-Aware Selection**: Small bonus (3% max) for lower-latency connections
+- **Quality Scoring**: Automatic preference for higher-quality connections
+- **Score Hysteresis**: 10% threshold prevents noise-driven flip-flopping while maintaining natural load distribution
+
+#### Classic Mode
+
+- Exact match to original `srtla_send.c` implementation
+- Pure capacity-based selection without quality awareness
+- Enable via `--mode classic`
+
+### Stalled-Link Deselect (On by Default)
+
+- **What it does**: Temporarily excludes a link that is holding a large in-flight backlog while producing no fresh delivery proof (no earned ACK and no keepalive round-trip within the staleness window), as long as a healthier link can carry the traffic.
+- **Independent liveness signal**: The staleness clock is stamped only on an earned ACK or a completed keepalive round-trip, never on generic inbound bytes, so a link that merely echoes traffic while its data path is dead still goes stale.
+- **Self-recovering**: A deselected link keeps sending keepalives. Its next keepalive round-trip clears the stall on its own, so the scheduler never probes a dead link blindly. Genuinely dead links are still pruned by the normal 15 second connection timeout.
+- **Selection penalty only**: It never affects timeouts, re-registration, or connection liveness. It is a routing decision, nothing more.
+- **Disable via**: `--no-stall-deselect`, or the `set_stall_deselect` JSON-RPC method. Thresholds are tunable with `--stall-min-in-flight` and `--stall-ack-stale-ms`.
+- **Use Case**: Satellite links (Starlink) during obstructions or handovers, where a link keeps a backlog but briefly stops delivering.
+
+## Assumptions and Prerequisites
+
+This tool assumes that data is streamed from a SRT _sender_ in _caller_ mode to a SRT _receiver_ in _listener_ mode. To get any benefit over using SRT directly, the _sender_ should have 2 or more network links to the SRT listener (in the typical application, these would be internet-connected 4G modems). The sender needs to have [source routing](https://tldp.org/HOWTO/Adv-Routing-HOWTO/lartc.rpdb.simple.html) configured, as srtla uses `bind()` to map UDP sockets to a given connection.
+
+## Requirements
+
+- **Rust nightly toolchain** and Cargo
+- Unix (Linux/macOS) or Windows
+  - Note: SIGHUP-based IP reload is Unix-only; Windows runs without that arm
+
+**Important:** This project requires Rust nightly due to advanced rustfmt configuration options used in the codebase.
+
+## Build
+
+```bash
+cd srtla_send
+rustup install nightly
+rustup default nightly  # Set nightly as default for this project
+cargo build --release
+# binary at target/release/srtla_send
+```
+
+Alternatively, you can use nightly for individual commands:
+
+```bash
+cargo +nightly build --release
+cargo +nightly fmt
+cargo +nightly test
+```
+
+## Testing
+
+The project includes comprehensive test suites covering unit tests, integration tests, and end-to-end tests.
+
+### Run Tests Locally
+
+```bash
+# Run all tests (requires nightly)
+cargo test
+
+# Run with verbose output
+cargo test --verbose
+
+# Run specific test
+cargo test test_connection_score
+
+# Check formatting (requires nightly)
+cargo fmt --all -- --check
+```
+
+### CI/CD
+
+The project uses GitHub Actions for continuous integration with automated testing on every push and pull request, including:
+
+- Multi-platform testing (Linux, Windows, macOS)
+- Code formatting and linting checks
+- Security vulnerability scanning
+- Build verification across multiple Rust versions
+
+## Usage
+
+```bash
+srtla_send [OPTIONS] SRT_LISTEN_PORT SRTLA_HOST SRTLA_PORT BIND_IPS_FILE
+```
+
+### Required Arguments
+
+- `SRT_LISTEN_PORT`: UDP port on which to receive SRT packets locally
+- `SRTLA_HOST`: hostname or IP of the SRTLA receiver (e.g., srtla_rec)
+- `SRTLA_PORT`: UDP port of the SRTLA receiver
+- `BIND_IPS_FILE`: path to a file with newline-separated local source IPs (uplinks)
+
+### Options
+
+- `--mode <MODE>`: Scheduling mode: `classic`, `enhanced` (default)
+- `--no-quality`: Disable quality scoring (enhanced only)
+- `--no-stall-deselect`: Disable the stalled-link deselect guard (on by default). The guard skips a link whose in-flight backlog is high while its last delivery proof (an earned ACK or keepalive round-trip) has gone stale, provided a healthier link can carry the traffic. The link recovers automatically on its next keepalive round-trip, so nothing is probed blindly. This mainly helps satellite links (Starlink obstructions and handovers) that keep a large backlog while briefly delivering nothing.
+- `--stall-min-in-flight <N>`: In-flight backlog (packets) at or above which a link becomes a stall candidate (default 32)
+- `--stall-ack-stale-ms <MS>`: Delivery-proof staleness window in milliseconds after which a stall candidate is deselected (default 3000)
+- `--no-rehome`: Disable whole-bond re-home (on by default). When every uplink has been down for longer than the all-links-failed window *and* the receiver hostname no longer resolves to the address the bond is pinned to, the sender moves every uplink together to the newly-resolved address and re-registers from scratch over the ordinary REG1/REG2/REG3 flow. It is deliberately conservative: a bond with any live uplink is never touched, a merely reordered DNS answer is not a move, a failed lookup is not a move, and at most one migration is attempted per minute. Pass this to keep the old behaviour of staying on the cached address until the process is restarted.
+- `--config <PATH>`: Path to a TOML config file (reloaded on SIGHUP)
+- `--control-socket <PATH>`: Unix domain socket path for remote control (e.g., `/tmp/srtla.sock`)
+- `--priority-bind <ADDR:PORT>`: UDP sidecar address for encoder keyframe priority hints
+- `--metrics-bind <ADDR:PORT>`: Expose a Prometheus scrape endpoint at `/metrics`
+- `-v, --version`: Print version and exit (see [Version output](#version-output))
+
+### Version output
+
+`srtla_send -v` prints the crate version, an optional git build-metadata parenthetical, and the package name:
+
+```bash
+$ ./target/release/srtla_send -v
+3.0.0 (main@974c8b9) [srtla_send]
+```
+
+The parenthetical is emitted only when the build could resolve a commit. Building outside a git checkout (an exported source tarball, a container that copies only `src/`, a vendored crate) is a normal build with nothing to name, so the metadata is omitted entirely rather than filled with a placeholder:
+
+```bash
+$ ./target/release/srtla_send -v
+3.0.0 [srtla_send]
+```
+
+A tag build (detached HEAD) reports the bare hash, `3.0.0 (974c8b9) [srtla_send]`, and a build from a modified working tree suffixes the hash with `-dirty`.
+
+## Example Usage
+
+Let's assume that the receiver has IP address 10.0.0.1 and the sender has 2 (unreliable) modems with IP addresses 192.168.0.2 and 192.168.1.2 respectively, which can reach the receiver. We'll set up the srtla sender to forward SRT traffic from port 6000 to the receiver's srtla service on port 5000.
+
+### Sender Setup
+
+```bash
+echo 192.168.0.2 > /tmp/srtla_ips
+echo 192.168.1.2 >> /tmp/srtla_ips
+./target/release/srtla_send 6000 10.0.0.1 5000 /tmp/srtla_ips
+```
+
+With `srtla_send` running on the sender, SRT-enabled applications should stream to port `6000` on the sender and this data will be forwarded through srtla to the receiver.
+
+### Additional Examples
+
+**With logging and Unix socket control:**
+
+```bash
+RUST_LOG=info ./target/release/srtla_send --control-socket /tmp/srtla.sock 6000 rec.example.com 5000 ./uplinks.txt
+```
+
+**With classic mode:**
+
+```bash
+./target/release/srtla_send --mode classic 6000 rec.example.com 5000 ./uplinks.txt
+```
+
+**With quality scoring disabled:**
+
+```bash
+./target/release/srtla_send --no-quality 6000 rec.example.com 5000 ./uplinks.txt
+```
+
+Sample `uplinks.txt`:
+
+```text
+192.0.2.10
+198.51.100.23
+203.0.113.5
+```
+
+## Logging
+
+This tool uses `tracing` with `EnvFilter`.
+
+- Control verbosity with `RUST_LOG` (e.g., `RUST_LOG=info`, `RUST_LOG=debug`).
+- Example:
+
+```bash
+RUST_LOG=info,hyper=off ./target/release/srtla_send 6000 host 5000 ./uplinks.txt
+```
+
+## Runtime Configuration
+
+The sender supports dynamic runtime configuration changes through two methods:
+
+### Method 1: Standard Input (stdin)
+
+Type commands directly into the running process and press Enter.
+
+### Method 2: Unix Domain Socket (Unix only)
+
+Use the `--control-socket` option to enable remote control via Unix socket. The wire format is JSON-RPC 2.0, one request per line. Full method reference lives at [docs/CONTROL_PROTOCOL.md](docs/CONTROL_PROTOCOL.md).
+
+```bash
+# Start with Unix socket control
+./target/release/srtla_send --control-socket /tmp/srtla.sock 6000 10.0.0.1 5000 /tmp/srtla_ips
+
+# Fetch current status
+echo '{"jsonrpc":"2.0","id":1,"method":"get_status"}' \
+    | socat - UNIX-CONNECT:/tmp/srtla.sock
+
+# Switch scheduler mode
+echo '{"jsonrpc":"2.0","id":1,"method":"set_mode","params":{"mode":"classic"}}' \
+    | socat - UNIX-CONNECT:/tmp/srtla.sock
+```
+
+### Available Methods
+
+- `set_mode { "mode": "classic"|"enhanced" }`
+- `set_quality { "enabled": bool }`
+- `get_status` returns the full config snapshot and priority-sidecar counters
+- `get_stats` returns per-link telemetry JSON
+- `subscribe` / `unsubscribe` to a topic (`stats` or `priority.window`) for streamed updates
+
+Keyframe priority hints travel on a dedicated UDP sidecar, not the control socket. See [docs/KEYFRAME_PRIORITY.md](docs/KEYFRAME_PRIORITY.md).
+
+## Prometheus `/metrics`
+
+Pass `--metrics-bind ADDR:PORT` to expose a Prometheus scrape endpoint at `/metrics`. No additional deps — hand-rolled over `tokio::net::TcpListener`. Serves `GET /metrics` and `GET /` with text format (version 0.0.4); anything else returns 404. Example:
+
+```
+srtla_send --metrics-bind 127.0.0.1:9099 \
+           --priority-bind 127.0.0.1:7000 \
+           --control-socket /tmp/srtla.sock \
+           6000 rec.example.com 5000 /tmp/uplinks
+```
+
+```
+curl -s 127.0.0.1:9099/metrics
+```
+
+Exposed series include `srtla_send_link_up`, `srtla_send_link_rtt_ms`, `srtla_send_link_window`, `srtla_send_link_in_flight`, `srtla_send_link_nak_total`, `srtla_send_link_bitrate_bytes_per_second`, `srtla_send_link_quality_multiplier`, plus aggregate `srtla_send_active_links`, `srtla_send_total_window`, `srtla_send_critical_windows_total`, and the current `srtla_send_mode` as a numeric gauge.
+
+### Connection Selection Algorithm Details
+
+**Classic Mode**: Matches the original srtla_send logic without any enhancements.
+
+**Enhanced Mode** (default): Quality-based scoring that punishes connections with recent NAKs. More recent NAKs mean more punishment. Additional 30% penalty (0.7x multiplier) for NAK bursts (≥5 NAKs in short time).
+
+## IP List Reload (Unix only)
+
+Send SIGHUP to trigger an IP list reload without restarting:
+
+```bash
+kill -HUP <pid_of_srtla_send>
+```
+
+On Windows this arm is disabled; restart the process after editing the IP list.
+
+## How It Works
+
+The core idea is that srtla keeps track of the number of packets in flight (sent but unacknowledged) for each link, together with a dynamic window size that tracks the capacity of each link - similarly to TCP congestion control. These are used together to balance the traffic through each link proportionally to its capacity. However, note that no congestion control is applied.
+
+### srtla v2 Improvements
+
+The main improvement in srtla v2 is that it supports multiple _srtla senders_ connecting to a single _srtla receiver_ by establishing _connection groups_. To support this feature, a 2-phase connection registration process is used:
+
+Normal registration:
+
+- Sender (conn 0): `SRTLA_REG1(sender_id = SRTLA_ID_LEN bytes sender-generated random id)`
+- Receiver: `SRTLA_REG2(full_id = sender_id with the last SRTLA_ID_LEN/2 bytes replaced with receiver-generated values)`
+- Sender (conn 0): `SRTLA_REG2(full_id)`
+- Receiver: `SRTLA_REG3`
+- [...]
+- Sender (conn n): `SRTLA_REG2(full_id)`
+- Receiver: `SRTLA_REG3`
+
+### Implementation Details
+
+- For each IP in `BIND_IPS_FILE`, the sender binds a UDP socket and connects to `SRTLA_HOST:SRTLA_PORT`.
+- Incoming SRT UDP packets are read on `SRT_LISTEN_PORT` and forwarded over the currently selected uplink based on the score `window / (in_flight + 1)`.
+- ACKs are applied to all uplinks to reduce in-flight counts; NAKs are attributed to the uplink that originally sent the sequence (tracked), falling back to the receiver uplink if unknown.
+- **Burst NAK Detection**: The system tracks NAK bursts (multiple NAKs within 1 second) per connection. When quality scoring is enabled, connections with recent NAK bursts (≥5 NAKs in burst, within last 3 seconds) receive an additional 0.7x multiplier (30% reduction) to their quality score, helping avoid connections experiencing packet loss issues.
+- Keepalives are sent when idle, and periodically for RTT measurement; the RTT is smoothed. Window recovery is conservative and time-based when there are no recent NAKs.
+
+## Notes
+
+- Ensure your system has the specified local source IPs configured and routable.
+- The local SRT producer (e.g., `srt-live-transmit`) should send to `udp://127.0.0.1:SRT_LISTEN_PORT`.
+- The SRTLA receiver must understand the SRTLA protocol (REG1/2/3, ACK, NAK, KEEPALIVE).
+- The sender **should** implement congestion control using adaptive bitrate based on the SRT `SRTO_SNDDATA` size or on the measured `RTT`. Due to reordering, these values may be slightly higher during uncongested operation over srtla compared to direct SRT operation over one of the same network links.
+
+## License
+
+This Rust implementation is licensed under the MIT License. See the [LICENSE](./LICENSE) file for full details.
+
+## Expected Behavior
+
+### Load Distribution
+
+With properly configured connections, you should observe:
+
+**All connections active**: Traffic should appear on all uplinks (e.g., if you have 4 uplinks, all 4 should show active bitrate)
+
+**Proportional distribution**:
+
+- With equal connections: roughly equal traffic distribution (e.g., 25% each with 4 uplinks)
+- With varying quality (enhanced mode): better connections get more traffic, degraded connections get less
+- With varying capacity: connections with larger windows get proportionally more traffic
+
+**Dynamic adaptation (enhanced mode)**:
+
+- Connections experiencing NAKs automatically receive less traffic
+- Connections recover to full capacity within ~8 seconds after issues resolve
+- System continuously rebalances based on current conditions
+
+### Monitoring
+
+**Status logs** (every 30 seconds) show:
+
+- Total bitrate across all connections
+- Individual connection status (active/timed out)
+- Window sizes and in-flight packet counts
+- RTT measurements and connection quality metrics
+- Current mode and configuration
+
+**Debug logs** (when `RUST_LOG=debug`) show:
+
+- Per-packet connection selection decisions
+- Quality multiplier calculations
+- NAK burst detections and recovery
+- Hysteresis decisions
+
+### Troubleshooting
+
+**If only some connections are used**:
+
+1. Check for NAKs in logs - degraded connections naturally get less traffic in enhanced mode
+2. Try classic mode via `set_mode { "mode": "classic" }` - disables quality awareness for pure capacity-based distribution
+3. Temporarily disable quality scoring via `set_quality { "enabled": false }`
+4. Verify all uplinks can reach the receiver (check for timeout messages)
+5. Check RTT differences - high-RTT connections get slightly less traffic in enhanced mode (3% max difference)
+
+**If throughput is lower than expected**:
+
+1. Verify SRT is not limiting the bitrate (check encoder settings)
+2. Check for high packet loss (NAKs) on connections - indicates network issues
+3. Ensure sender has sufficient CPU and network capacity
+4. Monitor SRT `SRTO_SNDDATA` buffer - if full, increase bitrate or improve connections
+5. Check connection windows in status logs - low windows indicate capacity limits
+
+**If connections are flip-flopping**:
+
+1. This should be minimal with 10% hysteresis in enhanced mode
+2. Check if scores are truly identical (look for hysteresis messages in debug logs)
+3. Verify connections have stable quality (no intermittent NAKs)
+4. Consider using classic mode for perfectly equal connections
+
+## Performance Tuning
+
+### Constants (Advanced)
+
+If needed, these can be adjusted in `src/sender/selection/`:
+
+**Enhanced Mode (`enhanced.rs`):**
+
+- `SWITCH_THRESHOLD`: 1.10 (10% hysteresis) - increase for more stability, decrease for faster response
+
+**Quality Scoring (`quality.rs`):**
+
+- `STARTUP_GRACE_PERIOD_MS`: 30000ms (30 seconds) - grace period before quality penalties apply
+- `PERFECT_CONNECTION_BONUS`: 1.1 (10% bonus) - bonus for connections with no NAKs
+- `STARTUP_NAK_PENALTY`: 0.98 (2% penalty) - light penalty during grace period
+- `HALF_LIFE_MS`: 2000ms (2 seconds) - NAK penalty decay speed
+- `MAX_PENALTY`: 0.5 (50% penalty) - maximum initial penalty after NAK
+- `NAK_BURST_THRESHOLD`: 5 NAKs - minimum burst size to trigger extra penalty
+- `NAK_BURST_MAX_AGE_MS`: 3000ms (3 seconds) - max age for burst penalty
+- `NAK_BURST_PENALTY`: 0.7 (30% reduction) - multiplier applied for bursts
+- `RTT_BONUS_THRESHOLD_MS`: 200ms - RTT threshold for bonus calculation
+- `MIN_RTT_MS`: 50ms - minimum RTT for calculation (prevents division issues)
+- `MAX_RTT_BONUS`: 1.03 (3% max bonus) - maximum RTT bonus multiplier
+
+### Runtime Optimization
+
+For maximum throughput:
+
+- Use enhanced mode (default) to automatically avoid degraded connections
+- Ensure adequate SRT buffer size (`SRTO_SNDDATA`)
+- Monitor for connection timeouts - these interrupt traffic flow
+- Use `RUST_LOG=info` for minimal logging overhead (avoid debug in production)
+
+For maximum stability:
+
+- Use classic mode (`--mode classic`) for predictable, simple behavior
+- Increase hysteresis threshold if experiencing unnecessary switching
