@@ -1,10 +1,12 @@
 #include "obs-srtla-dock.hpp"
 
 #include "network-monitor.hpp"
+#include "secret-store.hpp"
 
 #include <obs.h>
 #include <obs-encoder.h>
 #include <obs-frontend-api.h>
+#include <util/config-file.h>
 
 #include <QCheckBox>
 #include <QAbstractItemView>
@@ -18,12 +20,13 @@
 #include <QLineEdit>
 #include <QSignalBlocker>
 #include <QPushButton>
+#include <QUrl>
+#include <QUrlQuery>
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTimer>
 #include <QVBoxLayout>
-#include <QSettings>
 
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +38,93 @@ extern "C" int srtla_output_update_adapters(struct obs_output *output);
 extern "C" std::size_t srtla_output_copy_stats_json(struct obs_output *output, char *buffer, std::size_t capacity);
 
 namespace {
+
+constexpr char config_section[] = "SrtlaOutput";
+
+config_t *profile_config()
+{
+	return obs_frontend_get_profile_config();
+}
+
+QString profile_string(const char *name, const QString &fallback = {})
+{
+	auto *config = profile_config();
+	if (!config || !config_has_user_value(config, config_section, name))
+		return fallback;
+	const char *value = config_get_string(config, config_section, name);
+	return value ? QString::fromUtf8(value) : fallback;
+}
+
+struct LegacyUrlFields {
+	QString endpoint;
+	QString stream_id;
+	QString passphrase;
+	int latency_ms = 2000;
+	int pbkeylen = 16;
+	bool has_stream_id = false;
+	bool has_passphrase = false;
+	bool has_latency = false;
+	bool has_pbkeylen = false;
+};
+
+LegacyUrlFields parse_legacy_url(const QString &raw)
+{
+	LegacyUrlFields fields;
+	QUrl url(raw);
+	if (!url.isValid() || url.scheme().isEmpty()) {
+		fields.endpoint = raw;
+		return fields;
+	}
+	fields.endpoint = url.toString(QUrl::RemoveQuery | QUrl::RemoveFragment);
+	const QUrlQuery query(url);
+	for (const auto &[key, value] : query.queryItems(QUrl::FullyDecoded)) {
+		if (key == QStringLiteral("streamid") || key == QStringLiteral("stream_id")) {
+			fields.stream_id = value;
+			fields.has_stream_id = true;
+		} else if (key == QStringLiteral("passphrase") || key == QStringLiteral("password")) {
+			fields.passphrase = value;
+			fields.has_passphrase = true;
+		} else if (key == QStringLiteral("latency") || key == QStringLiteral("latency_ms")) {
+			bool ok = false;
+			const auto parsed = value.toInt(&ok);
+			if (ok && parsed >= 120 && parsed <= 60000) {
+				fields.latency_ms = parsed;
+				fields.has_latency = true;
+			}
+		} else if (key == QStringLiteral("pbkeylen")) {
+			bool ok = false;
+			const auto parsed = value.toInt(&ok);
+			if (ok && (parsed == 16 || parsed == 24 || parsed == 32)) {
+				fields.pbkeylen = parsed;
+				fields.has_pbkeylen = true;
+			}
+		}
+	}
+	return fields;
+}
+
+bool profile_bool(const char *name, bool fallback)
+{
+	auto *config = profile_config();
+	return config && config_has_user_value(config, config_section, name)
+		? config_get_bool(config, config_section, name)
+		: fallback;
+}
+
+int profile_int(const char *name, int fallback)
+{
+	auto *config = profile_config();
+	return config && config_has_user_value(config, config_section, name)
+		? static_cast<int>(config_get_int(config, config_section, name))
+		: fallback;
+}
+
+void save_profile_config()
+{
+	auto *config = profile_config();
+	if (config && config_save_safe(config, "tmp", nullptr) != CONFIG_SUCCESS)
+		blog(LOG_WARNING, "[obs-srtla-output] Failed to save dock settings");
+}
 
 bool is_supported_video_codec(const char *codec)
 {
@@ -117,6 +207,9 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	auto *controls = new QFormLayout();
 	startStop_ = new QPushButton(tr("Start"), this);
 	url_ = new QLineEdit(QStringLiteral("srtla://receiver.example:5000"), this);
+	streamId_ = new QLineEdit(this);
+	passphrase_ = new QLineEdit(this);
+	passphrase_->setEchoMode(QLineEdit::Password);
 	encoderSource_ = new QComboBox(this);
 	encoderSource_->addItem(tr("Streaming"), QStringLiteral("streaming"));
 	encoderSource_->addItem(tr("Recording"), QStringLiteral("recording"));
@@ -139,18 +232,11 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	maxBitrate_->setSuffix(tr(" kb/s"));
 	state_ = new QLabel(tr("Idle"), this);
 	metrics_ = new QLabel(tr("Capacity: -- | Used: -- | Active links: 0"), this);
-	{
-		QSettings settings;
-		url_->setText(settings.value(QStringLiteral("obs-srtla/url"), url_->text()).toString());
-		select_combo_data(encoderSource_, settings.value(QStringLiteral("obs-srtla/encoder_source"), QStringLiteral("streaming")).toString());
-		select_combo_data(customVideoEncoder_, settings.value(QStringLiteral("obs-srtla/custom_video_encoder")).toString());
-		select_combo_data(customAudioEncoder_, settings.value(QStringLiteral("obs-srtla/custom_audio_encoder")).toString());
-		autoBitrate_->setChecked(settings.value(QStringLiteral("obs-srtla/auto_bitrate"), true).toBool());
-		manualBitrate_->setValue(settings.value(QStringLiteral("obs-srtla/bitrate"), 1500).toInt());
-		maxBitrate_->setValue(settings.value(QStringLiteral("obs-srtla/max_bitrate"), 100000).toInt());
-	}
+	loadProfile();
 	controls->addRow(tr("State"), state_);
 	controls->addRow(tr("SRTLA URL"), url_);
+	controls->addRow(tr("Stream ID"), streamId_);
+	controls->addRow(tr("Passphrase"), passphrase_);
 	controls->addRow(tr("Encoder"), encoderSource_);
 	controls->addRow(tr("Custom video encoder"), customVideoEncoder_);
 	controls->addRow(tr("Custom audio encoder"), customAudioEncoder_);
@@ -180,8 +266,7 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 			return;
 		}
 		selected_[key] = enabled;
-		QSettings settings;
-		settings.setValue(QStringLiteral("obs-srtla/links/") + QString::fromStdString(key), selected_[key]);
+		saveSelectedLinks();
 	});
 	layout->addWidget(links_, 1);
 
@@ -215,28 +300,161 @@ SrtlaDock::~SrtlaDock()
 		obs_data_release(settings_);
 }
 
+void SrtlaDock::loadProfile()
+{
+	secret_error_ = false;
+	selected_.clear();
+	const auto raw_url = profile_string("Url", QStringLiteral("srtla://receiver.example:5000"));
+	const auto legacy = parse_legacy_url(raw_url);
+	url_->setText(legacy.endpoint.isEmpty() ? raw_url : legacy.endpoint);
+	latency_ms_ = profile_int("LatencyMs", legacy.has_latency ? legacy.latency_ms : 2000);
+	pbkeylen_ = profile_int("Pbkeylen", legacy.has_pbkeylen ? legacy.pbkeylen : 16);
+	if (legacy.has_latency)
+		latency_ms_ = legacy.latency_ms;
+	if (legacy.has_pbkeylen)
+		pbkeylen_ = legacy.pbkeylen;
+	QString stream_id = profile_string("StreamId");
+	if (stream_id.isEmpty() && legacy.has_stream_id)
+		stream_id = legacy.stream_id;
+	streamId_->setText(stream_id);
+
+	const auto protected_secret = profile_string("PassphraseDpapi");
+	QString passphrase;
+	if (!protected_secret.isEmpty()) {
+		passphrase = QString::fromStdString(unprotect_srtla_secret(protected_secret.toStdString()));
+		if (passphrase.isEmpty())
+			secret_error_ = true;
+	} else if (legacy.has_passphrase) {
+		passphrase = legacy.passphrase;
+	}
+	passphrase_->setText(passphrase);
+	select_combo_data(encoderSource_, profile_string("EncoderSource", QStringLiteral("streaming")));
+	select_combo_data(customVideoEncoder_, profile_string("CustomVideoEncoder"));
+	select_combo_data(customAudioEncoder_, profile_string("CustomAudioEncoder"));
+	autoBitrate_->setChecked(profile_bool("AutoBitrate", true));
+	manualBitrate_->setValue(profile_int("Bitrate", 1500));
+	maxBitrate_->setValue(profile_int("MaxBitrate", 100000));
+
+	const auto enabled_links = profile_string("EnabledLinks").toStdString();
+	std::size_t start = 0;
+	while (start <= enabled_links.size()) {
+		const auto end = enabled_links.find(',', start);
+		const auto id = enabled_links.substr(start, end == std::string::npos ? std::string::npos : end - start);
+		if (!id.empty())
+			selected_[id] = true;
+		if (end == std::string::npos)
+			break;
+		start = end + 1;
+	}
+	if (legacy.endpoint != raw_url) {
+		// Remove legacy query/fragment material even when a previously protected
+		// secret exists.  If that secret cannot be opened, preserve it and keep
+		// startup blocked rather than silently replacing it with plaintext or an
+		// empty encrypted value.
+		if (secret_error_) {
+			if (auto *config = profile_config()) {
+				config_set_string(config, config_section, "Url", legacy.endpoint.toUtf8().constData());
+				save_profile_config();
+			}
+		} else {
+			(void)saveProfile();
+		}
+	}
+}
+
+bool SrtlaDock::saveProfile()
+{
+	auto *config = profile_config();
+	if (!config)
+		return false;
+	const auto parsed = parse_legacy_url(url_->text());
+	const auto endpoint = parsed.endpoint.isEmpty() ? url_->text() : parsed.endpoint;
+	if (parsed.has_latency)
+		latency_ms_ = parsed.latency_ms;
+	if (parsed.has_pbkeylen)
+		pbkeylen_ = parsed.pbkeylen;
+	const auto passphrase = passphrase_->text().toUtf8().toStdString();
+	std::string protected_secret;
+	if (!passphrase.empty()) {
+		if (passphrase.size() < 10 || passphrase.size() > 79)
+			return false;
+		protected_secret = protect_srtla_secret(passphrase);
+		if (protected_secret.empty())
+			return false;
+	}
+	config_set_string(config, config_section, "Url", endpoint.toUtf8().constData());
+	config_set_string(config, config_section, "StreamId", streamId_->text().toUtf8().constData());
+	config_set_string(config, config_section, "PassphraseDpapi", protected_secret.c_str());
+	config_set_int(config, config_section, "LatencyMs", latency_ms_);
+	config_set_int(config, config_section, "Pbkeylen", pbkeylen_);
+	config_set_string(config, config_section, "EncoderSource", encoderSource_->currentData().toString().toUtf8().constData());
+	config_set_string(config, config_section, "CustomVideoEncoder", customVideoEncoder_->currentData().toString().toUtf8().constData());
+	config_set_string(config, config_section, "CustomAudioEncoder", customAudioEncoder_->currentData().toString().toUtf8().constData());
+	config_set_bool(config, config_section, "AutoBitrate", autoBitrate_->isChecked());
+	config_set_int(config, config_section, "Bitrate", manualBitrate_->value());
+	config_set_int(config, config_section, "MaxBitrate", maxBitrate_->value());
+	save_profile_config();
+	secret_error_ = false;
+	return true;
+}
+
+void SrtlaDock::reloadProfile()
+{
+	stopOutput();
+	if (output_) {
+		obs_output_release(output_);
+		output_ = nullptr;
+	}
+	if (settings_) {
+		obs_data_release(settings_);
+		settings_ = nullptr;
+	}
+	loadProfile();
+	refreshAdapters();
+}
+
+bool SrtlaDock::sharesEncoderWith(obs_output_t *other) const
+{
+	if (!output_ || !other || output_ == other)
+		return false;
+	const auto *video = obs_output_get_video_encoder(output_);
+	const auto *other_video = obs_output_get_video_encoder(other);
+	if (video && video == other_video)
+		return true;
+	const auto *audio = obs_output_get_audio_encoder(output_, 0);
+	const auto *other_audio = obs_output_get_audio_encoder(other, 0);
+	return audio && audio == other_audio;
+}
+
 void SrtlaDock::stopOutput()
 {
-	if (!running_)
-		return;
 	running_ = false;
 	if (output_ && obs_output_active(output_))
 		obs_output_stop(output_);
-	startStop_->setText(tr("Start"));
-	state_->setText(tr("Idle"));
+	// Profile-bound OBS objects must not survive a profile transition (or be
+	// reused after a failed start).  Releasing the output also waits for OBS's
+	// asynchronous encoder-capture teardown before a new profile is loaded.
+	if (output_) {
+		obs_output_release(output_);
+		output_ = nullptr;
+	}
+	if (settings_) {
+		obs_data_release(settings_);
+		settings_ = nullptr;
+	}
+	if (startStop_) startStop_->setText(tr("Start"));
+	if (state_) state_->setText(tr("Idle"));
 }
 
 void SrtlaDock::refreshAdapters()
 {
 	const auto adapters = NetworkMonitor().enumerate();
-	QSettings settings;
 	QSignalBlocker blocker(links_);
 	links_->setRowCount(static_cast<int>(adapters.size()));
 	for (int row = 0; row < links_->rowCount(); ++row) {
 		const auto &adapter = adapters[static_cast<size_t>(row)];
-		const auto persisted = settings.value(QStringLiteral("obs-srtla/links/") + QString::fromStdString(adapter.id));
-		const bool enabled = persisted.isValid() ? persisted.toBool() : adapter.enabled;
-		selected_[adapter.id] = enabled;
+		const auto selection = selected_.try_emplace(adapter.id, adapter.enabled).first;
+		const bool enabled = selection->second;
 		auto *use = new QTableWidgetItem();
 		use->setCheckState(enabled ? Qt::Checked : Qt::Unchecked);
 		links_->setItem(row, 0, use);
@@ -252,6 +470,23 @@ void SrtlaDock::refreshAdapters()
 	}
 	if (output_ && running_)
 		srtla_output_update_adapters(output_);
+}
+
+void SrtlaDock::saveSelectedLinks()
+{
+	std::string enabled_links;
+	for (const auto &[id, enabled] : selected_) {
+		if (!enabled)
+			continue;
+		if (!enabled_links.empty())
+			enabled_links += ',';
+		enabled_links += id;
+	}
+	auto *config = profile_config();
+	if (!config)
+		return;
+	config_set_string(config, config_section, "EnabledLinks", enabled_links.c_str());
+	save_profile_config();
 }
 
 void SrtlaDock::toggleOutput()
@@ -325,17 +560,14 @@ void SrtlaDock::toggleOutput()
 		return;
 	}
 
-	obs_data_set_string(settings_, "url", url_->text().toUtf8().constData());
-	{
-		QSettings settings;
-		settings.setValue(QStringLiteral("obs-srtla/url"), url_->text());
-		settings.setValue(QStringLiteral("obs-srtla/encoder_source"), encoder_source);
-		settings.setValue(QStringLiteral("obs-srtla/custom_video_encoder"), customVideoEncoder_->currentData().toString());
-		settings.setValue(QStringLiteral("obs-srtla/custom_audio_encoder"), customAudioEncoder_->currentData().toString());
-		settings.setValue(QStringLiteral("obs-srtla/auto_bitrate"), autoBitrate_->isChecked());
-		settings.setValue(QStringLiteral("obs-srtla/bitrate"), manualBitrate_->value());
-		settings.setValue(QStringLiteral("obs-srtla/max_bitrate"), maxBitrate_->value());
+	if (secret_error_ || !saveProfile()) {
+		state_->setText(tr("Error: passphrase could not be protected"));
+		return;
 	}
+	obs_data_set_string(settings_, "url", parse_legacy_url(url_->text()).endpoint.toUtf8().constData());
+	obs_data_set_string(settings_, "stream_id", streamId_->text().toUtf8().constData());
+	obs_data_set_string(settings_, "passphrase_dpapi", "");
+	obs_data_set_string(settings_, "passphrase", passphrase_->text().toUtf8().constData());
 	std::string enabled_links;
 	for (const auto &[id, enabled] : selected_) {
 		if (enabled) {
@@ -351,8 +583,8 @@ void SrtlaDock::toggleOutput()
 	obs_data_set_int(settings_, "max_bitrate", maxBitrate_->value());
 	obs_data_set_int(settings_, "audio_bitrate", 128);
 	obs_data_set_double(settings_, "safety_margin", 0.80);
-	obs_data_set_int(settings_, "latency_ms", 2000);
-	obs_data_set_int(settings_, "pbkeylen", 16);
+	obs_data_set_int(settings_, "latency_ms", latency_ms_);
+	obs_data_set_int(settings_, "pbkeylen", pbkeylen_);
 	obs_data_set_string(settings_, "scheduler", "enhanced");
 	obs_data_set_string(settings_, "encoder_source", encoder_source.toUtf8().constData());
 	obs_data_set_string(settings_, "encoder_mode", custom_encoder ? "dedicated" : "shared");
@@ -382,7 +614,9 @@ void SrtlaDock::toggleOutput()
 		obs_output_release(source_output);
 	obs_output_update(output_, settings_);
 	if (!obs_output_start(output_)) {
-		state_->setText(tr("Error: output start failed"));
+		const char *error = obs_output_get_last_error(output_);
+		const QString detail = error && *error ? QString::fromUtf8(error) : tr("output start failed");
+		state_->setText(tr("Error: %1").arg(detail));
 		return;
 	}
 	running_ = true;

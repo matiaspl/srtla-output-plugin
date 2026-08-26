@@ -11,6 +11,9 @@ No localhost UDP proxy is created by the plugin.  The embedded runner now owns
 the SRTLA uplink sockets and the patched libsrt transport callbacks in-process;
 wire compatibility still requires the Windows/receiver integration tests below.
 
+For a Windows local receiver/relay walkthrough and operating checklist, see
+[`docs/SRTLA-LOCAL-RELAY.md`](docs/SRTLA-LOCAL-RELAY.md).
+
 ## Current status
 
 This repository is being built in vertical slices. The current slice contains
@@ -73,7 +76,8 @@ cmake -S . -B build-obs -G "Visual Studio 18 2026" -A x64 `
   -DOBS_SRTLA_OBS_SOURCE_DIR="$PWD/tools/obs-source" `
   -DOBS_SRTLA_OBS_IMPORT_LIB_DIR="$PWD/tools/obs-dev" `
   -DOBS_SRTLA_OBS_RUNTIME_DIR="C:/Program Files/obs-studio/bin/64bit" `
-  -DOBS_SRTLA_FFMPEG_ROOT="$PWD/tools/obs-ffmpeg-dev"
+  -DOBS_SRTLA_FFMPEG_ROOT="$PWD/tools/obs-ffmpeg-dev" `
+  -DOBS_SRTLA_REQUIRE_PLUGIN=ON
 cmake --build build-obs --config Release --target obs-srtla-output
 ```
 

@@ -12,10 +12,29 @@ static SrtlaDock *dock = nullptr;
 
 static void frontend_event(enum obs_frontend_event event, void *)
 {
-	if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING && dock)
-		// Shared encoders cannot be used by two active outputs.  Stop the
-		// dock-owned SRTLA output before OBS starts its primary stream.
+	if (!dock)
+		return;
+	if (event == OBS_FRONTEND_EVENT_PROFILE_CHANGING) {
 		dock->stopOutput();
+		return;
+	}
+	if (event == OBS_FRONTEND_EVENT_PROFILE_CHANGED) {
+		dock->reloadProfile();
+		return;
+	}
+	obs_output_t *other = nullptr;
+	if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING)
+		other = obs_frontend_get_streaming_output();
+	else if (event == OBS_FRONTEND_EVENT_RECORDING_STARTING)
+		other = obs_frontend_get_recording_output();
+	else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTING)
+		other = obs_frontend_get_replay_buffer_output();
+	if (other) {
+		const bool conflict = dock->sharesEncoderWith(other);
+		obs_output_release(other);
+		if (conflict)
+			dock->stopOutput();
+	}
 }
 
 MODULE_EXPORT const char *obs_module_description(void)
@@ -40,7 +59,11 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
-	obs_frontend_remove_dock("obs-srtla-output-dock");
-	delete dock;
+	// obs_frontend_add_dock_by_id transfers ownership of the QWidget to OBS.
+	// obs_frontend_remove_dock() drops OBS's shared_ptr and destroys the dock;
+	// deleting it again here leaves the dock's output pointer dangling and can
+	// crash in obs_output_release during OBS shutdown.
+	if (dock)
+		obs_frontend_remove_dock("obs-srtla-output-dock");
 	dock = nullptr;
 }

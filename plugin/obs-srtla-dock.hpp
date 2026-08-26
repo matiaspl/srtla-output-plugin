@@ -22,13 +22,20 @@ public:
 
 	void refreshAdapters();
 	void stopOutput();
+	void reloadProfile();
+	bool sharesEncoderWith(struct obs_output *other) const;
 
 private:
 	void toggleOutput();
 	void refreshStatus();
+	void saveSelectedLinks();
+	void loadProfile();
+	bool saveProfile();
 
 	QPushButton *startStop_ = nullptr;
 	QLineEdit *url_ = nullptr;
+	QLineEdit *streamId_ = nullptr;
+	QLineEdit *passphrase_ = nullptr;
 	QComboBox *encoderSource_ = nullptr;
 	QComboBox *customVideoEncoder_ = nullptr;
 	QComboBox *customAudioEncoder_ = nullptr;
@@ -40,6 +47,9 @@ private:
 	QTableWidget *links_ = nullptr;
 	QTimer *timer_ = nullptr;
 	bool running_ = false;
+	bool secret_error_ = false;
+	int latency_ms_ = 2000;
+	int pbkeylen_ = 16;
 	std::unordered_map<std::string, bool> selected_;
 	struct obs_output *output_ = nullptr;
 	struct obs_data *settings_ = nullptr;

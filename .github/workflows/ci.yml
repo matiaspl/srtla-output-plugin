@@ -17,20 +17,52 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
       - run: cargo test --manifest-path engine/Cargo.toml
+      - run: cargo clippy --manifest-path engine/Cargo.toml -- -D warnings
       - run: cargo test --manifest-path third_party/srtla_send/Cargo.toml --workspace
 
-  native:
+  native-plugin:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
+      - name: Provision pinned OBS 32.2.1 / FFmpeg 8.1.2 / Qt 6 / mbedTLS 3
+        shell: pwsh
+        run: .\scripts\prepare-obs-ci.ps1
+      - name: Load dependency paths
+        shell: pwsh
+        run: |
+          Get-Content .ci-deps\paths.env | ForEach-Object {
+            $name, $value = $_ -split '=', 2
+            "${name}=$value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
       - name: Configure
-        run: cmake -S . -B build -DOBS_SRTLA_BUILD_TESTS=ON -DOBS_SRTLA_BUILD_VENDOR_SRT=ON
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DOBS_SRTLA_BUILD_TESTS=ON
+          -DOBS_SRTLA_BUILD_VENDOR_SRT=ON
+          -DOBS_SRTLA_REQUIRE_PLUGIN=ON
+          -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH"
+          -DOBS_SRTLA_OBS_SOURCE_DIR="$env:OBS_SRTLA_OBS_SOURCE_DIR"
+          -DOBS_SRTLA_OBS_IMPORT_LIB_DIR="$env:OBS_SRTLA_OBS_IMPORT_LIB_DIR"
+          -DOBS_SRTLA_OBS_RUNTIME_DIR="$env:OBS_SRTLA_OBS_RUNTIME_DIR"
+          -DOBS_SRTLA_FFMPEG_ROOT="$env:OBS_SRTLA_FFMPEG_ROOT"
+          -DOBS_SRTLA_MBEDTLS_ROOT="$env:OBS_SRTLA_MBEDTLS_ROOT"
       - name: Build
-        run: cmake --build build --config Release --parallel
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target obs-srtla-output --parallel
+          if (!(Test-Path build\plugin\obs-srtla-output.dll)) { throw 'The plugin target did not produce obs-srtla-output.dll' }
       - name: Test
+        shell: pwsh
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: cpack --config build\CPackConfig.cmake -C Release

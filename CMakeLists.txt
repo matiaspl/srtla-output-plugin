@@ -11,9 +11,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(OBS_SRTLA_BUILD_TESTS "Build native unit tests" ON)
 option(OBS_SRTLA_BUILD_VENDOR_SRT "Build the vendored libsrt fork" ON)
+option(OBS_SRTLA_REQUIRE_PLUGIN
+       "Fail configuration when the OBS plugin target cannot be built" OFF)
 option(OBS_SRTLA_USE_OBS_RUNTIME_DEPS
        "Use Qt/FFmpeg/libobs DLLs supplied by the installed OBS runtime" ON)
 set(OBS_SRTLA_OBS_PLUGIN_DIR "obs-plugins/64bit" CACHE PATH "OBS plugin install directory")
+set(OBS_SRTLA_OBS_DATA_DIR "data/obs-plugins" CACHE PATH "OBS plugin data directory")
 set(_ffmpeg_root_default "")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev/include/libavformat/avformat.h")
   set(_ffmpeg_root_default "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev")
@@ -65,6 +68,12 @@ if(OBS_SRTLA_MBEDTLS_ROOT)
       list(APPEND OBS_SRTLA_MBEDTLS_LIBRARIES bcrypt)
     endif()
   endif()
+endif()
+
+if(OBS_SRTLA_REQUIRE_PLUGIN AND
+   (NOT OBS_SRTLA_MBEDTLS_LIBRARY OR NOT OBS_SRTLA_MBEDCRYPTO_LIBRARY OR
+    NOT OBS_SRTLA_MBEDX509_LIBRARY))
+  message(FATAL_ERROR "mbedTLS development libraries were not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
 endif()
 
 # The binary OBS distribution contains the runtime DLLs, but deliberately does
@@ -175,8 +184,14 @@ if(NOT TARGET OBS::libobs AND WIN32 AND
 endif()
 
 if(NOT TARGET OBS::libobs)
+  if(OBS_SRTLA_REQUIRE_PLUGIN)
+    message(FATAL_ERROR "OBS development targets were not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
+  endif()
   message(WARNING "OBS development targets were not found; only the Rust/ABR slice can be built.")
 elseif(NOT TARGET Qt6::Widgets)
+  if(OBS_SRTLA_REQUIRE_PLUGIN)
+    message(FATAL_ERROR "Qt6 Widgets was not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
+  endif()
   message(WARNING "Qt6 Widgets was not found; OBS plugin target is disabled.")
 else()
   find_path(OBS_SRTLA_FFMPEG_INCLUDE_DIR
@@ -193,6 +208,9 @@ else()
                HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
   if(NOT OBS_SRTLA_FFMPEG_INCLUDE_DIR OR NOT OBS_SRTLA_FFMPEG_AVFORMAT OR
      NOT OBS_SRTLA_FFMPEG_AVCODEC OR NOT OBS_SRTLA_FFMPEG_AVUTIL)
+    if(OBS_SRTLA_REQUIRE_PLUGIN)
+      message(FATAL_ERROR "FFmpeg development headers/libraries were not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
+    endif()
     message(WARNING "FFmpeg development headers/libraries were not found; the OBS plugin target is disabled. Set OBS_SRTLA_FFMPEG_ROOT to an FFmpeg development prefix.")
   else()
     set(OBS_SRTLA_FFMPEG_LIBRARIES
@@ -201,6 +219,10 @@ else()
         "${OBS_SRTLA_FFMPEG_AVUTIL}")
     add_subdirectory(plugin)
   endif()
+endif()
+
+if(OBS_SRTLA_REQUIRE_PLUGIN AND NOT TARGET obs-srtla-output)
+  message(FATAL_ERROR "obs-srtla-output plugin target was not created; OBS_SRTLA_REQUIRE_PLUGIN is ON")
 endif()
 
 if(OBS_SRTLA_BUILD_TESTS)
@@ -219,4 +241,13 @@ if(OBS_SRTLA_BUILD_TESTS)
     endif()
     add_test(NAME srt_transport_abi_test COMMAND srt_transport_abi_test)
   endif()
+  add_executable(output_capture_lifecycle_test tests/output_capture_lifecycle_test.cpp)
+  target_include_directories(output_capture_lifecycle_test PRIVATE plugin)
+  add_test(NAME output_capture_lifecycle_test COMMAND output_capture_lifecycle_test)
+  add_executable(srtla_secret_store_test tests/secret_store_test.cpp plugin/secret-store.cpp)
+  target_include_directories(srtla_secret_store_test PRIVATE plugin)
+  if(WIN32)
+    target_link_libraries(srtla_secret_store_test PRIVATE crypt32)
+  endif()
+  add_test(NAME srtla_secret_store_test COMMAND srtla_secret_store_test)
 endif()

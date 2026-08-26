@@ -2,6 +2,7 @@
 
 mod abr;
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -18,6 +19,20 @@ pub use abr::{AbrConfig, AbrController, AbrDecision, AbrSample, LinkCapacity};
 
 const ENGINE_INPUT_CAPACITY: usize = 1024;
 const ENGINE_OUTPUT_CAPACITY: usize = 256;
+
+const SESSION_IDLE: u32 = 0;
+const SESSION_CONNECTING: u32 = 1;
+const SESSION_CONNECTED: u32 = 2;
+const SESSION_RECONNECTING: u32 = 3;
+const SESSION_FATAL: u32 = 4;
+const SESSION_STOPPED: u32 = 5;
+
+thread_local! {
+    // The ABI returns a pointer for historical compatibility.  Keep the
+    // pointed-to bytes in caller-thread storage instead of exposing memory
+    // owned by the engine mutex (which another thread can mutate or free).
+    static LAST_ERROR_VIEW: RefCell<CString> = RefCell::new(CString::new("").expect("empty CString"));
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -116,6 +131,8 @@ struct EngineSnapshot {
     estimated_capacity_bps: u64,
     recommended_video_bps: u64,
     current_video_bps: u64,
+    srt_session_state: String,
+    srt_connected: bool,
     links: Vec<LinkSnapshot>,
 }
 
@@ -255,6 +272,8 @@ struct Engine {
     current_video_bps: u64,
     audio_bps: u64,
     last_error: CString,
+    session_state: u32,
+    session_error: String,
     runner: Option<EmbeddedSender>,
 }
 
@@ -346,22 +365,49 @@ impl Engine {
     }
 
     fn snapshot(&self) -> EngineSnapshot {
+        let srt_connected = self.session_state == SESSION_CONNECTED;
+        let srt_session_state = match self.session_state {
+            SESSION_CONNECTING => "Connecting",
+            SESSION_CONNECTED => "Connected",
+            SESSION_RECONNECTING => "Reconnecting",
+            SESSION_FATAL => "Fatal",
+            SESSION_STOPPED => "Stopped",
+            _ => "Idle",
+        }
+        .to_string();
+        let has_live_link = self
+            .config
+            .links
+            .iter()
+            .any(|l| l.enabled && l.connected && l.payload_eligible);
         EngineSnapshot {
             receiver_host: self.config.receiver_host.clone(),
             receiver_port: self.config.receiver_port,
             running: self.running,
-            state: if !self.last_error.to_string_lossy().is_empty() {
+            state: if !self.last_error.to_string_lossy().is_empty()
+                || self.session_state == SESSION_FATAL
+            {
                 "Error".to_string()
             } else if !self.running {
                 "Idle".to_string()
-            } else if self.config.links.iter().any(|l| l.enabled && l.connected) {
+            } else if self.session_state == SESSION_CONNECTING {
+                "Starting".to_string()
+            } else if self.session_state == SESSION_RECONNECTING
+                || self.session_state == SESSION_STOPPED
+            {
+                "Reconnecting".to_string()
+            } else if srt_connected && has_live_link {
                 "Live".to_string()
             } else if self.config.links.iter().any(|l| l.enabled) {
                 "Reconnecting".to_string()
             } else {
                 "Waiting for network".to_string()
             },
-            error: self.last_error.to_string_lossy().into_owned(),
+            error: if !self.last_error.to_string_lossy().is_empty() {
+                self.last_error.to_string_lossy().into_owned()
+            } else {
+                self.session_error.clone()
+            },
             queue_in: self.input.len(),
             queue_out: self.output.len(),
             estimated_capacity_bps: self
@@ -401,6 +447,8 @@ impl Engine {
                 }
             },
             current_video_bps: self.current_video_bps,
+            srt_session_state,
+            srt_connected,
             links: self
                 .config
                 .links
@@ -519,6 +567,8 @@ pub extern "C" fn srtla_engine_create_v1(config_json: *const c_char) -> *mut Srt
         current_video_bps: start_bps,
         audio_bps,
         last_error: CString::new("").expect("empty CString"),
+        session_state: SESSION_IDLE,
+        session_error: String::new(),
         runner: None,
     });
     Box::into_raw(Box::new(SrtlaEngineHandle {
@@ -533,6 +583,8 @@ pub extern "C" fn srtla_engine_start(handle: *mut SrtlaEngineHandle) -> i32 {
             engine.input.reopen();
             engine.output.reopen();
             engine.last_error = CString::new("").expect("empty CString");
+            engine.session_state = SESSION_IDLE;
+            engine.session_error.clear();
             if engine.runner.is_none()
                 && engine
                     .config
@@ -554,6 +606,8 @@ pub extern "C" fn srtla_engine_stop(handle: *mut SrtlaEngineHandle) -> i32 {
     match with_engine(handle) {
         Some(mut engine) => {
             engine.running = false;
+            engine.session_state = SESSION_STOPPED;
+            engine.session_error.clear();
             engine.input.close();
             engine.output.close();
             if let Some(mut runner) = engine.runner.take() {
@@ -815,6 +869,8 @@ struct LinkStatsUpdate {
     #[serde(default)]
     connected: bool,
     #[serde(default)]
+    payload_eligible: bool,
+    #[serde(default)]
     capacity_ready: bool,
     #[serde(default)]
     target_bps: u64,
@@ -851,6 +907,7 @@ pub extern "C" fn srtla_engine_update_link_stats(
                 .map(|l| LinkStatsUpdate {
                     id: l.id,
                     connected: l.connected,
+                    payload_eligible: l.payload_eligible,
                     capacity_ready: l.capacity_ready,
                     target_bps: l.target_bps,
                     quality_percent: l.quality_percent,
@@ -875,6 +932,7 @@ pub extern "C" fn srtla_engine_update_link_stats(
             .find(|link| link.id == update.id)
         {
             link.connected = update.connected;
+            link.payload_eligible = update.payload_eligible;
             link.capacity_ready = update.capacity_ready;
             link.target_bps = update.target_bps;
             link.quality_percent = update.quality_percent;
@@ -910,6 +968,34 @@ pub extern "C" fn srtla_engine_set_video_bitrate(
     };
     engine.current_video_bps =
         video_bps.clamp(engine.abr.config().min_bps, engine.abr.config().max_bps);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_set_session_state(
+    handle: *mut SrtlaEngineHandle,
+    state: u32,
+    error: *const c_char,
+) -> i32 {
+    if state > SESSION_STOPPED {
+        return -1;
+    }
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    engine.session_state = state;
+    engine.session_error = if error.is_null() {
+        String::new()
+    } else {
+        // SAFETY: caller promises a NUL-terminated string for the duration of the call.
+        unsafe { CStr::from_ptr(error) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    if state == SESSION_FATAL {
+        engine.last_error = CString::new(engine.session_error.clone())
+            .unwrap_or_else(|_| CString::new("SRT session failure").expect("literal CString"));
+    }
     0
 }
 
@@ -954,7 +1040,13 @@ pub extern "C" fn srtla_engine_last_error(handle: *mut SrtlaEngineHandle) -> *co
     let Some(engine) = with_engine(handle) else {
         return ptr::null();
     };
-    engine.last_error.as_ptr()
+    let value = engine.last_error.to_string_lossy().into_owned();
+    drop(engine);
+    LAST_ERROR_VIEW.with(|slot| {
+        *slot.borrow_mut() = CString::new(value)
+            .unwrap_or_else(|_| CString::new("engine error").expect("literal CString"));
+        slot.borrow().as_ptr()
+    })
 }
 
 #[cfg(test)]
@@ -1029,6 +1121,61 @@ mod tests {
         assert!(!handle.is_null());
         assert_eq!(srtla_engine_start(handle), 0);
         assert_eq!(srtla_engine_apply_abr(handle, 1_000), 500_000);
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn session_state_requires_both_srt_and_an_eligible_link_for_live() {
+        let config = CString::new(
+            r#"{"receiver_host":"example","receiver_port":5000,"links":[{"id":1,"label":"a","enabled":true}],"abr":{"start_bps":1500000,"max_bps":8000000}}"#,
+        )
+        .unwrap();
+        let handle = srtla_engine_create_v1(config.as_ptr());
+        assert!(!handle.is_null());
+        assert_eq!(srtla_engine_start(handle), 0);
+
+        fn stats(handle: *mut SrtlaEngineHandle) -> String {
+            let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
+            let mut out = vec![0i8; needed];
+            assert_eq!(
+                srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len()),
+                needed
+            );
+            unsafe { CStr::from_ptr(out.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        assert_eq!(
+            srtla_engine_set_session_state(handle, SESSION_CONNECTED, ptr::null()),
+            0
+        );
+        let json = stats(handle);
+        assert!(json.contains(r#""srt_session_state":"Connected""#));
+        assert!(json.contains(r#""srt_connected":true"#));
+        assert!(json.contains(r#""state":"Reconnecting""#));
+
+        let link_stats = CString::new(
+            r#"[{"id":1,"connected":true,"payload_eligible":true,"capacity_ready":true,"target_bps":2000000,"state":"Live"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            srtla_engine_update_link_stats(handle, link_stats.as_ptr()),
+            0
+        );
+        assert!(stats(handle).contains(r#""state":"Live""#));
+
+        let error = CString::new("receiver rejected authentication").unwrap();
+        assert_eq!(
+            srtla_engine_set_session_state(handle, SESSION_RECONNECTING, error.as_ptr()),
+            0
+        );
+        let json = stats(handle);
+        assert!(json.contains(r#""srt_session_state":"Reconnecting""#));
+        assert!(json.contains("receiver rejected authentication"));
+        assert!(json.contains(r#""state":"Reconnecting""#));
+
+        srtla_engine_stop(handle);
         srtla_engine_destroy(handle);
     }
 }

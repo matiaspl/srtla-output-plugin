@@ -8,6 +8,7 @@
 #include "../engine/include/srtla_engine.h"
 #include "mpegts-avformat-sink.hpp"
 #include "network-monitor.hpp"
+#include "output-capture-lifecycle.hpp"
 #include "secret-store.hpp"
 #include "srt-session.hpp"
 
@@ -22,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -50,12 +52,16 @@ struct SrtlaOutput {
 	std::atomic_bool abr_stop{false};
 	std::thread abr_worker;
 	std::atomic_bool needs_muxer_reset{false};
+	std::atomic_bool capture_active{false};
+	std::atomic_bool fatal_signal_queued{false};
+	std::unique_ptr<OutputCaptureLifecycle> capture_lifecycle;
 	std::unique_ptr<MpegTsAvformatSink> muxer;
 	std::unique_ptr<SrtSession> session;
 	std::string receiver_host;
 	unsigned receiver_port = 0;
 	std::string stream_id;
 	std::string passphrase;
+	bool credential_error = false;
 	int latency_ms = 2000;
 	int pbkeylen = 16;
 	bool hevc = false;
@@ -250,7 +256,7 @@ static SrtlaEngineHandle *create_engine_from_settings(obs_data_t *settings)
 		",\"passphrase\":\"" + json_escape(passphrase) +
 		"\",\"pbkeylen\":" + std::to_string(pbkeylen) +
 		",\"scheduler\":\"" + json_escape(scheduler ? scheduler : "enhanced") +
-		",\"links\":" + links + ",\"abr\":{\"safety_margin\":" + std::to_string(safety_margin) +
+		"\",\"links\":" + links + ",\"abr\":{\"safety_margin\":" + std::to_string(safety_margin) +
 		",\"min_bps\":" + std::to_string(std::max<std::int64_t>(1, min_bitrate) * 1000) +
 		",\"start_bps\":" + std::to_string(std::max<std::int64_t>(1, start_bitrate) * 1000) +
 		",\"max_bps\":" + std::to_string(std::max<std::int64_t>(1, max_bitrate) * 1000) +
@@ -266,12 +272,16 @@ static const char *srtla_output_name(void *)
 static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 {
 	split_url_query_into_settings(settings);
+	bool secret_error = false;
 	if (settings) {
 		const char *plain = obs_data_get_string(settings, "passphrase");
 		if (plain && *plain) {
 			const auto protected_secret = protect_srtla_secret(plain);
 			if (!protected_secret.empty()) {
 				obs_data_set_string(settings, "passphrase_dpapi", protected_secret.c_str());
+				obs_data_set_string(settings, "passphrase", "");
+			} else {
+				secret_error = true;
 				obs_data_set_string(settings, "passphrase", "");
 			}
 		}
@@ -299,7 +309,13 @@ static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 	data->stream_id = settings && obs_data_get_string(settings, "stream_id") ? obs_data_get_string(settings, "stream_id") : "";
 	const char *stored_secret = settings ? obs_data_get_string(settings, "passphrase_dpapi") : nullptr;
 	const char *plain_secret = settings ? obs_data_get_string(settings, "passphrase") : nullptr;
-	data->passphrase = stored_secret && *stored_secret ? unprotect_srtla_secret(stored_secret) : (plain_secret ? plain_secret : "");
+	if (stored_secret && *stored_secret) {
+		data->passphrase = unprotect_srtla_secret(stored_secret);
+		secret_error = secret_error || data->passphrase.empty();
+	} else {
+		data->passphrase = plain_secret ? plain_secret : "";
+	}
+	data->credential_error = secret_error;
 	data->latency_ms = settings ? std::clamp(static_cast<int>(obs_data_get_int(settings, "latency_ms")), 120, 60000) : 2000;
 	data->pbkeylen = settings ? static_cast<int>(obs_data_get_int(settings, "pbkeylen")) : 16;
 	if (data->pbkeylen != 16 && data->pbkeylen != 24 && data->pbkeylen != 32) data->pbkeylen = 16;
@@ -316,6 +332,7 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	auto *data = static_cast<SrtlaOutput *>(opaque);
 	if (data->running.load())
 		return;
+	data->credential_error = false;
 	if (settings) {
 		split_url_query_into_settings(settings);
 		const char *plain = obs_data_get_string(settings, "passphrase");
@@ -323,6 +340,9 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 			const auto protected_secret = protect_srtla_secret(plain);
 			if (!protected_secret.empty()) {
 				obs_data_set_string(settings, "passphrase_dpapi", protected_secret.c_str());
+				obs_data_set_string(settings, "passphrase", "");
+			} else {
+				data->credential_error = true;
 				obs_data_set_string(settings, "passphrase", "");
 			}
 		}
@@ -351,7 +371,12 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	data->stream_id = settings && obs_data_get_string(settings, "stream_id") ? obs_data_get_string(settings, "stream_id") : "";
 	const char *stored_secret = settings ? obs_data_get_string(settings, "passphrase_dpapi") : nullptr;
 	const char *plain_secret = settings ? obs_data_get_string(settings, "passphrase") : nullptr;
-	data->passphrase = stored_secret && *stored_secret ? unprotect_srtla_secret(stored_secret) : (plain_secret ? plain_secret : "");
+	if (stored_secret && *stored_secret) {
+		data->passphrase = unprotect_srtla_secret(stored_secret);
+		data->credential_error = data->credential_error || data->passphrase.empty();
+	} else {
+		data->passphrase = plain_secret ? plain_secret : "";
+	}
 	data->latency_ms = settings ? std::clamp(static_cast<int>(obs_data_get_int(settings, "latency_ms")), 120, 60000) : 2000;
 	data->pbkeylen = settings ? static_cast<int>(obs_data_get_int(settings, "pbkeylen")) : 16;
 	if (data->pbkeylen != 16 && data->pbkeylen != 24 && data->pbkeylen != 32) data->pbkeylen = 16;
@@ -391,14 +416,15 @@ static void apply_manual_bitrate(SrtlaOutput *data)
 
 static void stop_worker(SrtlaOutput *data)
 {
-	if (!data->worker.joinable())
-		return;
 	{
 		std::lock_guard<std::mutex> lock(data->queue_mutex);
 		data->worker_stop = true;
+		data->queue.clear();
+		data->queue_bytes = 0;
 	}
 	data->queue_changed.notify_all();
-	data->worker.join();
+	if (data->worker.joinable())
+		data->worker.join();
 }
 
 static void stop_abr_worker(SrtlaOutput *data)
@@ -407,6 +433,8 @@ static void stop_abr_worker(SrtlaOutput *data)
 	if (data->abr_worker.joinable())
 		data->abr_worker.join();
 }
+
+static void queue_fatal_output(SrtlaOutput *data, const std::string &error);
 
 static void start_abr_worker(SrtlaOutput *data)
 {
@@ -417,6 +445,11 @@ static void start_abr_worker(SrtlaOutput *data)
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			if (data->abr_stop.load() || !data->running.load() || !data->engine)
 				continue;
+			if (const char *engine_error = srtla_engine_last_error(data->engine);
+			    engine_error && *engine_error) {
+				queue_fatal_output(data, engine_error);
+				continue;
+			}
 			const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::system_clock::now().time_since_epoch()).count());
 			const auto applied_bps = srtla_engine_apply_abr(data->engine, now);
@@ -436,6 +469,84 @@ static void start_abr_worker(SrtlaOutput *data)
 			}
 		}
 	});
+}
+
+static bool supported_video_encoder(obs_encoder_t *encoder)
+{
+	const char *codec = encoder ? obs_encoder_get_codec(encoder) : nullptr;
+	return codec && (strcmp(codec, "h264") == 0 || strcmp(codec, "hevc") == 0);
+}
+
+static bool supported_audio_encoder(obs_encoder_t *encoder)
+{
+	const char *codec = encoder ? obs_encoder_get_codec(encoder) : nullptr;
+	return !encoder || (codec && (strcmp(codec, "aac") == 0 || strcmp(codec, "opus") == 0));
+}
+
+struct FatalOutputTask {
+	obs_output_t *output = nullptr;
+	SrtlaOutput *data = nullptr;
+	std::string error;
+};
+
+static void srtla_output_stop(void *opaque, uint64_t ts);
+
+static void signal_fatal_output_on_ui(void *opaque)
+{
+	std::unique_ptr<FatalOutputTask> task(static_cast<FatalOutputTask *>(opaque));
+	if (!task || !task->output)
+		return;
+	if (!task->data || !task->data->running.load()) {
+		obs_output_release(task->output);
+		return;
+	}
+	obs_output_set_last_error(task->output, task->error.empty() ? "SRT session failed" : task->error.c_str());
+	obs_output_signal_stop(task->output, OBS_OUTPUT_ERROR);
+	// obs_output_signal_stop ends the encoder capture, but output-specific
+	// resources are released by the output's stop callback.  Invoke that
+	// callback on this UI task (never from the connector thread) so the engine,
+	// session and workers cannot survive a fatal local error.
+	if (task->data)
+		srtla_output_stop(task->data, 0);
+	obs_output_release(task->output);
+}
+
+static void queue_fatal_output(SrtlaOutput *data, const std::string &error)
+{
+	if (!data || !data->running.load() || data->fatal_signal_queued.exchange(true))
+		return;
+	auto *output = obs_output_get_ref(data->output);
+	if (!output) {
+		data->fatal_signal_queued.store(false);
+		return;
+	}
+	try {
+		auto *task = new FatalOutputTask{output, data, error};
+		obs_queue_task(OBS_TASK_UI, signal_fatal_output_on_ui, task, false);
+	} catch (...) {
+		data->fatal_signal_queued.store(false);
+		obs_output_release(output);
+	}
+}
+
+static void on_session_status(SrtlaOutput *data, SrtSession::Status status, const std::string &error)
+{
+	if (!data)
+		return;
+	if (status == SrtSession::Status::Fatal && data->running.load()) {
+		queue_fatal_output(data, error);
+		return;
+	}
+	if (status != SrtSession::Status::Reconnecting)
+		return;
+	{
+		std::lock_guard<std::mutex> lock(data->queue_mutex);
+		data->queue.clear();
+		data->queue_bytes = 0;
+		data->drop_until_keyframe = true;
+	}
+	data->needs_muxer_reset.store(true);
+	data->queue_changed.notify_all();
 }
 
 static void enqueue_datagram(SrtlaOutput *data, std::vector<std::uint8_t> bytes, bool keyframe,
@@ -507,11 +618,16 @@ static void srtla_output_destroy(void *opaque)
 {
 	auto *data = static_cast<SrtlaOutput *>(opaque);
 	data->running.store(false);
+	data->fatal_signal_queued.store(false);
+	if (data->capture_lifecycle)
+		data->capture_lifecycle->end();
+	data->capture_active.store(false);
 	stop_abr_worker(data);
 	stop_worker(data);
 	if (data->session)
 		data->session->stop();
 	restore_shared_bitrate(data);
+	data->muxer.reset();
 	{
 		std::lock_guard<std::mutex> lock(output_registry_mutex);
 		output_registry.erase(data->output);
@@ -557,26 +673,76 @@ extern "C" std::size_t srtla_output_copy_stats_json(obs_output_t *output, char *
 static bool srtla_output_start(void *opaque)
 {
 	auto *data = static_cast<SrtlaOutput *>(opaque);
-	if (!data->output || !obs_output_get_video_encoder(data->output))
+	if (!data->output || !supported_video_encoder(obs_output_get_video_encoder(data->output)) ||
+	    !supported_audio_encoder(obs_output_get_audio_encoder(data->output, 0))) {
+		if (data->output)
+			obs_output_set_last_error(data->output, "Unsupported or missing OBS encoder");
 		return false;
+	}
+	if (data->credential_error) {
+		obs_output_set_last_error(data->output, "SRT passphrase could not be protected or decrypted");
+		return false;
+	}
+	std::string capture_error;
+	data->capture_lifecycle = std::make_unique<OutputCaptureLifecycle>(
+		[data] { return obs_output_can_begin_data_capture(data->output, 0); },
+		[data] { return obs_output_initialize_encoders(data->output, 0); },
+		[data] { return obs_output_begin_data_capture(data->output, 0); },
+		[data] { obs_output_end_data_capture(data->output); }, OutputCaptureLifecycle::StopSignal{},
+		[data] { (void)obs_output_can_begin_data_capture(data->output, 0); });
+	if (!data->capture_lifecycle->prepare(capture_error)) {
+		obs_output_set_last_error(data->output, capture_error.c_str());
+		return false;
+	}
+	data->fatal_signal_queued.store(false);
 	if (data->shared_encoder) {
 		obs_output_t *source_output = data->encoder_source == "recording" ? obs_frontend_get_recording_output() :
 			obs_frontend_get_streaming_output();
-		if (source_output) {
-			const bool busy = source_output != data->output && obs_output_active(source_output);
-			obs_output_release(source_output);
-			if (busy)
-				return false;
+		if (!source_output) {
+			obs_output_set_last_error(data->output, "The selected shared OBS output is unavailable");
+			return false;
+		}
+		const bool busy = source_output != data->output && obs_output_active(source_output);
+		obs_output_release(source_output);
+		if (busy) {
+			obs_output_set_last_error(data->output, "The selected shared OBS encoder is already active");
+			return false;
 		}
 	}
-	data->queue_bytes = 0;
-	if (!data->engine || srtla_engine_start(data->engine) != 0)
+	// OBS has joined any previous end-data-capture worker by this point, so a
+	// stopped muxer can be safely released before the next session.
+	data->muxer.reset();
+	data->capture_active.store(false);
+	data->running.store(false);
+	if (!data->engine) {
+		obs_output_set_last_error(data->output, "SRTLA engine initialization failed");
 		return false;
-	(void)srtla_engine_set_audio_bitrate(data->engine, data->audio_bitrate_bps);
-	data->session = std::make_unique<SrtSession>(data->engine, data->receiver_host,
-		static_cast<std::uint16_t>(data->receiver_port), data->stream_id, data->passphrase,
-		data->latency_ms, data->pbkeylen);
-	if (!data->session->start()) {
+	}
+	if (srtla_engine_start(data->engine) != 0) {
+		const char *engine_error = srtla_engine_last_error(data->engine);
+		obs_output_set_last_error(data->output, engine_error && *engine_error ? engine_error : "SRTLA engine start failed");
+		return false;
+	}
+	if (srtla_engine_set_audio_bitrate(data->engine, data->audio_bitrate_bps) != 0) {
+		obs_output_set_last_error(data->output, "SRTLA audio bitrate initialization failed");
+		srtla_engine_stop(data->engine);
+		return false;
+	}
+	try {
+		data->session = std::make_unique<SrtSession>(data->engine, data->receiver_host,
+			static_cast<std::uint16_t>(data->receiver_port), data->stream_id, data->passphrase,
+			data->latency_ms, data->pbkeylen,
+			[data](SrtSession::Status status, const std::string &error) { on_session_status(data, status, error); });
+	} catch (...) {
+		obs_output_set_last_error(data->output, "SRT session allocation failed");
+		srtla_engine_stop(data->engine);
+		return false;
+	}
+	if (!data->session->start() || !data->session->wait_connected(5000)) {
+		const auto error = data->session->last_error().empty() ?
+			"SRT receiver did not connect within five seconds" : data->session->last_error();
+		obs_output_set_last_error(data->output, error.c_str());
+		data->session->stop();
 		data->session.reset();
 		srtla_engine_stop(data->engine);
 		return false;
@@ -590,8 +756,15 @@ static bool srtla_output_start(void *opaque)
 		}
 	}
 	apply_manual_bitrate(data);
-	if (!data->auto_bitrate)
-		(void)srtla_engine_set_video_bitrate(data->engine, static_cast<std::uint64_t>(std::max(1, data->manual_bitrate_kbps)) * 1000ULL);
+	if (!data->auto_bitrate &&
+	    srtla_engine_set_video_bitrate(data->engine, static_cast<std::uint64_t>(std::max(1, data->manual_bitrate_kbps)) * 1000ULL) != 0) {
+		obs_output_set_last_error(data->output, "SRTLA video bitrate initialization failed");
+		data->session->stop();
+		data->session.reset();
+		srtla_engine_stop(data->engine);
+		restore_shared_bitrate(data);
+		return false;
+	}
 	{
 		std::lock_guard<std::mutex> lock(data->queue_mutex);
 		data->queue.clear();
@@ -599,16 +772,33 @@ static bool srtla_output_start(void *opaque)
 		data->needs_muxer_reset.store(false);
 		data->worker_stop = false;
 	}
-	data->muxer = std::make_unique<MpegTsAvformatSink>(data->output,
-		[data](std::vector<std::uint8_t> bytes, bool keyframe, std::int64_t pts90k) {
-			enqueue_datagram(data, std::move(bytes), keyframe, pts90k);
-	});
+	try {
+		data->muxer = std::make_unique<MpegTsAvformatSink>(data->output,
+			[data](std::vector<std::uint8_t> bytes, bool keyframe, std::int64_t pts90k) {
+				enqueue_datagram(data, std::move(bytes), keyframe, pts90k);
+			});
+	} catch (...) {
+		obs_output_set_last_error(data->output, "MPEG-TS muxer allocation failed");
+		data->session->stop();
+		data->session.reset();
+		srtla_engine_stop(data->engine);
+		restore_shared_bitrate(data);
+		return false;
+	}
 	data->running.store(true);
 	try {
 		start_worker(data);
+		if (!data->capture_lifecycle->initialize_and_begin(capture_error))
+			throw std::runtime_error(capture_error);
+		data->capture_active.store(data->capture_lifecycle->active());
 		start_abr_worker(data);
 	} catch (...) {
+		obs_output_set_last_error(data->output,
+		                         capture_error.empty() ? "OBS output worker startup failed" : capture_error.c_str());
 		data->running.store(false);
+		if (data->capture_lifecycle)
+			data->capture_lifecycle->end();
+		data->capture_active.store(false);
 		stop_abr_worker(data);
 		stop_worker(data);
 		if (data->session)
@@ -626,9 +816,11 @@ static void srtla_output_stop(void *opaque, uint64_t ts)
 {
 	UNUSED_PARAMETER(ts);
 	auto *data = static_cast<SrtlaOutput *>(opaque);
-	if (data->muxer)
-		data->muxer->flush();
 	data->running.store(false);
+	data->fatal_signal_queued.store(false);
+	if (data->capture_lifecycle)
+		data->capture_lifecycle->end();
+	data->capture_active.store(false);
 	stop_abr_worker(data);
 	stop_worker(data);
 	if (data->session)
@@ -636,12 +828,10 @@ static void srtla_output_stop(void *opaque, uint64_t ts)
 	if (data->engine)
 		srtla_engine_stop(data->engine);
 	restore_shared_bitrate(data);
-	{
-		std::lock_guard<std::mutex> lock(data->queue_mutex);
-		data->queue.clear();
-		data->queue_bytes = 0;
-	}
 	data->muxer.reset();
+	std::lock_guard<std::mutex> lock(data->queue_mutex);
+	data->queue.clear();
+	data->queue_bytes = 0;
 }
 
 static void srtla_output_encoded_packet(void *opaque, struct encoder_packet *packet)
@@ -657,13 +847,17 @@ static void srtla_output_encoded_packet(void *opaque, struct encoder_packet *pac
 	if (data->needs_muxer_reset.exchange(false) && data->muxer)
 		data->muxer->reset();
 	if (!data->muxer || !data->muxer->write(packet)) {
-		if (data->muxer && !data->muxer->last_error().empty())
-			obs_output_set_last_error(data->output, data->muxer->last_error().c_str());
+		const std::string error = data->muxer && !data->muxer->last_error().empty() ?
+			data->muxer->last_error() : "MPEG-TS muxer rejected an encoded packet";
+		obs_output_set_last_error(data->output, error.c_str());
+		queue_fatal_output(data, error);
 		return;
 	}
 	// Flush at each callback.  A full 1316-byte datagram is emitted whenever
 	// possible; a smaller final datagram bounds latency when the stream is idle.
 	data->muxer->flush();
+	if (!data->muxer->healthy())
+		queue_fatal_output(data, data->muxer->last_error());
 }
 
 static void srtla_output_defaults(obs_data_t *settings)

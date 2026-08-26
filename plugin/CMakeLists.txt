@@ -3,6 +3,7 @@ add_library(obs-srtla-output MODULE
   obs-srtla-output.cpp
   obs-srtla-dock.cpp
   obs-srtla-dock.hpp
+  output-capture-lifecycle.hpp
   mpegts-avformat-sink.cpp
   mpegts-avformat-sink.hpp
   secret-store.cpp
@@ -62,7 +63,7 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../README.md"
   DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output"
 )
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
-  DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output/data"
+  DESTINATION "${OBS_SRTLA_OBS_DATA_DIR}/obs-srtla-output"
 )
 
 # mbedTLS is statically linked, matching the OBS SRT dependency.  Preserve its

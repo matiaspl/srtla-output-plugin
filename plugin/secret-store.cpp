@@ -83,7 +83,10 @@ std::string unprotect_srtla_secret(std::string_view encoded)
 
 #else
 
-std::string protect_srtla_secret(std::string_view plaintext) { return std::string(plaintext); }
-std::string unprotect_srtla_secret(std::string_view encoded) { return std::string(encoded); }
+// The release target is Windows.  Do not silently downgrade to plaintext on
+// another platform: callers treat an empty result as a blocking credential
+// failure, while an empty passphrase remains the explicit unencrypted choice.
+std::string protect_srtla_secret(std::string_view) { return {}; }
+std::string unprotect_srtla_secret(std::string_view) { return {}; }
 
 #endif
