@@ -2,93 +2,182 @@
 
 Native SRTLA output for OBS Studio on Windows x64.
 
-The plugin keeps the SRT engine and the SRTLA bonding engine in one process. OBS
-encoded packets are muxed as MPEG-TS and passed to the patched `irlserver/srt`
-library through an in-memory datagram transport; SRTLA then sends the resulting
-SRT datagrams over the selected network uplinks.
+The plugin muxes OBS-encoded audio and video as MPEG-TS, feeds the SRT packets
+directly into an embedded SRTLA sender, and distributes the resulting datagrams
+over the network links selected in its OBS dock. The SRT session, SRTLA sender,
+and uplink sockets all run in the OBS process; no localhost UDP proxy or helper
+process is required.
 
-No localhost UDP proxy is created by the plugin.  The embedded runner now owns
-the SRTLA uplink sockets and the patched libsrt transport callbacks in-process;
-wire compatibility still requires the Windows/receiver integration tests below.
-
-For a Windows local receiver/relay walkthrough and operating checklist, see
+An SRTLA-compatible receiver is required at the destination. This repository
+does **not** ship a production receiver. For a local Windows smoke test, see
 [`docs/SRTLA-LOCAL-RELAY.md`](docs/SRTLA-LOCAL-RELAY.md).
 
-## Current status
+## Features
 
-This repository is being built in vertical slices. The current slice contains
-the portable adaptive-bitrate controller, bounded engine ABI, OBS output/dock,
-Windows adapter discovery, an FFmpeg/libavformat MPEG-TS sink with a bounded
-packet/worker path, the embedded
-SRTLA runner/SRT session, the `SRT_TRANSPORT_V1` libsrt seam, and the
-sender-side forwarding seam shared by UDP and embedded endpoints.
+- An OBS dock for starting and stopping the output, selecting uplinks, and
+  monitoring the session.
+- Streaming or recording encoder reuse, plus independent custom encoders.
+- H.264 and HEVC video with AAC or Opus audio.
+- Automatic video bitrate control based on the aggregate capacity of eligible
+  links, with manual bitrate and maximum-bitrate controls.
+- Per-adapter IPv4 and IPv6 uplinks that can be enabled or disabled while the
+  output is running. Newly discovered links are opt-in, and the last enabled
+  link cannot be disabled.
+- Aggregate capacity, usage, current bitrate, and recommended bitrate metrics,
+  plus per-link state, quality, RTT, loss, usage, capacity, congestion, and
+  scheduler diagnostics.
+- SRT stream ID and optional passphrase authentication. Saved passphrases are
+  protected with Windows DPAPI instead of being stored in plaintext.
+- Automatic SRT reconnection and a bounded, keyframe-aware media queue. After a
+  reconnect, stale media is discarded and MPEG-TS resumes with fresh tables at
+  the next keyframe.
+- Profile-scoped settings and safe teardown when the OBS profile changes.
 
-The remaining hardening work is receiver interoperability, Windows route-change
-notifications, dedicated-encoder cloning, hardware/link soak tests and
-installer QA. MPEG-TS container syntax is delegated to libavformat; the plugin
-only owns a custom in-memory AVIO sink and 1316-byte transport packetization.
-The output-side ABR tick now applies video bitrate changes when Auto is
-selected; no separate proxy process is started.
+Automatic bitrate changes require an OBS encoder that advertises dynamic
+bitrate support. Other encoders remain usable at a fixed bitrate while the dock
+continues to show the recommended bitrate as telemetry.
 
-## Layout
+## Current status and limitations
 
-- `plugin/` — OBS output, dock and Windows network monitor.
-- `engine/` — Rust FFI facade, queues and adaptive bitrate controller.
-- `third_party/irlserver-srt/` — pinned SRT fork with the SRTLA receiver fixes.
+This is an early `0.1.0` development slice, not a production release. The
+in-process SRT/SRTLA path, OBS output and dock, adaptive-bitrate controller,
+Windows adapter discovery, MPEG-TS muxer, reconnect path, and bounded engine
+ABI are implemented.
+
+Current operational limitations:
+
+- Streaming and recording encoders can be reused only while their source OBS
+  output is stopped. Starting another OBS output that needs the same encoder
+  stops the SRTLA output to avoid conflicting capture ownership.
+- The Custom encoder path creates a dedicated encoder from that encoder's
+  defaults and applies the selected bitrate. It does not clone all settings
+  from the streaming or recording encoder.
+- Network adapters are refreshed by polling once per second; native Windows
+  route-change notifications are not implemented yet.
+- Receiver interoperability has a local Windows relay smoke-test path, but no
+  maintained production-receiver compatibility matrix or hardware/link soak
+  coverage yet.
+- Packaging produces a manual-install ZIP. Installer and upgrade QA remain to
+  be completed.
+
+## TODO
+
+- Validate and document interoperability with maintained production SRTLA
+  receivers.
+- Provision the receiver, SRT tools, privileges, and kernel support needed to
+  run the existing network-namespace/netem scenarios in project CI. They are
+  currently discovered by the sender workspace test command but skip when
+  those dependencies are unavailable.
+- Replace or augment one-second adapter polling with Windows route-change
+  notifications.
+- Clone streaming/recording encoder settings into an independent dedicated
+  encoder.
+- Run extended hardware-encoder, multi-link, impairment, reconnect, and soak
+  testing.
+- Complete installer, upgrade, and release-package QA.
+
+## Install
+
+There is no installer yet. After creating the ZIP described in [Build](#build):
+
+1. Close OBS.
+2. Open the generated ZIP and copy the contents of its top-level directory into
+   the OBS installation directory, preserving the `obs-plugins/64bit` and
+   `data/obs-plugins` paths. The default installation directory is
+   `C:\Program Files\obs-studio`.
+3. Start OBS and open **Docks > SRTLA Output**.
+
+## Use
+
+1. Enter the receiver endpoint as `srtla://host:port`. Keep credentials out of
+   the URL; legacy `streamid`, `passphrase`, and `password` query parameters are
+   migrated to separate profile fields.
+2. Enter the stream ID expected by the receiver and, if encryption is required,
+   a 10–79-byte UTF-8 passphrase.
+3. Choose **Streaming** or **Recording** to reuse that stopped OBS output's
+   encoders, or **Custom** to create independent video and audio encoders.
+4. Select at least one operational network link.
+5. Choose automatic bitrate with a maximum, or disable it and set a manual
+   bitrate.
+6. Select **Start**. `Live` requires both an established SRT session and at
+   least one payload-eligible SRTLA link.
+
+The dock reports `Starting`, `Live`, `Waiting for network`, `Reconnecting`, or
+`Error`. `Reconnecting` is recoverable; `Error` indicates a local fatal failure
+such as invalid socket, engine, encoder, muxer, or queue state.
+
+## Architecture
+
+- `plugin/` — OBS output, dock, Windows network monitor, SRT session, and
+  libavformat MPEG-TS sink.
+- `engine/` — Rust FFI facade, bounded queues, statistics, and adaptive-bitrate
+  controller.
+- `third_party/irlserver-srt/` — pinned SRT fork with the external-transport
+  patch.
 - `third_party/srtla_send/` — pinned SRTLA sender implementation and core.
 
-The local libsrt API patch adds `srt_set_external_transport()`. Its callback
-contract is deliberately small: `send_datagram` returns zero after accepting a
-complete datagram, `receive_datagram` returns zero on timeout and writes the
-length to `received`, while `wake` interrupts a pending read and `close` is
-called once during teardown.
+MPEG-TS container syntax is delegated to libavformat. The plugin owns the
+custom in-memory AVIO sink and 1316-byte transport packetization. The local
+libsrt patch adds `srt_set_external_transport()`, whose versioned callback
+contract connects libsrt directly to the bounded engine queues.
 
 ## Build
 
-The Windows build expects Qt 6, FFmpeg development headers/import libraries,
-mbedTLS 3.x development libraries and Rust 1.88 or newer (nightly is required
-by the vendored sender's rustfmt configuration). The SRT fork is built with the
-same `USE_ENCLIB=mbedtls` provider as the OBS dependency build, with mbedTLS
-linked statically; no OpenSSL DLL is required by the plugin. The OBS installer
-itself is sufficient at runtime: the
-plugin's `OBS::libobs` and `OBS::frontend-api` targets can use generated MSVC
-import libraries while loading `obs.dll` and `obs-frontend-api.dll` from the
-installed OBS `bin/64bit` directory. No static copy of libobs is embedded.
+### Requirements
 
-For the local OBS 32.2.1 installation, the source headers are in
-`tools/obs-source`, the generated import libraries are in `tools/obs-dev`, and
-the Qt/FFmpeg development prefix is the vcpkg triplet
-`tools/obs-ffmpeg-dev` (headers from the exact OBS FFmpeg 8.1.2 source and
-import libraries generated from the OBS DLL exports); Qt is installed in
-`tools/vcpkg/installed/x64-windows`; install mbedTLS into that triplet before
-configuring:
+- Windows x64 and an x64 MSVC developer environment
+- CMake 3.28 or newer and Ninja
+- Git and PowerShell
+- Stable Rust 1.88 or newer
+
+The vendored sender has a rustfmt configuration that uses unstable formatting
+options. Nightly Rust is needed only to format that vendored workspace, not to
+build the plugin or run the project CI configuration.
+
+The pinned provisioning script downloads the OBS 32.2.1 runtime and source,
+the matching 2026-07-15 Qt/FFmpeg/mbedTLS dependency bundles, verifies their
+archive hashes, and creates the required OBS import libraries. Run it from an
+x64 Visual Studio Developer PowerShell:
 
 ```powershell
-tools\vcpkg\vcpkg.exe install mbedtls:x64-windows
+.\scripts\prepare-obs-ci.ps1
+
+Get-Content .ci-deps\paths.env | ForEach-Object {
+  $name, $value = $_ -split '=', 2
+  Set-Item -Path "Env:$name" -Value $value
+}
+
+cmake -S . -B build-obs -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DOBS_SRTLA_BUILD_TESTS=ON `
+  -DOBS_SRTLA_BUILD_VENDOR_SRT=ON `
+  -DOBS_SRTLA_REQUIRE_PLUGIN=ON `
+  -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH" `
+  -DOBS_SRTLA_OBS_SOURCE_DIR="$env:OBS_SRTLA_OBS_SOURCE_DIR" `
+  -DOBS_SRTLA_OBS_IMPORT_LIB_DIR="$env:OBS_SRTLA_OBS_IMPORT_LIB_DIR" `
+  -DOBS_SRTLA_OBS_RUNTIME_DIR="$env:OBS_SRTLA_OBS_RUNTIME_DIR" `
+  -DOBS_SRTLA_FFMPEG_ROOT="$env:OBS_SRTLA_FFMPEG_ROOT" `
+  -DOBS_SRTLA_MBEDTLS_ROOT="$env:OBS_SRTLA_MBEDTLS_ROOT"
+
+cmake --build build-obs --config Release --target obs-srtla-output --parallel
+ctest --test-dir build-obs -C Release --output-on-failure
+cpack --config build-obs\CPackConfig.cmake -C Release
 ```
 
-From a Visual Studio Developer Command
-Prompt, configure and build with:
+The SRT fork and mbedTLS are linked statically into the plugin, so no OpenSSL or
+mbedTLS DLL is shipped. Qt, FFmpeg, `obs.dll`, and `obs-frontend-api.dll` are
+resolved from the OBS runtime; no static copy of libobs is embedded.
 
-```powershell
-cmake -S . -B build-obs -G "Visual Studio 18 2026" -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE=tools/vcpkg/scripts/buildsystems/vcpkg.cmake `
-  -DOBS_SRTLA_OBS_SOURCE_DIR="$PWD/tools/obs-source" `
-  -DOBS_SRTLA_OBS_IMPORT_LIB_DIR="$PWD/tools/obs-dev" `
-  -DOBS_SRTLA_OBS_RUNTIME_DIR="C:/Program Files/obs-studio/bin/64bit" `
-  -DOBS_SRTLA_FFMPEG_ROOT="$PWD/tools/obs-ffmpeg-dev" `
-  -DOBS_SRTLA_REQUIRE_PLUGIN=ON
-cmake --build build-obs --config Release --target obs-srtla-output
-```
+If you already have a compatible OBS SDK and dependency set, provide
+`OBS_SRTLA_OBS_SOURCE_DIR`, `OBS_SRTLA_OBS_IMPORT_LIB_DIR`,
+`OBS_SRTLA_OBS_RUNTIME_DIR`, `OBS_SRTLA_FFMPEG_ROOT`,
+`OBS_SRTLA_MBEDTLS_ROOT`, and the Qt prefix directly instead of running the
+provisioning script.
 
-If a separate OBS SDK is available, set the three `OBS_SRTLA_OBS_*` paths to
-that SDK instead. Linux CI also builds the Rust crates and runs protocol/netem
-tests.
-
-To create the distributable ZIP after a Release build, run
-`cpack --config build/CPackConfig.cmake -C Release`. Set
-`OBS_SRTLA_OBS_PLUGIN_DIR` when the OBS installation uses a non-standard plugin
-layout.
+Windows CI builds the native plugin and runs the Rust engine, transport ABI,
+output lifecycle, and secret-store tests. Linux CI runs the engine and vendored
+sender workspaces' unit, protocol, and dependency-independent integration
+tests. See [TODO](#todo) for the network-namespace/netem coverage gap.
 
 ## License
 

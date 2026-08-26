@@ -1,6 +1,6 @@
 # Local SRTLA relay (Windows)
 
-This repository ships the OBS SRTLA output and the Rust sender/transport seam; it does **not** ship a production SRTLA receiver. For local testing we use the Windows-compatible `srtla_rec` build from [manueldev/srtla-windows](https://github.com/manueldev/srtla-windows), plus the SRT sample relay that is already installed with FFmpeg.
+This repository ships the OBS SRTLA output and the Rust sender/transport seam; it does **not** ship a production SRTLA receiver. For local testing, use the Windows-compatible `srtla_rec` build from [manueldev/srtla-windows](https://github.com/manueldev/srtla-windows), plus `srt-live-transmit` and FFmpeg.
 
 ## Topology
 
@@ -23,25 +23,33 @@ srtla_rec :5000  ->  SRT listener :5002
 
 ## Start the local relay
 
-The checked-out receiver source and the locally built executable live in `.relay-src` while developing this workspace. Start the receiver first:
+Build `srtla_rec.exe` from the receiver repository and place it in
+`.relay-src` under this repository. Put `srt-live-transmit.exe` and
+`ffmpeg.exe` on `PATH`, or replace the `Get-Command` expressions below with
+their full paths.
+
+Run the following commands from this repository's root. Start the receiver
+first and retain its process object for precise cleanup:
 
 ```powershell
-cd C:\Users\Mateusz\Documents\ChatGPT\obs-srtla-output\.relay-src
-Start-Process .\srtla_rec.exe `
+$receiverExe = (Resolve-Path .\.relay-src\srtla_rec.exe).Path
+$receiverProcess = Start-Process $receiverExe `
   -ArgumentList '5000','127.0.0.1','5002','--log-errors' `
-  -RedirectStandardOutput .\srtla_rec.stdout.log `
-  -RedirectStandardError .\srtla_rec.stderr.log
+  -RedirectStandardOutput .\.relay-src\srtla_rec.stdout.log `
+  -RedirectStandardError .\.relay-src\srtla_rec.stderr.log `
+  -PassThru
 ```
 
 Then start the SRT bridge. The `lossmaxttl` and `latency` options allow the receiver to reorder bonded packets:
 
 ```powershell
-$srt = 'D:\ffmpeg\bin\srt-live-transmit.exe'
-Start-Process $srt `
+$srtLiveTransmit = (Get-Command srt-live-transmit.exe -ErrorAction Stop).Source
+$bridgeProcess = Start-Process $srtLiveTransmit `
   -ArgumentList 'srt://127.0.0.1:5002?mode=listener&lossmaxttl=40&latency=2000', `
               'srt://0.0.0.0:5001?mode=listener' `
   -RedirectStandardOutput .\srt-live-transmit.stdout.log `
-  -RedirectStandardError .\srt-live-transmit.stderr.log
+  -RedirectStandardError .\srt-live-transmit.stderr.log `
+  -PassThru
 ```
 
 Expected receiver log:
@@ -57,10 +65,10 @@ Check listeners without stopping unrelated processes:
 Get-NetUDPEndpoint -LocalPort 5000,5001,5002
 ```
 
-Record the PIDs printed by `Start-Process`. Stop only those PIDs when finished:
+Stop only the two processes started above when finished:
 
 ```powershell
-Stop-Process -Id <srtla-rec-pid>,<srt-live-transmit-pid>
+Stop-Process -Id $receiverProcess.Id,$bridgeProcess.Id
 ```
 
 ## Configure the OBS output for this relay
@@ -79,7 +87,8 @@ The URL is endpoint-only. Do not put `streamid`, `passphrase`, or `password` que
 Use an SRT caller to consume the bridge listener. FFmpeg can validate packets without opening a preview window:
 
 ```powershell
-D:\ffmpeg\bin\ffmpeg.exe -hide_banner -loglevel info `
+$ffmpeg = (Get-Command ffmpeg.exe -ErrorAction Stop).Source
+& $ffmpeg -hide_banner -loglevel info `
   -i 'srt://127.0.0.1:5001?mode=caller&latency=2000' `
   -t 10 -map 0 -f null NUL
 ```
