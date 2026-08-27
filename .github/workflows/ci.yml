@@ -1,68 +1,158 @@
 name: obs-srtla-output
 
 on:
+  workflow_dispatch:
   push:
+    branches:
+      - master
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
   pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  OBS_VERSION: "32"
+  RUST_VERSION: "1.88.0"
 
 jobs:
   rust:
+    name: Rust checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.88.0
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
-      - run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
-      - run: cargo test --manifest-path engine/Cargo.toml
-      - run: cargo clippy --manifest-path engine/Cargo.toml -- -D warnings
-      - run: cargo test --manifest-path third_party/srtla_send/Cargo.toml --workspace
+      - name: Check formatting
+        run: cargo fmt --manifest-path engine/Cargo.toml --all -- --check
+      - name: Test engine
+        run: cargo test --manifest-path engine/Cargo.toml
+      - name: Lint engine
+        run: cargo clippy --manifest-path engine/Cargo.toml -- -D warnings
+      - name: Test vendored sender
+        run: cargo test --manifest-path third_party/srtla_send/Cargo.toml --workspace
 
   native-plugin:
+    name: OBS 32 plugin (Windows x64)
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.88.0
-      - name: Provision pinned OBS 32.2.1 / FFmpeg 8.1.2 / Qt 6 / mbedTLS 3
-        shell: pwsh
-        run: .\scripts\prepare-obs-ci.ps1
-      - name: Load dependency paths
+          toolchain: ${{ env.RUST_VERSION }}
+      - name: Provision OBS 32 development environment
+        id: obs-deps
+        uses: norihiro/obs-studio-devel-action@4d9bd843ff3f720432ccab26bf913f1435bc6618
+        with:
+          obs: ${{ env.OBS_VERSION }}
+          qt: true
+          arch: x86_64
+      - name: Configure Release build
         shell: pwsh
         run: |
-          Get-Content .ci-deps\paths.env | ForEach-Object {
-            $name, $value = $_ -split '=', 2
-            "${name}=$value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $cmakeArgs = @(
+            '-S', '.',
+            '-B', 'build',
+            '-G', 'Visual Studio 17 2022',
+            '-A', 'x64',
+            '-DOBS_SRTLA_BUILD_TESTS=ON',
+            '-DOBS_SRTLA_BUILD_VENDOR_SRT=ON',
+            '-DOBS_SRTLA_REQUIRE_PLUGIN=ON'
+          )
+          $obsArgs = '${{ steps.obs-deps.outputs.PLUGIN_CMAKE_OPTIONS_PS }}'.Split(
+            ' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          cmake @cmakeArgs @obsArgs
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $plugin = Get-ChildItem build\plugin -Recurse -File -Filter 'obs-srtla-output.dll' |
+            Select-Object -First 1
+          if (!$plugin) { throw 'The build did not produce obs-srtla-output.dll' }
+          Write-Host "Built $($plugin.FullName)"
+      - name: Test Release
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw 'Release tests failed' }
+      - name: Package Release
+        shell: pwsh
+        run: |
+          cpack -B package --config build\CPackConfig.cmake -C Release
+          if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
+          $archives = @(Get-ChildItem package -File -Filter '*.zip')
+          if ($archives.Count -ne 1) {
+            throw "Expected one release ZIP, found $($archives.Count)"
           }
-      - name: Configure
-        shell: pwsh
-        run: >-
-          cmake -S . -B build -G Ninja
-          -DOBS_SRTLA_BUILD_TESTS=ON
-          -DOBS_SRTLA_BUILD_VENDOR_SRT=ON
-          -DOBS_SRTLA_REQUIRE_PLUGIN=ON
-          -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH"
-          -DOBS_SRTLA_OBS_SOURCE_DIR="$env:OBS_SRTLA_OBS_SOURCE_DIR"
-          -DOBS_SRTLA_OBS_IMPORT_LIB_DIR="$env:OBS_SRTLA_OBS_IMPORT_LIB_DIR"
-          -DOBS_SRTLA_OBS_RUNTIME_DIR="$env:OBS_SRTLA_OBS_RUNTIME_DIR"
-          -DOBS_SRTLA_FFMPEG_ROOT="$env:OBS_SRTLA_FFMPEG_ROOT"
-          -DOBS_SRTLA_MBEDTLS_ROOT="$env:OBS_SRTLA_MBEDTLS_ROOT"
-      - name: Build
-        shell: pwsh
+          Get-FileHash -Algorithm SHA256 -LiteralPath $archives[0].FullName |
+            Format-List
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: obs-srtla-output-windows-x64
+          path: package/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs:
+      - rust
+      - native-plugin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify tag matches the project version
+        shell: bash
         run: |
-          cmake --build build --config Release --target obs-srtla-output --parallel
-          if (!(Test-Path build\plugin\obs-srtla-output.dll)) { throw 'The plugin target did not produce obs-srtla-output.dll' }
-      - name: Test
-        shell: pwsh
-        run: ctest --test-dir build -C Release --output-on-failure
-      - name: Package
-        shell: pwsh
-        run: cpack --config build\CPackConfig.cmake -C Release
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be a plain semantic version, got: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          project_version="$(sed -nE 's/^project\(obs-srtla-output VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
+          if [[ "$GITHUB_REF_NAME" != "$project_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match project version $project_version" >&2
+            exit 1
+          fi
+      - name: Download Windows package
+        uses: actions/download-artifact@v8
+        with:
+          name: obs-srtla-output-windows-x64
+          path: artifacts
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum -- *.zip > SHA256SUMS.txt
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --verify-tag \
+              --generate-notes \
+              --title "obs-srtla-output $GITHUB_REF_NAME"
+          fi

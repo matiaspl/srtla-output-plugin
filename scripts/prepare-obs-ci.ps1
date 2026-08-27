@@ -85,7 +85,7 @@ function New-ImportLibrary([IO.FileInfo]$Dll, [string]$Name, [string]$OutputDire
     $def = Join-Path $OutputDirectory "$Name.def"
     $lines = @("LIBRARY $($Dll.Name)", 'EXPORTS')
     (& $dumpbin.Source /exports $Dll.FullName) | ForEach-Object {
-        if ($_ -match '^\s*\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)\s*$') {
+        if ($_ -match '^\s*\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)') {
             $lines += "  $($Matches[1])"
         }
     }

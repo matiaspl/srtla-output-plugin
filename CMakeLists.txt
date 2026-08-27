@@ -35,6 +35,9 @@ endif()
 set(OBS_SRTLA_MBEDTLS_ROOT "${_mbedtls_root_default}" CACHE PATH
     "mbedTLS development prefix used by the vendored SRT fork")
 
+set(_obs_srtla_mbedtls_include_hints)
+set(_obs_srtla_mbedtls_library_hints)
+set(_obs_srtla_mbedtls_search_policy)
 if(OBS_SRTLA_MBEDTLS_ROOT)
   # The vendored SRT tree uses its legacy FindMbedTLS.cmake module, which
   # expects a prefix containing include/ and lib/.  Make the same prefix
@@ -42,31 +45,40 @@ if(OBS_SRTLA_MBEDTLS_ROOT)
   set(MBEDTLS_PREFIX "${OBS_SRTLA_MBEDTLS_ROOT}" CACHE PATH
       "The path of mbedTLS" FORCE)
   list(PREPEND CMAKE_PREFIX_PATH "${OBS_SRTLA_MBEDTLS_ROOT}")
-  find_path(OBS_SRTLA_MBEDTLS_INCLUDE_DIR
-            NAMES mbedtls/aes.h
-            HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/include"
-            NO_DEFAULT_PATH)
-  find_library(OBS_SRTLA_MBEDTLS_LIBRARY
-               NAMES mbedtls
-               HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/lib"
-               NO_DEFAULT_PATH)
-  find_library(OBS_SRTLA_MBEDCRYPTO_LIBRARY
-               NAMES mbedcrypto
-               HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/lib"
-               NO_DEFAULT_PATH)
-  find_library(OBS_SRTLA_MBEDX509_LIBRARY
-               NAMES mbedx509
-               HINTS "${OBS_SRTLA_MBEDTLS_ROOT}/lib"
-               NO_DEFAULT_PATH)
-  if(OBS_SRTLA_MBEDTLS_LIBRARY AND OBS_SRTLA_MBEDCRYPTO_LIBRARY AND
-     OBS_SRTLA_MBEDX509_LIBRARY)
-    set(OBS_SRTLA_MBEDTLS_LIBRARIES
-        "${OBS_SRTLA_MBEDTLS_LIBRARY}"
-        "${OBS_SRTLA_MBEDCRYPTO_LIBRARY}"
-        "${OBS_SRTLA_MBEDX509_LIBRARY}")
-    if(WIN32)
-      list(APPEND OBS_SRTLA_MBEDTLS_LIBRARIES bcrypt)
-    endif()
+  list(APPEND _obs_srtla_mbedtls_include_hints
+       "${OBS_SRTLA_MBEDTLS_ROOT}/include")
+  list(APPEND _obs_srtla_mbedtls_library_hints
+       "${OBS_SRTLA_MBEDTLS_ROOT}/lib")
+  set(_obs_srtla_mbedtls_search_policy NO_DEFAULT_PATH)
+endif()
+
+# A complete OBS development prefix (as used by GitHub Actions) carries
+# mbedTLS alongside libobs, Qt, and FFmpeg.  When no explicit root is supplied,
+# allow normal CMake prefix discovery to find that copy.
+find_path(OBS_SRTLA_MBEDTLS_INCLUDE_DIR
+          NAMES mbedtls/aes.h
+          HINTS ${_obs_srtla_mbedtls_include_hints}
+          ${_obs_srtla_mbedtls_search_policy})
+find_library(OBS_SRTLA_MBEDTLS_LIBRARY
+             NAMES mbedtls
+             HINTS ${_obs_srtla_mbedtls_library_hints}
+             ${_obs_srtla_mbedtls_search_policy})
+find_library(OBS_SRTLA_MBEDCRYPTO_LIBRARY
+             NAMES mbedcrypto
+             HINTS ${_obs_srtla_mbedtls_library_hints}
+             ${_obs_srtla_mbedtls_search_policy})
+find_library(OBS_SRTLA_MBEDX509_LIBRARY
+             NAMES mbedx509
+             HINTS ${_obs_srtla_mbedtls_library_hints}
+             ${_obs_srtla_mbedtls_search_policy})
+if(OBS_SRTLA_MBEDTLS_LIBRARY AND OBS_SRTLA_MBEDCRYPTO_LIBRARY AND
+   OBS_SRTLA_MBEDX509_LIBRARY)
+  set(OBS_SRTLA_MBEDTLS_LIBRARIES
+      "${OBS_SRTLA_MBEDTLS_LIBRARY}"
+      "${OBS_SRTLA_MBEDCRYPTO_LIBRARY}"
+      "${OBS_SRTLA_MBEDX509_LIBRARY}")
+  if(WIN32)
+    list(APPEND OBS_SRTLA_MBEDTLS_LIBRARIES bcrypt)
   endif()
 endif()
 
@@ -133,6 +145,9 @@ set(CPACK_PACKAGE_NAME "obs-srtla-output")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_GENERATOR "ZIP")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+if(WIN32)
+  set(CPACK_SYSTEM_NAME "obs32-windows-x64")
+endif()
 include(CPack)
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
@@ -194,18 +209,33 @@ elseif(NOT TARGET Qt6::Widgets)
   endif()
   message(WARNING "Qt6 Widgets was not found; OBS plugin target is disabled.")
 else()
+  set(_obs_srtla_ffmpeg_include_hints)
+  set(_obs_srtla_ffmpeg_library_hints)
+  if(OBS_SRTLA_FFMPEG_ROOT)
+    list(APPEND _obs_srtla_ffmpeg_include_hints
+         "${OBS_SRTLA_FFMPEG_ROOT}/include")
+    list(APPEND _obs_srtla_ffmpeg_library_hints
+         "${OBS_SRTLA_FFMPEG_ROOT}/lib")
+  endif()
+  if(DEFINED ENV{OBS_SRTLA_FFMPEG_ROOT} AND
+     NOT "$ENV{OBS_SRTLA_FFMPEG_ROOT}" STREQUAL "")
+    list(APPEND _obs_srtla_ffmpeg_include_hints
+         "$ENV{OBS_SRTLA_FFMPEG_ROOT}/include")
+    list(APPEND _obs_srtla_ffmpeg_library_hints
+         "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+  endif()
   find_path(OBS_SRTLA_FFMPEG_INCLUDE_DIR
             NAMES libavformat/avformat.h
-            HINTS "${OBS_SRTLA_FFMPEG_ROOT}/include" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/include")
+            HINTS ${_obs_srtla_ffmpeg_include_hints})
   find_library(OBS_SRTLA_FFMPEG_AVFORMAT
                NAMES avformat avformat-61 avformat-60 avformat-59
-               HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+               HINTS ${_obs_srtla_ffmpeg_library_hints})
   find_library(OBS_SRTLA_FFMPEG_AVCODEC
                NAMES avcodec avcodec-61 avcodec-60 avcodec-59
-               HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+               HINTS ${_obs_srtla_ffmpeg_library_hints})
   find_library(OBS_SRTLA_FFMPEG_AVUTIL
                NAMES avutil avutil-59 avutil-58 avutil-57
-               HINTS "${OBS_SRTLA_FFMPEG_ROOT}/lib" "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
+               HINTS ${_obs_srtla_ffmpeg_library_hints})
   if(NOT OBS_SRTLA_FFMPEG_INCLUDE_DIR OR NOT OBS_SRTLA_FFMPEG_AVFORMAT OR
      NOT OBS_SRTLA_FFMPEG_AVCODEC OR NOT OBS_SRTLA_FFMPEG_AVUTIL)
     if(OBS_SRTLA_REQUIRE_PLUGIN)

@@ -267,7 +267,14 @@ provisioning script.
 Windows CI builds the native plugin and runs the Rust engine, transport ABI,
 output lifecycle, and secret-store tests. Linux CI runs the engine and vendored
 sender workspaces' unit, protocol, and dependency-independent integration
-tests. See [TODO](#todo) for the network-namespace/netem coverage gap.
+tests. The Windows job uses the OBS 32 development environment, produces an
+OBS-ready ZIP, and uploads it as a workflow artifact.
+
+Pushing a plain semantic-version tag that matches the CMake project version
+(for example, `0.1.0`) runs the same checks. Only after both jobs pass, GitHub
+Actions publishes the ZIP and its `SHA256SUMS.txt` as a GitHub Release. Re-running
+the tagged workflow safely replaces the release assets. See [TODO](#todo) for
+the network-namespace/netem coverage gap.
 
 ## License
 
