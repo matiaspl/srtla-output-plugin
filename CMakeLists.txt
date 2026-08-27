@@ -162,6 +162,16 @@ if(NOT TARGET OBS::libobs)
   find_package(libobs CONFIG QUIET)
 endif()
 
+# Standalone OBS SDKs export the frontend package separately and name its
+# imported target OBS::obs-frontend-api.  Normalize it to the target name used
+# by in-tree OBS plugin builds and by our runtime-import fallback below.
+if(TARGET OBS::libobs AND NOT TARGET OBS::frontend-api)
+  find_package(obs-frontend-api CONFIG QUIET)
+  if(TARGET OBS::obs-frontend-api)
+    add_library(OBS::frontend-api ALIAS OBS::obs-frontend-api)
+  endif()
+endif()
+
 # Fallback for the normal OBS installer.  It has obs.dll and
 # obs-frontend-api.dll but no CMake package.  The generated import libraries
 # are ordinary MSVC import libs and do not copy or statically link OBS code.
@@ -203,6 +213,11 @@ if(NOT TARGET OBS::libobs)
     message(FATAL_ERROR "OBS development targets were not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
   endif()
   message(WARNING "OBS development targets were not found; only the Rust/ABR slice can be built.")
+elseif(NOT TARGET OBS::frontend-api)
+  if(OBS_SRTLA_REQUIRE_PLUGIN)
+    message(FATAL_ERROR "OBS frontend API target was not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
+  endif()
+  message(WARNING "OBS frontend API target was not found; OBS plugin target is disabled.")
 elseif(NOT TARGET Qt6::Widgets)
   if(OBS_SRTLA_REQUIRE_PLUGIN)
     message(FATAL_ERROR "Qt6 Widgets was not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
