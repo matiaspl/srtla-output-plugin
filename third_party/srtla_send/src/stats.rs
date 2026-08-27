@@ -26,7 +26,7 @@ use srtla_core::connection::SrtlaConnection;
 use srtla_core::selection::calculate_quality_multiplier;
 use srtla_core::selection::classifier::{ClassificationResult, WeakReason};
 use srtla_core::selection::enhanced::in_flight_cap_packets;
-use srtla_core::selection::link_cc::{CcState, LinkCcSnapshot};
+use srtla_core::selection::link_cc::{CcState, LinkCcController, LinkCcSnapshot};
 use srtla_core::utils::now_ms;
 
 use crate::config::ConfigSnapshot;
@@ -70,6 +70,10 @@ pub struct LinkStats {
     /// name also claimed bits. Anything that compared the two, or
     /// graphed the gauge, was silently out by a factor of 8.
     pub bitrate_bytes_per_sec: u32,
+    /// Payload-datagram rate confirmed by per-packet SRTLA ACKs on this exact
+    /// link, in bits per second. This is a demonstrated-throughput lower bound,
+    /// not an estimate of unused headroom.
+    pub delivered_bps: u64,
 
     // --- RTT baseline tracking ---
     /// Dual-window minimum RTT baseline in milliseconds.
@@ -267,6 +271,38 @@ impl SharedStats {
         }
     }
 
+    /// Tick per-link congestion control, stamp its routing state onto each
+    /// connection, and publish one coherent statistics snapshot.
+    ///
+    /// Both sender front ends use this method so an embedded consumer cannot
+    /// accidentally omit the CC snapshot and export a zero capacity estimate.
+    pub fn update_with_link_cc(
+        &self,
+        connections: &mut [SrtlaConnection],
+        config: &ConfigSnapshot,
+        classification: Option<&ClassificationResult>,
+        link_cc: &mut LinkCcController,
+        current_time_ms: u64,
+    ) {
+        let link_cc_snapshots = link_cc.tick_all(connections, current_time_ms);
+        for conn in connections.iter_mut() {
+            let cc_snap = link_cc_snapshots.get(&conn.conn_id);
+            conn.cc_backing_off = cc_snap
+                .map(|snapshot| snapshot.state == CcState::BackingOff)
+                .unwrap_or(false);
+            conn.cc_target_bps = cc_snap.map(|snapshot| snapshot.target_bps).unwrap_or(0);
+            conn.loss_degraded = cc_snap
+                .map(|snapshot| snapshot.loss_degraded)
+                .unwrap_or(false);
+        }
+        self.update(
+            connections,
+            config,
+            classification,
+            Some(&link_cc_snapshots),
+        );
+    }
+
     /// Update stats from current connection state.
     ///
     /// `classification` carries the weak-link classifier's per-tick output.
@@ -368,7 +404,16 @@ impl SharedStats {
                 label: conn.label.clone(),
                 admin_enabled: conn.admin_enabled,
                 payload_eligible,
-                capacity_ready: conn.cc_target_bps > 0 && is_active,
+                // The bootstrap and initial targets are placeholders, not
+                // measured capacity. Publishing either one as ready can make
+                // an ABR consumer apply its safety margin to 1 Mbps even while
+                // this link is already carrying a high-rate stream. Require a
+                // complete offered and ACK-delivery windows and a state past
+                // Bootstrap.
+                capacity_ready: is_active
+                    && conn.offered_rate_ready()
+                    && conn.delivered_rate_ready()
+                    && cc_entry.is_some_and(|snapshot| snapshot.state != CcState::Bootstrap),
                 connected: conn.connected,
                 timed_out,
                 window: conn.window,
@@ -376,6 +421,7 @@ impl SharedStats {
                 rtt_ms: conn.get_smooth_rtt_ms() as u32,
                 nak_count: conn.total_nak_count(),
                 bitrate_bytes_per_sec: (conn.current_bitrate_mbps() * 1_000_000.0 / 8.0) as u32,
+                delivered_bps: conn.current_delivered_bps(),
                 rtt_min_ms: conn.get_rtt_min_ms(),
                 rtt_velocity: conn.get_rtt_velocity(),
                 base_score: conn.get_score(),
@@ -450,6 +496,7 @@ fn cc_state_str(state: CcState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use srtla_core::mode::SchedulingMode;
+    use srtla_core::selection::link_cc::LinkCcController;
 
     use super::*;
 
@@ -483,5 +530,70 @@ mod tests {
         assert!(json.contains("\"active_links\""));
         assert!(json.contains("\"total_window\""));
         assert!(json.contains("\"links\""));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_capacity_is_not_published_as_ready() {
+        let mut connections = crate::test_helpers::create_test_connections(1).await;
+        let config = ConfigSnapshot {
+            mode: SchedulingMode::Enhanced,
+            quality_enabled: true,
+            ..ConfigSnapshot::default()
+        };
+        let stats = SharedStats::new();
+        let mut link_cc = LinkCcController::new();
+
+        stats.update_with_link_cc(&mut connections, &config, None, &mut link_cc, now_ms());
+
+        let snapshot = stats.get();
+        let link = snapshot.links.first().expect("one link must be exported");
+        assert!(
+            !link.capacity_ready,
+            "an unmeasured bootstrap target must remain warming"
+        );
+        assert!(
+            link.cc_target_bps > 0,
+            "CC target must not be exported as zero"
+        );
+        assert_eq!(link.cc_target_bps, connections[0].cc_target_bps);
+    }
+
+    #[tokio::test]
+    async fn measured_non_bootstrap_capacity_is_ready() {
+        let mut connections = crate::test_helpers::create_test_connections(1).await;
+        let start = now_ms();
+        connections[0].rtt.kalman_rtt.update(50.0);
+        connections[0].bitrate.reset(start);
+        connections[0].delivered_bitrate.reset(start);
+        connections[0].bitrate.update_on_send(4_500_000);
+        connections[0].record_delivered_bytes(4_000_000);
+        connections[0].calculate_bitrate(start + 2_000);
+        let config = ConfigSnapshot {
+            mode: SchedulingMode::Enhanced,
+            quality_enabled: true,
+            ..ConfigSnapshot::default()
+        };
+        let stats = SharedStats::new();
+        let mut link_cc = LinkCcController::new();
+
+        stats.update_with_link_cc(&mut connections, &config, None, &mut link_cc, start + 2_000);
+
+        let link = &stats.get().links[0];
+        assert!(link.capacity_ready);
+        assert_ne!(link.cc_state, "bootstrap");
+    }
+
+    #[tokio::test]
+    async fn snapshot_exposes_ack_confirmed_delivery_rate() {
+        let mut connections = crate::test_helpers::create_test_connections(1).await;
+        let now = now_ms();
+        connections[0].delivered_bitrate.reset(now);
+        connections[0].record_delivered_bytes(500_000);
+        connections[0].calculate_bitrate(now + 2_000);
+
+        let stats = SharedStats::new();
+        stats.update(&connections, &ConfigSnapshot::default(), None, None);
+
+        assert_eq!(stats.get().links[0].delivered_bps, 2_000_000);
     }
 }

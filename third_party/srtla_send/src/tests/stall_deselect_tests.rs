@@ -840,7 +840,7 @@ mod tests {
         conns[0].last_ack_or_rtt_sample_ms = 1;
         conns[1].last_ack_or_rtt_sample_ms = 1;
 
-        let seq_tracker = SequenceTracker::new();
+        let mut seq_tracker = SequenceTracker::new();
         let (instant_tx, _instant_rx) = tokio::sync::mpsc::unbounded_channel();
         let incoming = SrtlaIncoming {
             srtla_ack_numbers: smallvec::smallvec![seq],
@@ -854,7 +854,7 @@ mod tests {
             &mut conns,
             None,
             &instant_tx,
-            &seq_tracker,
+            &mut seq_tracker,
             false,
             incoming,
         )
@@ -874,6 +874,66 @@ mod tests {
             "the unique copy stays in flight until its own ACK clears it"
         );
         assert_eq!(conns[1].in_flight_packets, 0);
+    }
+
+    #[tokio::test]
+    async fn srtla_ack_records_unique_delivered_bytes_after_cumulative_sweep() {
+        use srtla_core::connection::SrtlaIncoming;
+
+        use crate::sender::{SequenceTracker, process_connection_events};
+
+        let mut conns = create_test_connections(1).await;
+        let now = now_ms();
+        let seq: u32 = 5151;
+        let conn_id = conns[0].conn_id;
+        conns[0].register_packet(seq as i32, now);
+        conns[0].last_ack_or_rtt_sample_ms = 1;
+        let mut seq_tracker = SequenceTracker::new();
+        seq_tracker.insert_with_size(seq, conn_id, now, 1_316);
+        let (instant_tx, _instant_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // The cumulative ACK is intentionally processed first and removes the
+        // per-link packet-log entry. The independent sequence ring must still
+        // let the exact-link SRTLA ACK credit its bytes and delivery proof.
+        process_connection_events(
+            0,
+            &mut conns,
+            None,
+            &instant_tx,
+            &mut seq_tracker,
+            false,
+            SrtlaIncoming {
+                ack_numbers: smallvec::smallvec![seq],
+                srtla_ack_numbers: smallvec::smallvec![seq],
+                read_any: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(conns[0].packet_log.is_empty());
+        assert_eq!(conns[0].delivered_bitrate.bytes_sent_total, 1_316);
+        assert!(conns[0].last_ack_or_rtt_sample_ms > 1);
+
+        // A duplicated ACK remains ownership evidence, but not another byte
+        // sample.
+        process_connection_events(
+            0,
+            &mut conns,
+            None,
+            &instant_tx,
+            &mut seq_tracker,
+            false,
+            SrtlaIncoming {
+                srtla_ack_numbers: smallvec::smallvec![seq],
+                read_any: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(conns[0].delivered_bitrate.bytes_sent_total, 1_316);
     }
 
     // --- Cross-mechanism blackout immunity (librist !375 field lesson,

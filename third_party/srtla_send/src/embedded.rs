@@ -19,6 +19,7 @@ use smallvec::SmallVec;
 use srtla_core::mode::SchedulingMode;
 use srtla_core::priority::CriticalWindow;
 use srtla_core::registration::SrtlaRegistrationManager;
+use srtla_core::selection::link_cc::LinkCcController;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
@@ -62,6 +63,63 @@ pub enum EmbeddedSubmitError {
     Stopped,
 }
 
+/// Cloneable input side of the embedded sender.
+///
+/// The C ABI takes the engine's state lock only long enough to clone this
+/// handle, then submits outside that lock.  A full channel therefore applies
+/// backpressure to libsrt without blocking unrelated feedback reads or engine
+/// control operations.
+#[derive(Clone)]
+pub struct EmbeddedSubmitter {
+    input: mpsc::Sender<Vec<u8>>,
+}
+
+impl EmbeddedSubmitter {
+    pub fn submit(&self, packet: Vec<u8>) -> std::result::Result<(), EmbeddedSubmitError> {
+        match self.input.try_send(packet) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(packet)) => self
+                .input
+                .blocking_send(packet)
+                .map_err(|_| EmbeddedSubmitError::Stopped),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(EmbeddedSubmitError::Stopped),
+        }
+    }
+}
+
+/// Cloneable output side of the embedded sender.
+///
+/// Waiting for feedback must not hold the engine's global state lock: libsrt
+/// has independent send and receive threads, and serialising them behind the
+/// receive callback's timeout throttles the media path.
+#[derive(Clone)]
+pub struct EmbeddedReceiver {
+    output: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+}
+
+impl EmbeddedReceiver {
+    pub fn receive(&self, timeout: StdDuration) -> Option<Vec<u8>> {
+        let deadline = StdInstant::now() + timeout;
+        loop {
+            let result = {
+                let mut receiver = self.output.lock().ok()?;
+                receiver.try_recv()
+            };
+            match result {
+                Ok(packet) => return Some(packet),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) if timeout.is_zero() => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if StdInstant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(StdDuration::from_millis(1));
+                }
+            }
+        }
+    }
+}
+
 enum Control {
     SetLink { id: u64, enabled: bool },
     UpdateLinks(Vec<EmbeddedLink>),
@@ -70,8 +128,8 @@ enum Control {
 
 /// A thread-safe, bounded in-process sender handle.
 pub struct EmbeddedSender {
-    input: mpsc::Sender<Vec<u8>>,
-    output: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    submitter: EmbeddedSubmitter,
+    receiver: EmbeddedReceiver,
     control: mpsc::Sender<Control>,
     stats: Arc<Mutex<String>>,
     join: Option<thread::JoinHandle<()>>,
@@ -82,7 +140,9 @@ impl EmbeddedSender {
         let (input, input_rx) = mpsc::channel(INPUT_CAPACITY);
         let (output_tx, output_rx) = mpsc::channel(OUTPUT_CAPACITY);
         let (control, control_rx) = mpsc::channel(32);
-        let output = Arc::new(Mutex::new(output_rx));
+        let receiver = EmbeddedReceiver {
+            output: Arc::new(Mutex::new(output_rx)),
+        };
         let stats = Arc::new(Mutex::new("{}".to_string()));
         let stats_thread = stats.clone();
         let join = thread::Builder::new()
@@ -114,8 +174,8 @@ impl EmbeddedSender {
                 serde_json::json!({"state":"Error","error":"failed to spawn embedded SRTLA thread"}).to_string();
         }
         Self {
-            input,
-            output,
+            submitter: EmbeddedSubmitter { input },
+            receiver,
             control,
             stats,
             join,
@@ -123,32 +183,19 @@ impl EmbeddedSender {
     }
 
     pub fn submit(&self, packet: Vec<u8>) -> std::result::Result<(), EmbeddedSubmitError> {
-        match self.input.try_send(packet) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(EmbeddedSubmitError::Backpressure),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(EmbeddedSubmitError::Stopped),
-        }
+        self.submitter.submit(packet)
+    }
+
+    pub fn submitter(&self) -> EmbeddedSubmitter {
+        self.submitter.clone()
     }
 
     pub fn receive(&self, timeout: StdDuration) -> Option<Vec<u8>> {
-        let deadline = StdInstant::now() + timeout;
-        loop {
-            let result = {
-                let mut receiver = self.output.lock().ok()?;
-                receiver.try_recv()
-            };
-            match result {
-                Ok(packet) => return Some(packet),
-                Err(mpsc::error::TryRecvError::Disconnected) => return None,
-                Err(mpsc::error::TryRecvError::Empty) if timeout.is_zero() => return None,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if StdInstant::now() >= deadline {
-                        return None;
-                    }
-                    thread::sleep(StdDuration::from_millis(1));
-                }
-            }
-        }
+        self.receiver.receive(timeout)
+    }
+
+    pub fn receiver(&self) -> EmbeddedReceiver {
+        self.receiver.clone()
     }
 
     pub fn set_link_enabled(&self, id: u64, enabled: bool) -> bool {
@@ -224,6 +271,7 @@ async fn run_embedded(
     });
     let critical_window = CriticalWindow::new();
     let shared_stats = SharedStats::new();
+    let mut link_cc_controller = LinkCcController::new();
     let mut reg = SrtlaRegistrationManager::new();
     let mut sequence = SequenceTracker::new();
     let (packet_tx, mut packet_rx) = create_uplink_channel();
@@ -258,11 +306,11 @@ async fn run_embedded(
                 handle_srt_datagram(&packet, local_addr, &mut connections, &conn_io, &mut last_selected,
                     &mut sequence, &mut last_client, reg.has_connected, &snapshot, &critical_window).await;
                 drain_packet_queue(&mut packet_rx, &mut connections, &conn_io, &mut reg, &instant_tx,
-                    last_client, &sequence, &snapshot, &dynamic).await;
+                    last_client, &mut sequence, &snapshot, &dynamic).await;
             }
             Some(packet) = packet_rx.recv() => {
                 handle_uplink_packet(packet, &mut connections, &conn_io, &mut reg, &instant_tx,
-                    last_client, &sequence, &dynamic.snapshot(), &dynamic).await;
+                    last_client, &mut sequence, &dynamic.snapshot(), &dynamic).await;
             }
             Some((_, packet)) = instant_rx.recv() => {
                 match output_tx.try_send(packet.to_vec()) {
@@ -413,10 +461,22 @@ async fn run_embedded(
                         }
                     }
                 }
+                let now_ms = srtla_core::utils::now_ms();
                 let _ = handle_housekeeping(&mut connections, &mut conn_io, &mut reg, &mut sequence,
-                    &config.receiver_host, dynamic.mode().is_classic(), srtla_core::utils::now_ms(),
+                    &config.receiver_host, dynamic.mode().is_classic(), now_ms,
                     &mut all_failed_at, &mut readers, &packet_tx, &mut rehome).await;
-                shared_stats.update(&connections, &dynamic.snapshot(), None, None);
+
+                // Keep embedded-runner telemetry in step with the standalone
+                // sender. This operation both runs per-link CC and publishes
+                // its capacity estimate, so OBS never receives a zero-filled
+                // placeholder snapshot for a live connection.
+                shared_stats.update_with_link_cc(
+                    &mut connections,
+                    &dynamic.snapshot(),
+                    None,
+                    &mut link_cc_controller,
+                    now_ms,
+                );
                 let snapshot = shared_stats.get();
                 if let Ok(mut out) = stats.lock() {
                     *out = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
@@ -432,4 +492,36 @@ async fn run_embedded(
         reader.handle.abort();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_input_waits_for_capacity_instead_of_dropping_a_packet() {
+        let (input, mut input_rx) = mpsc::channel(1);
+        let submitter = EmbeddedSubmitter { input };
+        assert!(submitter.submit(vec![1]).is_ok());
+
+        let blocked = submitter.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            done_tx.send(blocked.submit(vec![2])).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+            "a full input must apply backpressure"
+        );
+        assert_eq!(input_rx.blocking_recv(), Some(vec![1]));
+        assert!(
+            done_rx
+                .recv_timeout(StdDuration::from_secs(1))
+                .expect("blocked submit should resume")
+                .is_ok()
+        );
+        assert_eq!(input_rx.blocking_recv(), Some(vec![2]));
+        worker.join().unwrap();
+    }
 }

@@ -244,7 +244,7 @@ pub async fn run_sender_with_config(
                             &mut reg,
                             &instant_tx,
                             last_client_addr,
-                            &seq_tracker,
+                            &mut seq_tracker,
                             &config_snap,
                             &config,
                         )
@@ -260,7 +260,7 @@ pub async fn run_sender_with_config(
                                 &mut reg,
                                 &instant_tx,
                                 last_client_addr,
-                                &seq_tracker,
+                                &mut seq_tracker,
                                 &config_snap,
                                 &config,
                             ).await;
@@ -271,7 +271,7 @@ pub async fn run_sender_with_config(
                                 &mut reg,
                                 &instant_tx,
                                 last_client_addr,
-                                &seq_tracker,
+                                &mut seq_tracker,
                                 &config_snap,
                                 &config,
                             ).await;
@@ -297,14 +297,12 @@ pub async fn run_sender_with_config(
                             warn!("housekeeping failed: {err}");
                         }
 
-                        // Run the weak-link classifier and per-link CC
-                        // controller, stamp results onto each connection
-                        // for selection to consume, and surface via stats.
+                        // Run the weak-link classifier, stamp its result onto
+                        // each connection, then publish it together with a
+                        // fresh per-link CC snapshot.
                         let housekeeping_snap = config.snapshot();
                         let classification = weak_link_filter
                             .classify(&connections, housekeeping_snap.negotiated_latency_ms);
-                        let link_cc_snapshots = link_cc_controller
-                            .tick_all(&connections, srtla_core::utils::now_ms());
                         for conn in connections.iter_mut() {
                             let entry = classification
                                 .per_link
@@ -317,19 +315,13 @@ pub async fn run_sender_with_config(
                             conn.weak_reason = entry
                                 .map(|e| e.reason)
                                 .unwrap_or(srtla_core::selection::classifier::WeakReason::Healthy);
-                            let cc_snap = link_cc_snapshots.get(&conn.conn_id);
-                            conn.cc_backing_off = cc_snap
-                                .map(|s| s.state == srtla_core::selection::link_cc::CcState::BackingOff)
-                                .unwrap_or(false);
-                            conn.cc_target_bps = cc_snap.map(|s| s.target_bps).unwrap_or(0);
-                            conn.loss_degraded =
-                                cc_snap.map(|s| s.loss_degraded).unwrap_or(false);
                         }
-                        shared_stats.update(
-                            &connections,
+                        shared_stats.update_with_link_cc(
+                            &mut connections,
                             &housekeeping_snap,
                             Some(&classification),
-                            Some(&link_cc_snapshots),
+                            &mut link_cc_controller,
+                            srtla_core::utils::now_ms(),
                         );
 
                         // Fan the fresh snapshot out to any `stats` subscribers
@@ -373,7 +365,7 @@ pub async fn run_sender_with_config(
                             &mut reg,
                             &instant_tx,
                             last_client_addr,
-                            &seq_tracker,
+                            &mut seq_tracker,
                             &config_snap,
                             &config,
                         )
@@ -424,7 +416,7 @@ pub async fn run_sender_with_config(
                 &mut reg,
                 &instant_tx,
                 last_client_addr,
-                &seq_tracker,
+                &mut seq_tracker,
                 &config_snap,
                 &config,
             )

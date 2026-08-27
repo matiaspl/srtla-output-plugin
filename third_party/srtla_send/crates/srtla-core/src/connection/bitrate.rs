@@ -10,6 +10,9 @@ pub struct BitrateTracker {
     pub bytes_sent_window: u64,
     pub last_rate_update_ms: u64,
     pub current_bitrate_bps: f64,
+    /// True after at least one complete measurement window. Distinguishes a
+    /// real zero rate from a tracker that has not published its first sample.
+    pub rate_ready: bool,
 }
 
 impl BitrateTracker {
@@ -20,6 +23,7 @@ impl BitrateTracker {
             bytes_sent_window: 0,
             last_rate_update_ms: now_ms,
             current_bitrate_bps: 0.0,
+            rate_ready: false,
         }
     }
 
@@ -29,6 +33,7 @@ impl BitrateTracker {
         self.bytes_sent_window = 0;
         self.last_rate_update_ms = now_ms;
         self.current_bitrate_bps = 0.0;
+        self.rate_ready = false;
     }
 
     /// Update bitrate tracking when bytes are sent
@@ -55,6 +60,7 @@ impl BitrateTracker {
 
             self.last_rate_update_ms = now;
             self.bytes_sent_window = self.bytes_sent_total;
+            self.rate_ready = true;
         }
     }
 
@@ -77,11 +83,13 @@ mod tests {
         // Open the window 2.5s in the past so the next calculate() crosses 2s.
         let mut t = BitrateTracker::new(T0);
         assert_eq!(t.current_bitrate_bps, 0.0);
+        assert!(!t.rate_ready);
 
         t.update_on_send(500_000);
         assert_eq!(t.bytes_sent_total, 500_000);
 
         t.calculate(T0 + 2_500);
+        assert!(t.rate_ready);
         assert!(
             t.current_bitrate_bps > 0.0,
             "sending bytes must raise the estimate, got {}",

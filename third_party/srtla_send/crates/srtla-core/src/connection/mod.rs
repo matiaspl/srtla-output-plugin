@@ -401,6 +401,13 @@ pub struct SrtlaConnection {
     pub bitrate: BitrateTracker,
     #[cfg(not(feature = "test-internals"))]
     pub(crate) bitrate: BitrateTracker,
+    /// ACK-confirmed payload-datagram rate for this exact link. Unlike
+    /// [`Self::bitrate`], this advances only when an SRTLA per-packet ACK
+    /// returns on the link that owned the sequence.
+    #[cfg(feature = "test-internals")]
+    pub delivered_bitrate: BitrateTracker,
+    #[cfg(not(feature = "test-internals"))]
+    pub(crate) delivered_bitrate: BitrateTracker,
     pub reconnection: ReconnectionState,
     /// Cached quality multiplier for performance optimization.
     /// Recalculated every 50ms instead of on every packet.
@@ -510,6 +517,7 @@ impl SrtlaConnection {
             rtt: RttTracker::default(),
             congestion: CongestionControl::default(),
             bitrate: BitrateTracker::new(now),
+            delivered_bitrate: BitrateTracker::new(now),
             reconnection: ReconnectionState {
                 startup_grace_deadline_ms: now + STARTUP_GRACE_MS,
                 ..Default::default()
@@ -1255,6 +1263,7 @@ impl SrtlaConnection {
         self.in_flight_packets = 0;
         self.highest_acked_seq = NO_ACK_YET;
         self.congestion.reset();
+        self.delivered_bitrate.reset(now_ms);
         self.batch_sender.reset();
         self.quality_cache = CachedQuality::default();
         // REG3 received — begin warming phase
@@ -1368,11 +1377,41 @@ impl SrtlaConnection {
     /// Calculate current bitrate
     pub fn calculate_bitrate(&mut self, now_ms: u64) {
         self.bitrate.calculate(now_ms);
+        self.delivered_bitrate.calculate(now_ms);
     }
 
     /// Get current bitrate in Mbps
     pub fn current_bitrate_mbps(&self) -> f64 {
         self.bitrate.mbps()
+    }
+
+    /// Whether a complete offered-rate measurement window has elapsed.
+    pub fn offered_rate_ready(&self) -> bool {
+        self.bitrate.rate_ready
+    }
+
+    /// Credit bytes that were acknowledged by the SRTLA receiver on this
+    /// exact link. The shell deduplicates ACKs before calling this method.
+    pub fn record_delivered_bytes(&mut self, bytes: u64) {
+        self.delivered_bitrate.update_on_send(bytes);
+    }
+
+    /// Preserve delivery proof when a cumulative SRT ACK already swept the
+    /// packet from this link's in-flight log before its exact-link SRTLA ACK
+    /// returned. The shell's sequence ring retains the original timestamp.
+    pub fn record_sweep_pruned_delivery_proof(&mut self, sent_ms: u64, now_ms: u64) {
+        self.last_ack_or_rtt_sample_ms = now_ms;
+        self.rtt.record_round_trip(sent_ms, now_ms);
+    }
+
+    /// Latest ACK-confirmed payload rate in bits per second.
+    pub fn current_delivered_bps(&self) -> u64 {
+        self.delivered_bitrate.current_bitrate_bps.max(0.0) as u64
+    }
+
+    /// Whether a complete acknowledged-rate measurement window has elapsed.
+    pub fn delivered_rate_ready(&self) -> bool {
+        self.delivered_bitrate.rate_ready
     }
 
     /// Pick the batch regime for this connection from its observed
@@ -1398,6 +1437,7 @@ impl SrtlaConnection {
         self.congestion.reset();
         self.rtt.reset();
         self.bitrate.reset(now);
+        self.delivered_bitrate.reset(now);
 
         // Reset reconnection tracking
         self.reconnection.last_reconnect_attempt_ms = now;

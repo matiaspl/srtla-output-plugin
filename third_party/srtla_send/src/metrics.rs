@@ -146,6 +146,26 @@ pub fn render(stats: &SharedStats, config: &DynamicConfig, cw: &CriticalWindow) 
 
     writeln!(
         out,
+        "# HELP srtla_send_link_delivered_bits_per_second ACK-confirmed payload datagram rate, \
+         bits/sec"
+    )
+    .ok();
+    writeln!(
+        out,
+        "# TYPE srtla_send_link_delivered_bits_per_second gauge"
+    )
+    .ok();
+    for link in &snap.links {
+        writeln!(
+            out,
+            r#"srtla_send_link_delivered_bits_per_second{{ip="{}"}} {}"#,
+            link.ip, link.delivered_bps
+        )
+        .ok();
+    }
+
+    writeln!(
+        out,
         "# HELP srtla_send_link_quality_multiplier scheduler quality multiplier in [0.35, 1.1]"
     )
     .ok();

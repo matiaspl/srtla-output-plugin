@@ -156,6 +156,11 @@ const FAST_RECOVERY_TICKS: u32 = 5;
 /// wait for ARQ to surface the loss.
 const DRAIN_RTT_INFLATION: f64 = 2.0;
 
+/// Minimum absolute queueing delay required for Drain. A ratio by itself is
+/// noisy on very low-latency paths: 6ms -> 13ms is above 2x, but only 7ms of
+/// queueing and not evidence that a multi-megabit local link lost its capacity.
+const DRAIN_MIN_QUEUE_DELAY_MS: f64 = 20.0;
+
 /// Drain factor applied as a one-shot multiplicative decrease when
 /// Drain triggers. 0.75 = -25%.
 const DRAIN_PERMILLE: u32 = 750;
@@ -362,6 +367,10 @@ pub struct LinkCongestionState {
     /// Ticks the `loss_uncongestive` verdict has been held, against
     /// `LOSS_UNCONGESTIVE_RETEST_TICKS`.
     uncongestive_ticks: u32,
+    /// A Drain cut is armed initially and only re-arms after RTT returns to the
+    /// non-holding band. This hysteresis prevents 1.9x/2.0x jitter from applying
+    /// another 25% cut on every threshold crossing.
+    drain_armed: bool,
 }
 
 impl Default for LinkCongestionState {
@@ -390,6 +399,7 @@ impl Default for LinkCongestionState {
             backoff_entry_loss_pm: 0,
             loss_uncongestive: false,
             uncongestive_ticks: 0,
+            drain_armed: true,
         }
     }
 }
@@ -586,10 +596,44 @@ impl LinkCongestionState {
         }
     }
 
+    /// Compatibility helper for callers whose observed rate is already known
+    /// to be delivered. Production uses [`Self::tick_with_delivery_sample`] so
+    /// offered load, ACK-confirmed delivery, and sample readiness remain
+    /// distinct.
+    pub fn tick(&mut self, observed_bps: u64, now_ms: u64) {
+        self.tick_with_delivery(observed_bps, observed_bps, now_ms);
+    }
+
+    /// Recompute the state and `target_bps` from the latest signals.
+    /// Compatibility entry point for tests and callers that already have a
+    /// complete rate sample.
+    pub fn tick_with_delivery(&mut self, offered_bps: u64, delivered_bps: u64, now_ms: u64) {
+        self.tick_with_delivery_sample(offered_bps, delivered_bps, true, now_ms);
+    }
+
     /// Recompute the state and `target_bps` from the latest signals.
     /// Called once per housekeeping tick.
-    pub fn tick(&mut self, observed_bps: u64, now_ms: u64) {
+    ///
+    /// `rate_sample_ready` is true only after both two-second rate trackers
+    /// have published a complete window. Until then (or while either measured
+    /// rate is zero) the CC target is deliberately kept in Bootstrap: RTT can
+    /// arrive much earlier than throughput, and seeding from that interval's
+    /// zero placeholder used to pin a busy link near 1 Mbps.
+    pub fn tick_with_delivery_sample(
+        &mut self,
+        offered_bps: u64,
+        delivered_bps: u64,
+        rate_sample_ready: bool,
+        now_ms: u64,
+    ) {
         self.evict_expired(now_ms);
+
+        if !rate_sample_ready || offered_bps == 0 || delivered_bps == 0 {
+            self.state = CcState::Bootstrap;
+            self.climb_mode = ClimbMode::Normal;
+            self.target_bps = MIN_TARGET_BPS;
+            return;
+        }
 
         if !self.rtt_ewma_ms.is_finite() || self.rtt_ewma_ms == 0.0 {
             // No RTT yet: stay in bootstrap, hold the floor.
@@ -606,6 +650,16 @@ impl LinkCongestionState {
         } else {
             1.0
         };
+        let queue_delay_ms = if self.rtt_min_ms.is_finite() {
+            (self.rtt_ewma_ms - self.rtt_min_ms).max(0.0)
+        } else {
+            0.0
+        };
+        let drain_signal =
+            rtt_inflation >= DRAIN_RTT_INFLATION && queue_delay_ms >= DRAIN_MIN_QUEUE_DELAY_MS;
+        if rtt_inflation <= RTT_HOLD_FACTOR {
+            self.drain_armed = true;
+        }
 
         // Outlier rejection: clamp a single throughput sample to
         // `CC_OUTLIER_FACTOR` times the running estimate (floored at the
@@ -614,13 +668,38 @@ impl LinkCongestionState {
         // burst can move the soft cap, whether at the seed or via the
         // climb's measured cap.
         let baseline = self.target_bps.max(INITIAL_TARGET_BPS) as f64;
-        let sane_observed = (observed_bps as f64).min(CC_OUTLIER_FACTOR * baseline) as u64;
+        let sane_offered = (offered_bps as f64).min(CC_OUTLIER_FACTOR * baseline) as u64;
+        // ACK compression can briefly report delivery above the matching send
+        // window. It is still useful as a lower-bound signal, but never credit
+        // more than was offered in the same controller sample.
+        //
+        // Do not clamp this proof to the old target-derived `sane_offered`.
+        // That estimate can itself be stale-low (the startup bug this path
+        // repairs). Both trackers cover the same complete interval, so offered
+        // traffic is the appropriate upper bound for ACK-confirmed delivery.
+        let proven_delivered = delivered_bps.min(offered_bps);
 
-        // First non-bootstrap tick: seed the target from observed throughput
-        // (or a conservative floor if no traffic yet).
-        if self.target_bps == MIN_TARGET_BPS {
-            let seed = sane_observed.max(INITIAL_TARGET_BPS);
+        // First measured tick: seed from the larger of the outlier-bounded
+        // offered rate and ACK-confirmed delivery. In the common case the
+        // latter immediately lifts the target to the rate the link is already
+        // demonstrably sustaining instead of climbing there from 1 Mbps.
+        if self.state == CcState::Bootstrap && self.target_bps == MIN_TARGET_BPS {
+            let seed = sane_offered.max(proven_delivered).max(INITIAL_TARGET_BPS);
             self.target_bps = seed.clamp(MIN_TARGET_BPS, MAX_TARGET_BPS);
+        }
+
+        // Reconcile any stale-low estimate with fresh ACK evidence before
+        // classifying load or applying a decrease. `target_bps` steers traffic;
+        // it is not a pacer, so a target below demonstrated delivery cannot
+        // correct itself without this floor. The one deliberate exception is
+        // an armed-off Drain episode: Drain is explicitly allowed to request a
+        // single 25% step below current delivery, and lifting that step again
+        // on every inflated-RTT tick would make Drain inert.
+        if self.drain_armed {
+            self.target_bps = self
+                .target_bps
+                .max(proven_delivered)
+                .clamp(MIN_TARGET_BPS, MAX_TARGET_BPS);
         }
 
         // Is this loss ours? Two independent things have to hold.
@@ -629,7 +708,7 @@ impl LinkCongestionState {
         // the bottleneck at all — see `BACKOFF_MIN_LOAD_PERMILLE`. A
         // starved link's NAKs are wire loss, and cutting its cap in
         // response is how a usable link gets ratcheted into oblivion.
-        let loaded = (sane_observed as u128) * 1_000
+        let loaded = (sane_offered as u128) * 1_000
             >= (self.target_bps as u128) * (BACKOFF_MIN_LOAD_PERMILLE as u128);
 
         // Second, backing off has to actually be *working*. This is the
@@ -645,7 +724,7 @@ impl LinkCongestionState {
         let prev_state = self.state;
         let next_state = if loss_high && loaded && !self.loss_uncongestive {
             CcState::BackingOff
-        } else if rtt_inflation >= DRAIN_RTT_INFLATION {
+        } else if drain_signal {
             // BDQ overload before loss surfaces — drain hard.
             CcState::Drain
         } else if rtt_inflation > RTT_HOLD_FACTOR {
@@ -693,8 +772,8 @@ impl LinkCongestionState {
                 // ramp on idle links. Same cap applies regardless of
                 // step size. Uses the outlier-clamped sample so a burst
                 // can't open a huge headroom for the AI to climb into.
-                let measured_cap = (sane_observed as f64) * 2.0;
-                if sane_observed > 0 {
+                let measured_cap = (sane_offered as f64) * 2.0;
+                if sane_offered > 0 {
                     prev.max(MIN_TARGET_BPS as f64) + step.min(measured_cap - prev).max(0.0)
                 } else {
                     // No measured traffic this tick: hold the target instead of
@@ -734,7 +813,7 @@ impl LinkCongestionState {
                 // Clamped to `prev` so a backoff can never raise the cap
                 // when the link is already delivering above it.
                 let decreased = (prev * BACKOFF_PERMILLE as f64) / 1000.0;
-                let delivered_floor = (sane_observed as f64).min(prev);
+                let delivered_floor = (proven_delivered as f64).min(prev);
                 decreased.max(delivered_floor)
             }
             CcState::Drain => {
@@ -745,8 +824,15 @@ impl LinkCongestionState {
                 // target_bps to the floor within ~11 ticks and producing
                 // saw-tooth oscillation under sustained RTT inflation. Leaving
                 // and re-entering Drain applies a fresh cut.
-                if prev_state != CcState::Drain {
-                    (prev * DRAIN_PERMILLE as f64) / 1000.0
+                if prev_state != CcState::Drain && self.drain_armed {
+                    self.drain_armed = false;
+                    let decreased = (prev * DRAIN_PERMILLE as f64) / 1000.0;
+                    // A Drain is allowed to ask for one step below the proven
+                    // rate, but threshold jitter must not compound the target
+                    // beneath that step while ACKs keep proving delivery.
+                    let delivered_guard =
+                        (proven_delivered as f64 * DRAIN_PERMILLE as f64) / 1000.0;
+                    decreased.max(delivered_guard.min(prev))
                 } else {
                     prev
                 }
@@ -890,8 +976,10 @@ impl LinkCcController {
                 conn.total_nak_count(),
                 now_ms,
             );
-            let observed_bps = conn.bitrate.current_bitrate_bps.max(0.0) as u64;
-            entry.tick(observed_bps, now_ms);
+            let offered_bps = conn.bitrate.current_bitrate_bps.max(0.0) as u64;
+            let delivered_bps = conn.current_delivered_bps();
+            let rate_sample_ready = conn.offered_rate_ready() && conn.delivered_rate_ready();
+            entry.tick_with_delivery_sample(offered_bps, delivered_bps, rate_sample_ready, now_ms);
             alive.insert(conn.conn_id, entry.snapshot());
         }
         // Garbage-collect entries for connections that disappeared.
@@ -910,6 +998,51 @@ mod tests {
         cc.tick(0, 0);
         assert_eq!(cc.state, CcState::Bootstrap);
         assert_eq!(cc.target_bps, MIN_TARGET_BPS);
+    }
+
+    #[test]
+    fn complete_rate_sample_is_required_before_seeding() {
+        let mut cc = LinkCongestionState::default();
+        cc.record_rtt(50.0, 1_000);
+
+        // RTT is available well before the two rate trackers publish their
+        // first complete windows. Neither an unready sample nor a window with
+        // no ACK-confirmed delivery may publish the 1 Mbps placeholder.
+        cc.tick_with_delivery_sample(10_000_000, 9_500_000, false, 1_000);
+        assert_eq!(cc.state, CcState::Bootstrap);
+        assert_eq!(cc.target_bps, MIN_TARGET_BPS);
+        cc.tick_with_delivery_sample(10_000_000, 0, true, 1_500);
+        assert_eq!(cc.state, CcState::Bootstrap);
+        assert_eq!(cc.target_bps, MIN_TARGET_BPS);
+
+        cc.tick_with_delivery_sample(10_000_000, 9_500_000, true, 2_000);
+        assert_eq!(cc.state, CcState::Climbing);
+        assert!(
+            cc.target_bps >= 9_500_000,
+            "measured bootstrap stayed below proven delivery: {}",
+            cc.target_bps
+        );
+    }
+
+    #[test]
+    fn fresh_delivery_repairs_a_stale_low_target() {
+        let mut cc = LinkCongestionState {
+            state: CcState::Climbing,
+            target_bps: 1_250_000,
+            rtt_ewma_ms: 50.0,
+            rtt_min_ms: 50.0,
+            rtt_min_stamp_ms: 1,
+            ..Default::default()
+        };
+
+        cc.tick_with_delivery_sample(10_000_000, 9_000_000, true, 1_000);
+
+        assert_eq!(cc.state, CcState::Climbing);
+        assert!(
+            cc.target_bps >= 9_000_000,
+            "target {} ignored ACK-confirmed delivery",
+            cc.target_bps
+        );
     }
 
     #[test]
@@ -1316,6 +1449,62 @@ mod tests {
     }
 
     #[test]
+    fn low_latency_ratio_without_queue_depth_does_not_drain() {
+        let mut cc = LinkCongestionState {
+            state: CcState::Climbing,
+            target_bps: 4_000_000,
+            rtt_min_ms: 6.0,
+            rtt_min_stamp_ms: 1,
+            rtt_ewma_ms: 13.0,
+            ..Default::default()
+        };
+
+        cc.tick_with_delivery(4_000_000, 4_000_000, 1_000);
+
+        assert_eq!(cc.state, CcState::Holding);
+        assert_eq!(cc.target_bps, 4_000_000);
+    }
+
+    #[test]
+    fn drain_jitter_cannot_ratchet_below_acknowledged_guard() {
+        let mut cc = LinkCongestionState {
+            state: CcState::Climbing,
+            target_bps: 4_000_000,
+            rtt_min_ms: 20.0,
+            rtt_min_stamp_ms: 1,
+            rtt_ewma_ms: 50.0,
+            ..Default::default()
+        };
+
+        // The first genuine Drain may request one 25% step below proven
+        // delivery.
+        cc.tick_with_delivery(4_000_000, 4_000_000, 1_000);
+        assert_eq!(cc.state, CcState::Drain);
+        assert_eq!(cc.target_bps, 3_000_000);
+
+        // Merely crossing back and forth around 2x does not re-arm the cut.
+        cc.rtt_ewma_ms = 39.0;
+        cc.tick_with_delivery(4_000_000, 4_000_000, 2_000);
+        assert_eq!(cc.state, CcState::Holding);
+        cc.rtt_ewma_ms = 41.0;
+        cc.tick_with_delivery(4_000_000, 4_000_000, 3_000);
+        assert_eq!(cc.state, CcState::Drain);
+        assert_eq!(cc.target_bps, 3_000_000);
+
+        // A real recovery re-arms Drain and lets fresh ACK evidence recover the
+        // target. A subsequent cut still cannot compound beneath one step of
+        // delivered rate.
+        cc.rtt_ewma_ms = 29.0;
+        cc.tick_with_delivery(4_000_000, 4_000_000, 4_000);
+        assert_eq!(cc.state, CcState::Climbing);
+        cc.rtt_ewma_ms = 41.0;
+        cc.tick_with_delivery(4_000_000, 4_000_000, 5_000);
+        assert_eq!(cc.state, CcState::Drain);
+        assert!(cc.target_bps >= 3_000_000);
+        assert!(cc.target_bps < 4_000_000);
+    }
+
+    #[test]
     fn drain_then_recovery_path() {
         let mut cc = LinkCongestionState::default();
         cc.record_rtt(20.0, 0);
@@ -1375,10 +1564,10 @@ mod tests {
     fn outlier_burst_at_seed_is_clamped() {
         let mut cc = LinkCongestionState::default();
         cc.record_rtt(50.0, 0);
-        // First non-bootstrap tick sees a 50 Mbps stall-release burst.
-        // The seed must be bounded to a few times the initial estimate,
-        // not pinned to the burst.
-        cc.tick(50_000_000, 0);
+        // The offered tracker sees a 50 Mbps stall-release burst, while ACKs
+        // confirm only 3 Mbps. The seed must be bounded to a few times the
+        // initial estimate, not pinned to the unconfirmed burst.
+        cc.tick_with_delivery(50_000_000, 3_000_000, 0);
         assert!(
             cc.target_bps <= 5 * INITIAL_TARGET_BPS,
             "seed inflated to {} from a burst",
@@ -1401,7 +1590,7 @@ mod tests {
         // clamped to 4x the running estimate, so the target can't leap to
         // the burst rate in one tick.
         cc.record_rtt(50.0, 900);
-        cc.tick(50_000_000, 900);
+        cc.tick_with_delivery(50_000_000, 2_000_000, 900);
         assert!(
             cc.target_bps <= before.saturating_mul(4).max(INITIAL_TARGET_BPS),
             "one burst tick inflated target to {} from {}",

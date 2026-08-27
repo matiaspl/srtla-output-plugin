@@ -62,6 +62,7 @@ fn build_connection(local_ip: IpAddr, label: String) -> SrtlaConnection {
         rtt: RttTracker::default(),
         congestion: CongestionControl::default(),
         bitrate: BitrateTracker::new(now_ms()),
+        delivered_bitrate: BitrateTracker::new(now_ms()),
         reconnection: ReconnectionState {
             connection_established_ms: now_ms(),
             startup_grace_deadline_ms: now_ms(),

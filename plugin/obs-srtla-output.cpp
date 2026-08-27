@@ -51,6 +51,7 @@ struct SrtlaOutput {
 	std::thread worker;
 	std::atomic_bool abr_stop{false};
 	std::thread abr_worker;
+	std::mutex bitrate_mutex;
 	std::atomic_bool needs_muxer_reset{false};
 	std::atomic_bool capture_active{false};
 	std::atomic_bool fatal_signal_queued{false};
@@ -66,10 +67,10 @@ struct SrtlaOutput {
 	int pbkeylen = 16;
 	bool hevc = false;
 	bool opus = false;
-	bool auto_bitrate = true;
+	std::atomic_bool auto_bitrate{true};
 	bool shared_encoder = false;
 	std::string encoder_source = "streaming";
-	int manual_bitrate_kbps = 1500;
+	std::atomic<int> manual_bitrate_kbps{1500};
 	int min_bitrate_kbps = 500;
 	int max_bitrate_kbps = 100000;
 	int start_bitrate_kbps = 1500;
@@ -245,7 +246,8 @@ static SrtlaEngineHandle *create_engine_from_settings(obs_data_t *settings)
 	const auto pbkeylen = settings ? obs_data_get_int(settings, "pbkeylen") : 16;
 	const char *scheduler = settings ? obs_data_get_string(settings, "scheduler") : nullptr;
 	const auto min_bitrate = settings ? obs_data_get_int(settings, "min_bitrate") : 500;
-	const auto start_bitrate = settings ? obs_data_get_int(settings, "bitrate") : 1500;
+	const auto start_bitrate = settings && obs_data_has_user_value(settings, "start_bitrate") ?
+		obs_data_get_int(settings, "start_bitrate") : settings ? obs_data_get_int(settings, "bitrate") : 1500;
 	const auto max_bitrate = settings ? obs_data_get_int(settings, "max_bitrate") : 100000;
 	const auto safety_margin = settings ? obs_data_get_double(settings, "safety_margin") : 0.80;
 	const auto audio_bitrate = settings ? obs_data_get_int(settings, "audio_bitrate") : 128;
@@ -292,15 +294,16 @@ static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 		std::string(obs_data_get_string(settings, "video_codec")) == "hevc";
 	data->opus = settings && obs_data_get_string(settings, "audio_codec") &&
 		std::string(obs_data_get_string(settings, "audio_codec")) == "opus";
-	data->auto_bitrate = !settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate");
+	data->auto_bitrate.store(!settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate"));
 	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
 	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
 	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
 	data->encoder_source = encoder_source && *encoder_source ? encoder_source : "streaming";
-	data->manual_bitrate_kbps = settings && obs_data_has_user_value(settings, "bitrate") ? static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500;
+	data->manual_bitrate_kbps.store(settings && obs_data_has_user_value(settings, "bitrate") ? static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500);
 	data->min_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "min_bitrate")) : 500;
 	data->max_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "max_bitrate")) : 100000;
-	data->start_bitrate_kbps = data->manual_bitrate_kbps;
+	data->start_bitrate_kbps = settings && obs_data_has_user_value(settings, "start_bitrate") ?
+		static_cast<int>(obs_data_get_int(settings, "start_bitrate")) : data->manual_bitrate_kbps.load();
 	data->safety_margin = settings ? obs_data_get_double(settings, "safety_margin") : 0.80;
 	data->audio_bitrate_bps = settings ? static_cast<std::uint64_t>(std::max<std::int64_t>(0, obs_data_get_int(settings, "audio_bitrate"))) * 1000ULL : 128000ULL;
 	const auto endpoint = parse_endpoint(settings ? obs_data_get_string(settings, "url") : nullptr);
@@ -354,15 +357,16 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	const char *audio_codec = settings ? obs_data_get_string(settings, "audio_codec") : nullptr;
 	data->hevc = video_codec && std::string(video_codec) == "hevc";
 	data->opus = audio_codec && std::string(audio_codec) == "opus";
-	data->auto_bitrate = !settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate");
+	data->auto_bitrate.store(!settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate"));
 	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
 	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
 	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
 	data->encoder_source = encoder_source && *encoder_source ? encoder_source : "streaming";
-	data->manual_bitrate_kbps = settings && obs_data_has_user_value(settings, "bitrate") ? static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500;
+	data->manual_bitrate_kbps.store(settings && obs_data_has_user_value(settings, "bitrate") ? static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500);
 	data->min_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "min_bitrate")) : 500;
 	data->max_bitrate_kbps = settings ? static_cast<int>(obs_data_get_int(settings, "max_bitrate")) : 100000;
-	data->start_bitrate_kbps = data->manual_bitrate_kbps;
+	data->start_bitrate_kbps = settings && obs_data_has_user_value(settings, "start_bitrate") ?
+		static_cast<int>(obs_data_get_int(settings, "start_bitrate")) : data->manual_bitrate_kbps.load();
 	data->safety_margin = settings ? obs_data_get_double(settings, "safety_margin") : 0.80;
 	data->audio_bitrate_bps = settings ? static_cast<std::uint64_t>(std::max<std::int64_t>(0, obs_data_get_int(settings, "audio_bitrate"))) * 1000ULL : 128000ULL;
 	const auto endpoint = parse_endpoint(settings ? obs_data_get_string(settings, "url") : nullptr);
@@ -384,7 +388,10 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 
 static void restore_shared_bitrate(SrtlaOutput *data)
 {
-	if (!data->bitrate_overridden || !data->output)
+	if (!data->output)
+		return;
+	std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
+	if (!data->bitrate_overridden)
 		return;
 	if (auto *encoder = obs_output_get_video_encoder(data->output)) {
 		if (auto *settings = obs_encoder_get_settings(encoder)) {
@@ -400,12 +407,13 @@ static void apply_manual_bitrate(SrtlaOutput *data)
 {
 	if (!data->output)
 		return;
+	std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
 	if (auto *encoder = obs_output_get_video_encoder(data->output)) {
 		if (auto *settings = obs_encoder_get_settings(encoder)) {
 			if (!data->bitrate_overridden)
 				data->original_bitrate_kbps = static_cast<int>(obs_data_get_int(settings, "bitrate"));
-			if (!data->auto_bitrate) {
-				obs_data_set_int(settings, "bitrate", data->manual_bitrate_kbps);
+			if (!data->auto_bitrate.load()) {
+				obs_data_set_int(settings, "bitrate", data->manual_bitrate_kbps.load());
 				obs_encoder_update(encoder, settings);
 			}
 			obs_data_release(settings);
@@ -452,8 +460,26 @@ static void start_abr_worker(SrtlaOutput *data)
 			}
 			const auto now = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 				std::chrono::system_clock::now().time_since_epoch()).count());
+			SrtlaSrtStatsV1 srt_stats{};
+			if (data->session && data->session->sample_stats(now, srt_stats))
+				(void)srtla_engine_update_srt_stats(data->engine, &srt_stats);
 			const auto applied_bps = srtla_engine_apply_abr(data->engine, now);
-			if (!data->auto_bitrate || applied_bps == 0 || !data->output)
+			if (!data->auto_bitrate.load()) {
+				std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
+				if (data->auto_bitrate.load())
+					continue;
+				// Keep calculating the capacity recommendation for diagnostics,
+				// but report the bitrate the manual encoder is actually using.
+				// apply_abr updates the engine's current-video field even when the
+				// OBS encoder update below is intentionally bypassed.
+				(void)srtla_engine_set_video_bitrate(data->engine,
+					static_cast<std::uint64_t>(std::max(1, data->manual_bitrate_kbps.load())) * 1000ULL);
+				continue;
+			}
+			if (applied_bps == 0 || !data->output)
+				continue;
+			std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
+			if (!data->auto_bitrate.load())
 				continue;
 			if (auto *encoder = obs_output_get_video_encoder(data->output)) {
 				if (!(obs_encoder_get_caps(encoder) & OBS_ENCODER_CAP_DYN_BITRATE))
@@ -467,6 +493,7 @@ static void start_abr_worker(SrtlaOutput *data)
 					obs_data_release(settings);
 				}
 			}
+			(void)srtla_engine_set_video_bitrate(data->engine, applied_bps);
 		}
 	});
 }
@@ -651,6 +678,92 @@ extern "C" int srtla_output_set_link_enabled(obs_output_t *output, std::uint64_t
 	return srtla_engine_set_link_enabled(it->second->engine, link_id, enabled);
 }
 
+extern "C" int srtla_output_set_bitrate_control(obs_output_t *output, bool automatic,
+	                                             int manual_bitrate_kbps)
+{
+	std::lock_guard<std::mutex> registry_lock(output_registry_mutex);
+	const auto it = output_registry.find(output);
+	if (it == output_registry.end() || !it->second->engine)
+		return -1;
+
+	auto *data = it->second;
+	std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
+	const int minimum = std::max(1, data->min_bitrate_kbps);
+	const int maximum = std::max(minimum, data->max_bitrate_kbps);
+	const int manual = std::clamp(manual_bitrate_kbps, minimum, maximum);
+	auto *encoder = data->output ? obs_output_get_video_encoder(data->output) : nullptr;
+	if (data->running.load() &&
+	    (!encoder || !(obs_encoder_get_caps(encoder) & OBS_ENCODER_CAP_DYN_BITRATE)))
+		return -2;
+
+	int active_bitrate_kbps = manual;
+	if (encoder) {
+		auto *settings = obs_encoder_get_settings(encoder);
+		if (!settings)
+			return -3;
+		if (automatic) {
+			active_bitrate_kbps = static_cast<int>(obs_data_get_int(settings, "bitrate"));
+		} else if (obs_data_get_int(settings, "bitrate") != manual) {
+			obs_data_set_int(settings, "bitrate", manual);
+			obs_encoder_update(encoder, settings);
+		}
+		obs_data_release(settings);
+	}
+
+	data->manual_bitrate_kbps.store(manual);
+	data->auto_bitrate.store(automatic);
+	return srtla_engine_set_video_bitrate(
+		data->engine, static_cast<std::uint64_t>(std::max(1, active_bitrate_kbps)) * 1000ULL);
+}
+
+extern "C" int srtla_output_set_max_bitrate(obs_output_t *output, int max_bitrate_kbps)
+{
+	std::lock_guard<std::mutex> registry_lock(output_registry_mutex);
+	const auto it = output_registry.find(output);
+	if (it == output_registry.end() || !it->second->engine)
+		return -1;
+
+	auto *data = it->second;
+	std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
+	const int maximum = std::max(std::max(1, data->min_bitrate_kbps), max_bitrate_kbps);
+	const bool apply_to_encoder = data->running.load() && data->auto_bitrate.load();
+	auto *encoder = data->output ? obs_output_get_video_encoder(data->output) : nullptr;
+	obs_data_t *encoder_settings = nullptr;
+	int active_bitrate_kbps = maximum;
+
+	if (apply_to_encoder) {
+		if (!encoder || !(obs_encoder_get_caps(encoder) & OBS_ENCODER_CAP_DYN_BITRATE))
+			return -2;
+		encoder_settings = obs_encoder_get_settings(encoder);
+		if (!encoder_settings)
+			return -3;
+		active_bitrate_kbps = static_cast<int>(obs_data_get_int(encoder_settings, "bitrate"));
+		if (active_bitrate_kbps <= 0)
+			active_bitrate_kbps = maximum;
+	}
+
+	const int result = srtla_engine_set_max_video_bitrate(
+		data->engine, static_cast<std::uint64_t>(maximum) * 1000ULL);
+	if (result != 0) {
+		if (encoder_settings)
+			obs_data_release(encoder_settings);
+		return result;
+	}
+	data->max_bitrate_kbps = maximum;
+
+	if (encoder_settings) {
+		active_bitrate_kbps = std::min(active_bitrate_kbps, maximum);
+		if (obs_data_get_int(encoder_settings, "bitrate") != active_bitrate_kbps) {
+			obs_data_set_int(encoder_settings, "bitrate", active_bitrate_kbps);
+			obs_encoder_update(encoder, encoder_settings);
+		}
+		obs_data_release(encoder_settings);
+		return srtla_engine_set_video_bitrate(
+			data->engine, static_cast<std::uint64_t>(active_bitrate_kbps) * 1000ULL);
+	}
+	return 0;
+}
+
 extern "C" int srtla_output_update_adapters(obs_output_t *output)
 {
 	std::lock_guard<std::mutex> lock(output_registry_mutex);
@@ -747,17 +860,30 @@ static bool srtla_output_start(void *opaque)
 		srtla_engine_stop(data->engine);
 		return false;
 	}
-	if (data->auto_bitrate) {
+	if (data->auto_bitrate.load()) {
 		if (auto *encoder = obs_output_get_video_encoder(data->output);
-			encoder && !(obs_encoder_get_caps(encoder) & OBS_ENCODER_CAP_DYN_BITRATE)) {
+		    encoder && !(obs_encoder_get_caps(encoder) & OBS_ENCODER_CAP_DYN_BITRATE)) {
 			// Hardware encoders without dynamic-bitrate support stay usable in
 			// fixed mode; the dock still shows the recommendation as telemetry.
-			data->auto_bitrate = false;
+			data->auto_bitrate.store(false);
 		}
 	}
 	apply_manual_bitrate(data);
-	if (!data->auto_bitrate &&
-	    srtla_engine_set_video_bitrate(data->engine, static_cast<std::uint64_t>(std::max(1, data->manual_bitrate_kbps)) * 1000ULL) != 0) {
+	int active_bitrate_kbps = data->auto_bitrate.load() ?
+		data->start_bitrate_kbps : data->manual_bitrate_kbps.load();
+	if (data->auto_bitrate.load()) {
+		std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
+		if (auto *encoder = obs_output_get_video_encoder(data->output)) {
+			if (auto *encoder_settings = obs_encoder_get_settings(encoder)) {
+				const auto encoder_bitrate = obs_data_get_int(encoder_settings, "bitrate");
+				if (encoder_bitrate > 0)
+					active_bitrate_kbps = static_cast<int>(encoder_bitrate);
+				obs_data_release(encoder_settings);
+			}
+		}
+	}
+	if (srtla_engine_set_video_bitrate(
+		data->engine, static_cast<std::uint64_t>(std::max(1, active_bitrate_kbps)) * 1000ULL) != 0) {
 		obs_output_set_last_error(data->output, "SRTLA video bitrate initialization failed");
 		data->session->stop();
 		data->session.reset();

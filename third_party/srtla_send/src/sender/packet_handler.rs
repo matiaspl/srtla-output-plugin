@@ -53,7 +53,7 @@ pub async fn process_connection_events(
     connections: &mut [SrtlaConnection],
     last_client_addr: Option<SocketAddr>,
     instant_forwarder: &InstantForwarder,
-    seq_tracker: &SequenceTracker,
+    seq_tracker: &mut SequenceTracker,
     classic: bool,
     incoming: SrtlaIncoming,
 ) -> Result<()> {
@@ -88,6 +88,14 @@ pub async fn process_connection_events(
     }
 
     for srtla_ack in incoming.srtla_ack_numbers.iter() {
+        let delivery =
+            seq_tracker.acknowledge_delivery(*srtla_ack, connections[idx].conn_id, current_time_ms);
+        if let Some(credit) = delivery
+            && credit.newly_credited
+        {
+            connections[idx].record_delivered_bytes(u64::from(credit.wire_bytes));
+        }
+
         // Match the arrival link's packet log FIRST. The receiver sends an
         // SRTLA ACK back on the link that delivered the packet, and with
         // duplicate probing the same sequence can sit in two links' logs (the
@@ -96,8 +104,21 @@ pub async fn process_connection_events(
         // its rejoin dwell. The fallback scan is kept for ACKs whose owner
         // can't be resolved from the arrival link (e.g. after a reconnect
         // cleared its log).
-        let found_on_arrival =
+        let found_in_packet_log =
             connections[idx].handle_srtla_ack_specific(*srtla_ack as i32, classic, current_time_ms);
+        // A cumulative SRT ACK may have pruned the per-link packet log before
+        // this exact-link SRTLA ACK returned. The sweep-proof sequence ring is
+        // still authoritative delivery evidence; preserve the proof/RTT sample
+        // and do not let the fallback scan stamp it onto a probe on another
+        // link.
+        if !found_in_packet_log
+            && let Some(credit) = delivery
+            && credit.newly_credited
+        {
+            connections[idx]
+                .record_sweep_pruned_delivery_proof(credit.timestamp_ms, current_time_ms);
+        }
+        let found_on_arrival = found_in_packet_log || delivery.is_some();
         if !found_on_arrival {
             for (i, c) in connections.iter_mut().enumerate() {
                 if i == idx {
@@ -134,7 +155,7 @@ pub async fn handle_uplink_packet(
     reg: &mut SrtlaRegistrationManager,
     instant_tx: &InstantForwarder,
     last_client_addr: Option<SocketAddr>,
-    seq_tracker: &SequenceTracker,
+    seq_tracker: &mut SequenceTracker,
     config_snap: &ConfigSnapshot,
     config: &DynamicConfig,
 ) {
@@ -209,7 +230,7 @@ pub async fn drain_packet_queue(
     reg: &mut SrtlaRegistrationManager,
     instant_tx: &InstantForwarder,
     last_client_addr: Option<SocketAddr>,
-    seq_tracker: &SequenceTracker,
+    seq_tracker: &mut SequenceTracker,
     config_snap: &ConfigSnapshot,
     config: &DynamicConfig,
 ) {
@@ -466,7 +487,7 @@ pub async fn forward_via_connection(
     // O(1) insert into ring buffer - no allocation
     // Track immediately when queued (not when flushed) for accurate NAK attribution
     if let Some(s) = seq {
-        seq_tracker.insert(s, conn_id, packet_time_ms);
+        seq_tracker.insert_with_size(s, conn_id, packet_time_ms, pkt.len());
     }
 
     // Flush if batch threshold reached

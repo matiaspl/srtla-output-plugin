@@ -3,6 +3,7 @@ add_library(obs-srtla-output MODULE
   obs-srtla-output.cpp
   obs-srtla-dock.cpp
   obs-srtla-dock.hpp
+  stats-json.hpp
   output-capture-lifecycle.hpp
   mpegts-avformat-sink.cpp
   mpegts-avformat-sink.hpp

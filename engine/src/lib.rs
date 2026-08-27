@@ -15,7 +15,7 @@ use srtla_send::embedded::{
     EmbeddedLink, EmbeddedSender, EmbeddedSenderConfig, EmbeddedSubmitError,
 };
 
-pub use abr::{AbrConfig, AbrController, AbrDecision, AbrSample, LinkCapacity};
+pub use abr::{AbrConfig, AbrController, AbrDecision, AbrSample, LinkCapacity, SrtCapacity};
 
 const ENGINE_INPUT_CAPACITY: usize = 1024;
 const ENGINE_OUTPUT_CAPACITY: usize = 256;
@@ -26,6 +26,7 @@ const SESSION_CONNECTED: u32 = 2;
 const SESSION_RECONNECTING: u32 = 3;
 const SESSION_FATAL: u32 = 4;
 const SESSION_STOPPED: u32 = 5;
+const SRT_STATS_MAX_AGE_MS: u64 = 2_500;
 
 thread_local! {
     // The ABI returns a pointer for historical compatibility.  Keep the
@@ -86,6 +87,8 @@ struct EngineLinkConfig {
     #[serde(default)]
     used_bps: u64,
     #[serde(default)]
+    delivered_bps: u64,
+    #[serde(default)]
     state: String,
     #[serde(default)]
     cc_state: String,
@@ -114,6 +117,7 @@ struct LinkSnapshot {
     loss_permille: u32,
     nak_count: u64,
     used_bps: u64,
+    delivered_bps: u64,
     cc_state: String,
     stall_gate_events: u64,
     exclusion_reason: String,
@@ -128,6 +132,18 @@ struct EngineSnapshot {
     error: String,
     queue_in: usize,
     queue_out: usize,
+    link_capacity_bps: u64,
+    srt_bandwidth_bps: u64,
+    srt_capacity_bps: u64,
+    srt_send_rate_bps: u64,
+    srt_send_buffer_ms: u32,
+    srt_packets_in_flight: u32,
+    srt_sender_loss_packets: u32,
+    srt_retransmit_permille: u32,
+    srt_dropped_bytes: u64,
+    srt_stats_ready: bool,
+    srt_limited: bool,
+    transport_stressed: bool,
     estimated_capacity_bps: u64,
     recommended_video_bps: u64,
     current_video_bps: u64,
@@ -168,6 +184,8 @@ struct RunnerLinkStats {
     #[serde(default)]
     bitrate_bytes_per_sec: u32,
     #[serde(default)]
+    delivered_bps: u64,
+    #[serde(default)]
     cc_state: String,
     #[serde(default)]
     stall_gated: bool,
@@ -181,6 +199,47 @@ struct RunnerLinkStats {
     cc_loss_permille: u32,
     #[serde(default)]
     nak_count: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SrtlaSrtStatsV1 {
+    pub struct_size: u32,
+    pub reserved: u32,
+    pub sampled_at_ms: u64,
+    pub bandwidth_bps: u64,
+    pub send_rate_bps: u64,
+    pub sent_unique_bytes: u64,
+    pub retransmitted_bytes: u64,
+    pub dropped_bytes: u64,
+    pub send_buffer_ms: u32,
+    pub packets_in_flight: u32,
+    pub sender_loss_packets: u32,
+    pub reserved2: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SrtTransportStats {
+    sampled_at_ms: u64,
+    bandwidth_bps: u64,
+    send_rate_bps: u64,
+    sent_unique_bytes: u64,
+    retransmitted_bytes: u64,
+    dropped_bytes: u64,
+    send_buffer_ms: u32,
+    packets_in_flight: u32,
+    sender_loss_packets: u32,
+}
+
+impl SrtTransportStats {
+    fn retransmit_permille(&self) -> u32 {
+        if self.retransmitted_bytes == 0 {
+            return 0;
+        }
+        let ratio = u128::from(self.retransmitted_bytes) * 1_000
+            / u128::from(self.sent_unique_bytes.max(1));
+        ratio.min(1_000) as u32
+    }
 }
 
 struct DatagramQueue {
@@ -274,6 +333,8 @@ struct Engine {
     last_error: CString,
     session_state: u32,
     session_error: String,
+    srt_stats: SrtTransportStats,
+    last_abr_decision: AbrDecision,
     runner: Option<EmbeddedSender>,
 }
 
@@ -327,6 +388,7 @@ impl Engine {
                 link.loss_permille = update.cc_loss_permille;
                 link.nak_count = update.nak_count.max(0) as u64;
                 link.used_bps = u64::from(update.bitrate_bytes_per_sec) * 8;
+                link.delivered_bps = update.delivered_bps;
                 link.state = if !link.enabled {
                     "Standby".to_string()
                 } else if !link.connected {
@@ -380,6 +442,45 @@ impl Engine {
             .links
             .iter()
             .any(|l| l.enabled && l.connected && l.payload_eligible);
+        let link_capacity_bps = self
+            .config
+            .links
+            .iter()
+            .filter(|l| l.enabled && l.payload_eligible && l.capacity_ready)
+            .map(|l| l.target_bps)
+            .sum();
+        let decision_current = self.last_abr_decision.recommended_bps > 0
+            && self.last_abr_decision.link_capacity_bps == link_capacity_bps;
+        let estimated_capacity_bps = if decision_current {
+            self.last_abr_decision.estimated_capacity_bps
+        } else {
+            link_capacity_bps
+        };
+        let recommended_video_bps = if decision_current {
+            self.last_abr_decision.recommended_bps
+        } else {
+            let ready = self
+                .config
+                .links
+                .iter()
+                .any(|l| l.enabled && l.payload_eligible && l.capacity_ready);
+            let any_connected = self.config.links.iter().any(|l| l.enabled && l.connected);
+            if !any_connected {
+                self.abr.config().min_bps
+            } else if !ready {
+                self.abr
+                    .config()
+                    .start_bps
+                    .saturating_sub(self.audio_bps)
+                    .clamp(self.abr.config().min_bps, self.abr.config().max_bps)
+            } else {
+                let budget =
+                    ((estimated_capacity_bps as f64) * self.abr.config().safety_margin) as u64;
+                budget
+                    .saturating_sub(self.audio_bps)
+                    .clamp(self.abr.config().min_bps, self.abr.config().max_bps)
+            }
+        };
         EngineSnapshot {
             receiver_host: self.config.receiver_host.clone(),
             receiver_port: self.config.receiver_port,
@@ -410,42 +511,24 @@ impl Engine {
             },
             queue_in: self.input.len(),
             queue_out: self.output.len(),
-            estimated_capacity_bps: self
-                .config
-                .links
-                .iter()
-                .filter(|l| l.enabled && l.payload_eligible && l.capacity_ready)
-                .map(|l| l.target_bps)
-                .sum(),
-            recommended_video_bps: {
-                let ready = self
-                    .config
-                    .links
-                    .iter()
-                    .any(|l| l.enabled && l.payload_eligible && l.capacity_ready);
-                let any_connected = self.config.links.iter().any(|l| l.enabled && l.connected);
-                let capacity: u64 = self
-                    .config
-                    .links
-                    .iter()
-                    .filter(|l| l.enabled && l.payload_eligible && l.capacity_ready)
-                    .map(|l| l.target_bps)
-                    .sum();
-                if !any_connected {
-                    self.abr.config().min_bps
-                } else if !ready {
-                    self.abr
-                        .config()
-                        .start_bps
-                        .saturating_sub(self.audio_bps)
-                        .max(self.abr.config().min_bps)
-                } else {
-                    let budget = ((capacity as f64) * self.abr.config().safety_margin) as u64;
-                    budget
-                        .saturating_sub(self.audio_bps)
-                        .clamp(self.abr.config().min_bps, self.abr.config().max_bps)
-                }
+            link_capacity_bps,
+            srt_bandwidth_bps: self.srt_stats.bandwidth_bps,
+            srt_capacity_bps: if decision_current {
+                self.last_abr_decision.srt_capacity_bps
+            } else {
+                0
             },
+            srt_send_rate_bps: self.srt_stats.send_rate_bps,
+            srt_send_buffer_ms: self.srt_stats.send_buffer_ms,
+            srt_packets_in_flight: self.srt_stats.packets_in_flight,
+            srt_sender_loss_packets: self.srt_stats.sender_loss_packets,
+            srt_retransmit_permille: self.srt_stats.retransmit_permille(),
+            srt_dropped_bytes: self.srt_stats.dropped_bytes,
+            srt_stats_ready: decision_current && self.last_abr_decision.srt_capacity_bps > 0,
+            srt_limited: decision_current && self.last_abr_decision.srt_limited,
+            transport_stressed: decision_current && self.last_abr_decision.transport_stressed,
+            estimated_capacity_bps,
+            recommended_video_bps,
             current_video_bps: self.current_video_bps,
             srt_session_state,
             srt_connected,
@@ -473,6 +556,7 @@ impl Engine {
                     loss_permille: l.loss_permille,
                     nak_count: l.nak_count,
                     used_bps: l.used_bps,
+                    delivered_bps: l.delivered_bps,
                     cc_state: l.cc_state.clone(),
                     stall_gate_events: l.stall_gate_events,
                     exclusion_reason: l.exclusion_reason.clone(),
@@ -491,16 +575,18 @@ impl Engine {
                 payload_eligible: link.payload_eligible,
                 capacity_ready: link.capacity_ready,
                 target_bps: link.target_bps,
+                delivered_bps: link.delivered_bps,
             })
             .collect::<Vec<_>>();
         let capacity_ready = links
             .iter()
             .any(|link| link.enabled && link.payload_eligible && link.capacity_ready);
-        let all_links_down = !self
-            .config
-            .links
-            .iter()
-            .any(|link| link.enabled && link.connected);
+        let all_links_down = self.session_state != SESSION_CONNECTED
+            || !self
+                .config
+                .links
+                .iter()
+                .any(|link| link.enabled && link.connected);
         let decision = self.abr.decide(&AbrSample {
             links,
             audio_bps: self.audio_bps,
@@ -508,8 +594,18 @@ impl Engine {
             now_ms,
             capacity_ready,
             all_links_down,
+            srt: SrtCapacity {
+                ready: self.session_state == SESSION_CONNECTED
+                    && now_ms.saturating_sub(self.srt_stats.sampled_at_ms) <= SRT_STATS_MAX_AGE_MS,
+                sampled_at_ms: self.srt_stats.sampled_at_ms,
+                bandwidth_bps: self.srt_stats.bandwidth_bps,
+                send_buffer_ms: self.srt_stats.send_buffer_ms,
+                retransmit_permille: self.srt_stats.retransmit_permille(),
+                dropped_bytes: self.srt_stats.dropped_bytes,
+            },
         });
         self.current_video_bps = decision.applied_bps;
+        self.last_abr_decision = decision.clone();
         decision
     }
 }
@@ -569,6 +665,8 @@ pub extern "C" fn srtla_engine_create_v1(config_json: *const c_char) -> *mut Srt
         last_error: CString::new("").expect("empty CString"),
         session_state: SESSION_IDLE,
         session_error: String::new(),
+        srt_stats: SrtTransportStats::default(),
+        last_abr_decision: AbrDecision::default(),
         runner: None,
     });
     Box::into_raw(Box::new(SrtlaEngineHandle {
@@ -585,6 +683,9 @@ pub extern "C" fn srtla_engine_start(handle: *mut SrtlaEngineHandle) -> i32 {
             engine.last_error = CString::new("").expect("empty CString");
             engine.session_state = SESSION_IDLE;
             engine.session_error.clear();
+            engine.srt_stats = SrtTransportStats::default();
+            engine.last_abr_decision = AbrDecision::default();
+            engine.abr.reset();
             if engine.runner.is_none()
                 && engine
                     .config
@@ -608,6 +709,8 @@ pub extern "C" fn srtla_engine_stop(handle: *mut SrtlaEngineHandle) -> i32 {
             engine.running = false;
             engine.session_state = SESSION_STOPPED;
             engine.session_error.clear();
+            engine.srt_stats = SrtTransportStats::default();
+            engine.last_abr_decision = AbrDecision::default();
             engine.input.close();
             engine.output.close();
             if let Some(mut runner) = engine.runner.take() {
@@ -642,38 +745,47 @@ pub extern "C" fn srtla_engine_submit_srt_datagram(
     if data.is_null() || len == 0 {
         return -1;
     }
+    // SAFETY: caller owns a readable buffer of len bytes for this call.
+    let mut packet = Some(unsafe { std::slice::from_raw_parts(data, len) }.to_vec());
+    let submitter = {
+        let Some(mut engine) = with_engine(handle) else {
+            return -1;
+        };
+        if !engine.running {
+            engine.last_error = CString::new("engine is not running").expect("literal CString");
+            return -4;
+        }
+        if let Some(runner) = engine.runner.as_ref() {
+            runner.submitter()
+        } else if engine
+            .input
+            .push(packet.take().expect("packet is available"))
+        {
+            engine.last_error = CString::new("").expect("empty CString");
+            return 0;
+        } else {
+            engine.last_error = CString::new("input queue backpressure").expect("literal CString");
+            return -2;
+        }
+    };
+
+    let result = submitter.submit(packet.take().expect("runner packet is available"));
     let Some(mut engine) = with_engine(handle) else {
         return -1;
     };
-    if !engine.running {
-        engine.last_error = CString::new("engine is not running").expect("literal CString");
-        return -4;
-    }
-    // SAFETY: caller owns a readable buffer of len bytes for this call.
-    let packet = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-    if let Some(runner) = engine.runner.as_ref() {
-        match runner.submit(packet) {
-            Ok(()) => {
-                engine.last_error = CString::new("").expect("empty CString");
-                0
-            }
-            Err(EmbeddedSubmitError::Backpressure) => {
-                engine.last_error =
-                    CString::new("input queue backpressure").expect("literal CString");
-                -2
-            }
-            Err(EmbeddedSubmitError::Stopped) => {
-                engine.last_error =
-                    CString::new("embedded runner stopped").expect("literal CString");
-                -4
-            }
+    match result {
+        Ok(()) => {
+            engine.last_error = CString::new("").expect("empty CString");
+            0
         }
-    } else if engine.input.push(packet) {
-        engine.last_error = CString::new("").expect("empty CString");
-        0
-    } else {
-        engine.last_error = CString::new("input queue backpressure").expect("literal CString");
-        -2
+        Err(EmbeddedSubmitError::Backpressure) => {
+            engine.last_error = CString::new("input queue backpressure").expect("literal CString");
+            -2
+        }
+        Err(EmbeddedSubmitError::Stopped) => {
+            engine.last_error = CString::new("embedded runner stopped").expect("literal CString");
+            -4
+        }
     }
 }
 
@@ -687,28 +799,50 @@ pub extern "C" fn srtla_engine_receive_srt_datagram(
     if data.is_null() || capacity == 0 {
         return -1;
     }
-    let Some(mut engine) = with_engine(handle) else {
-        return -1;
+    let receiver = {
+        let Some(mut engine) = with_engine(handle) else {
+            return -1;
+        };
+        if !engine.running {
+            return 0;
+        }
+        if let Some(runner) = engine.runner.as_ref() {
+            runner.receiver()
+        } else {
+            if let Some(len) = engine.output.front_len()
+                && len > capacity
+            {
+                engine.last_error =
+                    CString::new("receive buffer too small").expect("literal CString");
+                return -3;
+            }
+            let packet = engine.output.pop(timeout_ms);
+            let Some(packet) = packet else {
+                return 0;
+            };
+            if packet.len() > capacity {
+                engine.last_error =
+                    CString::new("receive buffer too small").expect("literal CString");
+                return -3;
+            }
+            // SAFETY: caller provides capacity writable bytes.
+            unsafe {
+                ptr::copy_nonoverlapping(packet.as_ptr(), data, packet.len());
+            }
+            return packet.len() as i32;
+        }
     };
-    if !engine.running {
-        return 0;
-    }
-    if let Some(len) = engine.output.front_len()
-        && len > capacity
-    {
-        engine.last_error = CString::new("receive buffer too small").expect("literal CString");
-        return -3;
-    }
-    let packet = if let Some(runner) = engine.runner.as_ref() {
-        runner.receive(Duration::from_millis(timeout_ms as u64))
-    } else {
-        engine.output.pop(timeout_ms)
-    };
+    // Waiting for SRTLA feedback happens outside the engine state lock.  The
+    // libsrt send thread can therefore submit media while its receive thread is
+    // parked in this callback.
+    let packet = receiver.receive(Duration::from_millis(timeout_ms as u64));
     let Some(packet) = packet else {
         return 0;
     };
     if packet.len() > capacity {
-        engine.last_error = CString::new("receive buffer too small").expect("literal CString");
+        if let Some(mut engine) = with_engine(handle) {
+            engine.last_error = CString::new("receive buffer too small").expect("literal CString");
+        }
         return -3;
     }
     // SAFETY: caller provides capacity writable bytes.
@@ -765,11 +899,13 @@ pub extern "C" fn srtla_engine_set_link_enabled(
             // aggregate bitrate.
             link.capacity_ready = false;
             link.target_bps = 0;
+            link.delivered_bps = 0;
             link.quality_percent = 0;
             link.state = "Warming".to_string();
         }
         if !enabled {
             link.capacity_ready = false;
+            link.delivered_bps = 0;
             link.state = "Standby".to_string();
         }
         link.enabled = enabled;
@@ -885,6 +1021,8 @@ struct LinkStatsUpdate {
     #[serde(default)]
     used_bps: u64,
     #[serde(default)]
+    delivered_bps: u64,
+    #[serde(default)]
     state: String,
 }
 
@@ -915,6 +1053,7 @@ pub extern "C" fn srtla_engine_update_link_stats(
                     loss_permille: l.loss_permille,
                     nak_count: l.nak_count,
                     used_bps: l.used_bps,
+                    delivered_bps: l.delivered_bps,
                     state: l.state,
                 })
                 .collect()
@@ -940,9 +1079,43 @@ pub extern "C" fn srtla_engine_update_link_stats(
             link.loss_permille = update.loss_permille;
             link.nak_count = update.nak_count;
             link.used_bps = update.used_bps;
+            link.delivered_bps = update.delivered_bps;
             link.state = update.state;
         }
     }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_update_srt_stats(
+    handle: *mut SrtlaEngineHandle,
+    stats: *const SrtlaSrtStatsV1,
+) -> i32 {
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    if stats.is_null() {
+        return -1;
+    }
+    // SAFETY: the caller supplies a readable V1 structure and advertises its
+    // byte size before any field beyond `struct_size` is consumed.
+    let struct_size = unsafe { (*stats).struct_size } as usize;
+    if struct_size < std::mem::size_of::<SrtlaSrtStatsV1>() {
+        return -1;
+    }
+    // SAFETY: the size check above establishes the complete V1 layout.
+    let stats = unsafe { *stats };
+    engine.srt_stats = SrtTransportStats {
+        sampled_at_ms: stats.sampled_at_ms,
+        bandwidth_bps: stats.bandwidth_bps,
+        send_rate_bps: stats.send_rate_bps,
+        sent_unique_bytes: stats.sent_unique_bytes,
+        retransmitted_bytes: stats.retransmitted_bytes,
+        dropped_bytes: stats.dropped_bytes,
+        send_buffer_ms: stats.send_buffer_ms,
+        packets_in_flight: stats.packets_in_flight,
+        sender_loss_packets: stats.sender_loss_packets,
+    };
     0
 }
 
@@ -972,6 +1145,27 @@ pub extern "C" fn srtla_engine_set_video_bitrate(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_set_max_video_bitrate(
+    handle: *mut SrtlaEngineHandle,
+    max_video_bps: u64,
+) -> i32 {
+    if max_video_bps == 0 {
+        return -1;
+    }
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    let minimum = engine.abr.config().min_bps;
+    let maximum = engine.abr.set_max_bps(max_video_bps);
+    engine.current_video_bps = engine.current_video_bps.clamp(minimum, maximum);
+    // The previous recommendation was calculated against the old ceiling.
+    // Invalidate it so snapshots cannot display a target above the live cap
+    // before the next one-second controller tick.
+    engine.last_abr_decision = AbrDecision::default();
+    0
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn srtla_engine_set_session_state(
     handle: *mut SrtlaEngineHandle,
     state: u32,
@@ -984,6 +1178,10 @@ pub extern "C" fn srtla_engine_set_session_state(
         return -1;
     };
     engine.session_state = state;
+    if state != SESSION_CONNECTED {
+        engine.srt_stats = SrtTransportStats::default();
+        engine.last_abr_decision = AbrDecision::default();
+    }
     engine.session_error = if error.is_null() {
         String::new()
     } else {
@@ -1053,6 +1251,8 @@ pub extern "C" fn srtla_engine_last_error(handle: *mut SrtlaEngineHandle) -> *co
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use std::sync::{Arc, Barrier};
+    use std::time::Instant;
 
     #[test]
     fn bounded_abi_queue_reports_backpressure() {
@@ -1073,6 +1273,49 @@ mod tests {
         );
         assert_eq!(srtla_engine_set_link_enabled(handle, 1, false), 0);
         assert_eq!(srtla_engine_set_link_enabled(handle, 2, false), -3);
+        srtla_engine_stop(handle);
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn feedback_wait_does_not_block_media_submission() {
+        let config = CString::new(
+            r#"{"receiver_host":"127.0.0.1","receiver_port":65534,"links":[{"id":1,"label":"loopback","address":"127.0.0.1"}]}"#,
+        )
+        .unwrap();
+        let handle = srtla_engine_create_v1(config.as_ptr());
+        assert!(!handle.is_null());
+        assert_eq!(srtla_engine_start(handle), 0);
+
+        let rendezvous = Arc::new(Barrier::new(2));
+        let receive_rendezvous = rendezvous.clone();
+        let handle_address = handle as usize;
+        let receiver = std::thread::spawn(move || {
+            let mut buffer = [0u8; 1500];
+            receive_rendezvous.wait();
+            srtla_engine_receive_srt_datagram(
+                handle_address as *mut SrtlaEngineHandle,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                300,
+            )
+        });
+
+        rendezvous.wait();
+        std::thread::sleep(Duration::from_millis(25));
+        let packet = [0x42u8; 16];
+        let started = Instant::now();
+        assert_eq!(
+            srtla_engine_submit_srt_datagram(handle, packet.as_ptr(), packet.len()),
+            0
+        );
+        let submit_elapsed = started.elapsed();
+        assert!(
+            submit_elapsed < Duration::from_millis(150),
+            "feedback wait blocked media submission for {submit_elapsed:?}"
+        );
+
+        assert_eq!(receiver.join().unwrap(), 0);
         srtla_engine_stop(handle);
         srtla_engine_destroy(handle);
     }
@@ -1099,13 +1342,14 @@ mod tests {
         let config = CString::new(r#"{"links":[{"id":1,"label":"a","enabled":true},{"id":2,"label":"b","enabled":false}]}"#).unwrap();
         let handle = srtla_engine_create_v1(config.as_ptr());
         assert_eq!(srtla_engine_start(handle), 0);
-        let stats = CString::new(r#"[{"id":1,"connected":true,"capacity_ready":true,"target_bps":4000000,"quality_percent":92,"rtt_ms":80,"loss_permille":3,"used_bps":1200000,"state":"Live"}]"#).unwrap();
+        let stats = CString::new(r#"[{"id":1,"connected":true,"capacity_ready":true,"target_bps":4000000,"quality_percent":92,"rtt_ms":80,"loss_permille":3,"used_bps":1200000,"delivered_bps":1100000,"state":"Live"}]"#).unwrap();
         assert_eq!(srtla_engine_update_link_stats(handle, stats.as_ptr()), 0);
         let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
         let mut out = vec![0i8; needed];
         srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len());
         let json = unsafe { CStr::from_ptr(out.as_ptr()) }.to_string_lossy();
         assert!(json.contains("4000000"));
+        assert!(json.contains(r#""delivered_bps":1100000"#));
         assert!(json.contains("\"admin_enabled\":true"));
         assert_eq!(srtla_engine_set_link_enabled(handle, 2, true), 0);
         assert_eq!(srtla_engine_set_link_enabled(handle, 1, false), 0);
@@ -1121,6 +1365,92 @@ mod tests {
         assert!(!handle.is_null());
         assert_eq!(srtla_engine_start(handle), 0);
         assert_eq!(srtla_engine_apply_abr(handle, 1_000), 500_000);
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn maximum_video_bitrate_can_be_lowered_while_running() {
+        let config = CString::new(
+            r#"{"links":[{"id":1,"label":"a","enabled":true}],"abr":{"min_bps":500000,"start_bps":8000000,"max_bps":20000000}}"#,
+        )
+        .unwrap();
+        let handle = srtla_engine_create_v1(config.as_ptr());
+        assert!(!handle.is_null());
+        assert_eq!(srtla_engine_start(handle), 0);
+        let link_stats = CString::new(
+            r#"[{"id":1,"connected":true,"payload_eligible":true,"capacity_ready":true,"target_bps":20000000,"state":"Live"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            srtla_engine_update_link_stats(handle, link_stats.as_ptr()),
+            0
+        );
+        assert_eq!(
+            srtla_engine_set_session_state(handle, SESSION_CONNECTED, ptr::null()),
+            0
+        );
+        assert_eq!(srtla_engine_set_video_bitrate(handle, 8_000_000), 0);
+
+        assert_eq!(srtla_engine_set_max_video_bitrate(handle, 3_000_000), 0);
+        assert_eq!(srtla_engine_apply_abr(handle, 1_000), 3_000_000);
+        assert_eq!(srtla_engine_set_max_video_bitrate(handle, 0), -1);
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn srt_stats_abi_caps_aggregate_capacity_after_warmup() {
+        let config = CString::new(
+            r#"{"links":[{"id":1,"label":"a","enabled":true}],"abr":{"min_bps":500000,"start_bps":8000000,"max_bps":20000000}}"#,
+        )
+        .unwrap();
+        let handle = srtla_engine_create_v1(config.as_ptr());
+        assert!(!handle.is_null());
+        assert_eq!(srtla_engine_start(handle), 0);
+        let link_stats = CString::new(
+            r#"[{"id":1,"connected":true,"payload_eligible":true,"capacity_ready":true,"target_bps":10000000,"delivered_bps":4000000,"state":"Live"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            srtla_engine_update_link_stats(handle, link_stats.as_ptr()),
+            0
+        );
+        assert_eq!(
+            srtla_engine_set_session_state(handle, SESSION_CONNECTED, ptr::null()),
+            0
+        );
+        assert_eq!(srtla_engine_set_video_bitrate(handle, 8_000_000), 0);
+
+        let mut applied = 0;
+        for tick in 1..=3 {
+            let stats = SrtlaSrtStatsV1 {
+                struct_size: std::mem::size_of::<SrtlaSrtStatsV1>() as u32,
+                sampled_at_ms: tick * 1_000,
+                bandwidth_bps: 6_000_000,
+                send_rate_bps: 4_200_000,
+                sent_unique_bytes: 500_000,
+                send_buffer_ms: 250,
+                ..Default::default()
+            };
+            assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
+            applied = srtla_engine_apply_abr(handle, tick * 1_000);
+        }
+        assert_eq!(applied, 4_800_000);
+
+        let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
+        let mut out = vec![0i8; needed];
+        srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len());
+        let json = unsafe { CStr::from_ptr(out.as_ptr()) }.to_string_lossy();
+        assert!(json.contains(r#""link_capacity_bps":10000000"#));
+        assert!(json.contains(r#""srt_capacity_bps":6000000"#));
+        assert!(json.contains(r#""estimated_capacity_bps":6000000"#));
+        assert!(json.contains(r#""srt_stats_ready":true"#));
+        assert!(json.contains(r#""srt_limited":true"#));
+
+        let short = SrtlaSrtStatsV1 {
+            struct_size: 4,
+            ..Default::default()
+        };
+        assert_eq!(srtla_engine_update_srt_stats(handle, &short), -1);
         srtla_engine_destroy(handle);
     }
 

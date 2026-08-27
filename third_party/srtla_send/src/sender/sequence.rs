@@ -24,8 +24,22 @@ pub struct SequenceTrackingEntry {
     pub conn_id: u64,
     /// Timestamp when the packet was sent (milliseconds since epoch).
     pub timestamp_ms: u64,
+    /// Size of the SRT datagram assigned to this link. Zero for legacy/test
+    /// inserts that do not participate in acknowledged-rate accounting.
+    wire_bytes: u32,
+    /// Prevents a duplicated SRTLA ACK from crediting the same transmission
+    /// more than once while retaining ownership for later SRT ACK/NAK handling.
+    delivery_credited: bool,
     /// The actual sequence number stored (for collision detection).
     seq: u32,
+}
+
+/// Delivery evidence recovered from the sequence ring for an SRTLA ACK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryCredit {
+    pub timestamp_ms: u64,
+    pub wire_bytes: u32,
+    pub newly_credited: bool,
 }
 
 impl SequenceTrackingEntry {
@@ -74,6 +88,23 @@ impl SequenceTracker {
     /// This is O(1) and never allocates.
     #[inline]
     pub fn insert(&mut self, seq: u32, conn_id: u64, timestamp_ms: u64) {
+        self.insert_with_size(seq, conn_id, timestamp_ms, 0);
+    }
+
+    /// Insert a sequence mapping together with the exact SRT datagram size.
+    ///
+    /// The byte count survives cumulative SRT ACK pruning because this shell
+    /// tracker is independent of each connection's in-flight packet log. That
+    /// lets the later per-link SRTLA ACK provide an acknowledged throughput
+    /// sample even when a faster link already carried the cumulative ACK.
+    #[inline]
+    pub fn insert_with_size(
+        &mut self,
+        seq: u32,
+        conn_id: u64,
+        timestamp_ms: u64,
+        wire_bytes: usize,
+    ) {
         let idx = (seq as usize) & SEQ_TRACKING_MASK;
         let entry = &mut self.entries[idx];
 
@@ -85,6 +116,8 @@ impl SequenceTracker {
         *entry = SequenceTrackingEntry {
             conn_id,
             timestamp_ms,
+            wire_bytes: wire_bytes.min(u32::MAX as usize) as u32,
+            delivery_credited: false,
             seq,
         };
     }
@@ -105,6 +138,36 @@ impl SequenceTracker {
         } else {
             None
         }
+    }
+
+    /// Match an SRTLA ACK to the link that carried the unique payload copy.
+    ///
+    /// The entry is retained because cumulative SRT ACK RTT attribution and
+    /// later NAK handling still need ownership. `newly_credited` makes the byte
+    /// accounting idempotent if an ACK is duplicated on the wire.
+    #[inline]
+    pub fn acknowledge_delivery(
+        &mut self,
+        seq: u32,
+        arrival_conn_id: u64,
+        current_time_ms: u64,
+    ) -> Option<DeliveryCredit> {
+        let idx = (seq as usize) & SEQ_TRACKING_MASK;
+        let entry = &mut self.entries[idx];
+        if !entry.is_valid(seq, current_time_ms)
+            || entry.conn_id != arrival_conn_id
+            || entry.wire_bytes == 0
+        {
+            return None;
+        }
+
+        let newly_credited = !entry.delivery_credited;
+        entry.delivery_credited = true;
+        Some(DeliveryCredit {
+            timestamp_ms: entry.timestamp_ms,
+            wire_bytes: entry.wire_bytes,
+            newly_credited,
+        })
     }
 
     /// Remove entries for a specific connection ID.
@@ -189,6 +252,32 @@ mod tests {
         assert_eq!(tracker.get(100, now), None);
         assert_eq!(tracker.get(101, now), Some(2));
         assert_eq!(tracker.get(102, now), None);
+    }
+
+    #[test]
+    fn delivery_credit_is_owned_sized_and_idempotent() {
+        let mut tracker = SequenceTracker::new();
+        let now = 1_000_000u64;
+        tracker.insert_with_size(12345, 7, now, 1_316);
+
+        assert_eq!(tracker.acknowledge_delivery(12345, 8, now + 10), None);
+        assert_eq!(
+            tracker.acknowledge_delivery(12345, 7, now + 20),
+            Some(DeliveryCredit {
+                timestamp_ms: now,
+                wire_bytes: 1_316,
+                newly_credited: true,
+            })
+        );
+        assert_eq!(
+            tracker.acknowledge_delivery(12345, 7, now + 30),
+            Some(DeliveryCredit {
+                timestamp_ms: now,
+                wire_bytes: 1_316,
+                newly_credited: false,
+            })
+        );
+        assert_eq!(tracker.get(12345, now + 30), Some(7));
     }
 
     #[test]

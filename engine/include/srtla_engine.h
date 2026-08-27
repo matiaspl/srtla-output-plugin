@@ -19,6 +19,21 @@ typedef enum SrtlaSessionState {
 	SRTLA_SESSION_STOPPED = 5,
 } SrtlaSessionState;
 
+typedef struct SrtlaSrtStatsV1 {
+	uint32_t struct_size;
+	uint32_t reserved;
+	uint64_t sampled_at_ms;
+	uint64_t bandwidth_bps;
+	uint64_t send_rate_bps;
+	uint64_t sent_unique_bytes;
+	uint64_t retransmitted_bytes;
+	uint64_t dropped_bytes;
+	uint32_t send_buffer_ms;
+	uint32_t packets_in_flight;
+	uint32_t sender_loss_packets;
+	uint32_t reserved2;
+} SrtlaSrtStatsV1;
+
 /* v1 ABI: the queue and control contract is stable.  A successful submit is
  * acceptance into the bounded in-process SRTLA queue, not receiver delivery. */
 /* Return codes: 0 success, -1 invalid argument, -2 bounded queue/JSON error,
@@ -35,8 +50,10 @@ int32_t srtla_engine_receive_srt_datagram(SrtlaEngineHandle *handle, uint8_t *da
 int32_t srtla_engine_set_link_enabled(SrtlaEngineHandle *handle, uint64_t link_id, bool enabled);
 int32_t srtla_engine_update_adapters(SrtlaEngineHandle *handle, const char *adapters_json);
 int32_t srtla_engine_update_link_stats(SrtlaEngineHandle *handle, const char *stats_json);
+int32_t srtla_engine_update_srt_stats(SrtlaEngineHandle *handle, const SrtlaSrtStatsV1 *stats);
 int32_t srtla_engine_set_audio_bitrate(SrtlaEngineHandle *handle, uint64_t audio_bps);
 int32_t srtla_engine_set_video_bitrate(SrtlaEngineHandle *handle, uint64_t video_bps);
+int32_t srtla_engine_set_max_video_bitrate(SrtlaEngineHandle *handle, uint64_t max_video_bps);
 int32_t srtla_engine_set_session_state(SrtlaEngineHandle *handle, SrtlaSessionState state,
 						       const char *error);
 uint64_t srtla_engine_apply_abr(SrtlaEngineHandle *handle, uint64_t now_ms);

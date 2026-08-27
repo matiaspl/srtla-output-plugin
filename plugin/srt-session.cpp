@@ -16,7 +16,9 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -125,6 +127,16 @@ bool valid_utf8(const std::string &value)
 void ensure_srt_startup()
 {
 	std::call_once(startup_once, [] { (void)srt_startup(); });
+}
+
+std::uint64_t mbps_to_bps(double mbps)
+{
+	if (!std::isfinite(mbps) || mbps <= 0.0)
+		return 0;
+	const double bps = mbps * 1'000'000.0;
+	if (bps >= static_cast<double>(std::numeric_limits<std::uint64_t>::max()))
+		return std::numeric_limits<std::uint64_t>::max();
+	return static_cast<std::uint64_t>(bps);
 }
 
 int transport_send(void *opaque, const std::uint8_t *header, std::size_t header_len,
@@ -458,4 +470,31 @@ bool SrtSession::send_ts(const std::uint8_t *data, std::size_t size)
 	if (impl_->socket == SRT_INVALID_SOCK)
 		return false;
 	return srt_sendmsg(impl_->socket, reinterpret_cast<const char *>(data), static_cast<int>(size), -1, 0) == static_cast<int>(size);
+}
+
+bool SrtSession::sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStatsV1 &stats)
+{
+	stats = {};
+	stats.struct_size = static_cast<std::uint32_t>(sizeof(stats));
+	if (!connected_.load() || !impl_)
+		return false;
+
+	std::lock_guard<std::mutex> lock(impl_->socket_mutex);
+	if (impl_->socket == SRT_INVALID_SOCK)
+		return false;
+
+	SRT_TRACEBSTATS perf{};
+	if (srt_bistats(impl_->socket, &perf, 1, 1) == SRT_ERROR)
+		return false;
+
+	stats.sampled_at_ms = sampled_at_ms;
+	stats.bandwidth_bps = mbps_to_bps(perf.mbpsBandwidth);
+	stats.send_rate_bps = mbps_to_bps(perf.mbpsSendRate);
+	stats.sent_unique_bytes = perf.byteSentUnique;
+	stats.retransmitted_bytes = perf.byteRetrans;
+	stats.dropped_bytes = perf.byteSndDrop;
+	stats.send_buffer_ms = static_cast<std::uint32_t>(std::max(0, perf.msSndBuf));
+	stats.packets_in_flight = static_cast<std::uint32_t>(std::max(0, perf.pktFlightSize));
+	stats.sender_loss_packets = static_cast<std::uint32_t>(std::max(0, perf.pktSndLoss));
+	return true;
 }
