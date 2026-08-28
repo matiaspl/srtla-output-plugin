@@ -39,7 +39,7 @@ public:
 	Status status() const;
 	std::string last_error() const;
 	bool send_ts(const std::uint8_t *data, std::size_t size);
-	bool sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStatsV1 &stats);
+	bool sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStats &stats);
 
 private:
 	std::unique_ptr<Impl> impl_;

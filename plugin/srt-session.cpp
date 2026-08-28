@@ -26,7 +26,8 @@ struct SrtSession::Impl {
 	Impl(SrtlaEngineHandle *engine_, std::string host_, std::uint16_t port_, std::string stream_id_,
 	     std::string passphrase_, int latency_ms_, int pbkeylen_, StatusCallback status_callback_)
 		: engine(engine_), host(std::move(host_)), port(port_), stream_id(std::move(stream_id_)),
-		  passphrase(std::move(passphrase_)), latency_ms(latency_ms_), pbkeylen(pbkeylen_),
+		  passphrase(std::move(passphrase_)), latency_ms(latency_ms_),
+		  negotiated_latency_ms(latency_ms_), pbkeylen(pbkeylen_),
 		  status_callback(std::move(status_callback_)) {}
 
 	SrtlaEngineHandle *engine;
@@ -35,6 +36,7 @@ struct SrtSession::Impl {
 	std::string stream_id;
 	std::string passphrase;
 	int latency_ms;
+	std::atomic<int> negotiated_latency_ms;
 	int pbkeylen;
 	std::mutex socket_mutex;
 	std::mutex remote_mutex;
@@ -382,6 +384,13 @@ bool SrtSession::start()
 				impl_->socket = SRT_INVALID_SOCK;
 				continue;
 			}
+			int negotiated_latency = impl_->latency_ms;
+			int negotiated_latency_size = sizeof(negotiated_latency);
+			if (srt_getsockflag(socket, SRTO_PEERLATENCY, &negotiated_latency,
+			                    &negotiated_latency_size) == 0 && negotiated_latency > 0)
+				impl_->negotiated_latency_ms.store(negotiated_latency);
+			else
+				impl_->negotiated_latency_ms.store(impl_->latency_ms);
 			backoff = 1;
 			connected_.store(true);
 			ever_connected = true;
@@ -472,7 +481,7 @@ bool SrtSession::send_ts(const std::uint8_t *data, std::size_t size)
 	return srt_sendmsg(impl_->socket, reinterpret_cast<const char *>(data), static_cast<int>(size), -1, 0) == static_cast<int>(size);
 }
 
-bool SrtSession::sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStatsV1 &stats)
+bool SrtSession::sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStats &stats)
 {
 	stats = {};
 	stats.struct_size = static_cast<std::uint32_t>(sizeof(stats));
@@ -486,6 +495,11 @@ bool SrtSession::sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStatsV1 &stat
 	SRT_TRACEBSTATS perf{};
 	if (srt_bistats(impl_->socket, &perf, 1, 1) == SRT_ERROR)
 		return false;
+	int send_buffer_packets = 0;
+	int send_buffer_packets_size = sizeof(send_buffer_packets);
+	if (srt_getsockflag(impl_->socket, SRTO_SNDDATA, &send_buffer_packets,
+	                    &send_buffer_packets_size) == SRT_ERROR || send_buffer_packets < 0)
+		return false;
 
 	stats.sampled_at_ms = sampled_at_ms;
 	stats.bandwidth_bps = mbps_to_bps(perf.mbpsBandwidth);
@@ -496,5 +510,8 @@ bool SrtSession::sample_stats(std::uint64_t sampled_at_ms, SrtlaSrtStatsV1 &stat
 	stats.send_buffer_ms = static_cast<std::uint32_t>(std::max(0, perf.msSndBuf));
 	stats.packets_in_flight = static_cast<std::uint32_t>(std::max(0, perf.pktFlightSize));
 	stats.sender_loss_packets = static_cast<std::uint32_t>(std::max(0, perf.pktSndLoss));
+	stats.rtt_ms = static_cast<std::uint32_t>(std::max(0.0, perf.msRTT));
+	stats.send_buffer_packets = static_cast<std::uint32_t>(send_buffer_packets);
+	stats.latency_ms = static_cast<std::uint32_t>(std::max(1, impl_->negotiated_latency_ms.load()));
 	return true;
 }

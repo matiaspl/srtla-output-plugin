@@ -1,10 +1,16 @@
 #include "stats-json.hpp"
+#include "../engine/include/srtla_engine.h"
 
 #include <cstddef>
 #include <iostream>
 
 #include <QJsonArray>
 #include <QJsonObject>
+
+static_assert(sizeof(SrtlaSrtStats) == 88);
+static_assert(offsetof(SrtlaSrtStats, rtt_ms) == 72);
+static_assert(offsetof(SrtlaSrtStats, send_buffer_packets) == 76);
+static_assert(offsetof(SrtlaSrtStats, latency_ms) == 80);
 
 int main()
 {
@@ -14,7 +20,7 @@ int main()
 		return condition;
 	};
 
-	QByteArray buffer(R"({"link_capacity_bps":6000000,"srt_capacity_bps":5000000,"estimated_capacity_bps":5000000,"srt_stats_ready":true,"links":[{"target_bps":4000000,"delivered_bps":3500000}]})");
+	QByteArray buffer(R"({"link_capacity_bps":6000000,"srt_send_buffer_packets":12,"srt_rtt_ms":84,"srt_latency_ms":2000,"abr_state":"Hold","recommended_video_bps":4000000,"srt_stats_ready":true,"links":[{"target_bps":4000000,"delivered_bps":3500000}]})");
 	buffer.append('\0');
 	const auto actual = static_cast<std::size_t>(buffer.size());
 	// Simulate a document that became shorter between the ABI size query and
@@ -30,10 +36,16 @@ int main()
 	const auto links = root.value(QStringLiteral("links")).toArray();
 	if (!require(root.value(QStringLiteral("link_capacity_bps")).toInteger() == 6'000'000,
 		     "stats JSON link capacity changed during parsing") ||
-	    !require(root.value(QStringLiteral("srt_capacity_bps")).toInteger() == 5'000'000,
-		     "stats JSON SRT capacity changed during parsing") ||
-	    !require(root.value(QStringLiteral("estimated_capacity_bps")).toInteger() == 5'000'000,
-		     "stats JSON effective capacity changed during parsing") ||
+	    !require(root.value(QStringLiteral("srt_send_buffer_packets")).toInteger() == 12,
+		     "stats JSON queue depth changed during parsing") ||
+	    !require(root.value(QStringLiteral("srt_rtt_ms")).toInteger() == 84,
+		     "stats JSON RTT changed during parsing") ||
+	    !require(root.value(QStringLiteral("srt_latency_ms")).toInteger() == 2'000,
+		     "stats JSON latency changed during parsing") ||
+	    !require(root.value(QStringLiteral("abr_state")).toString() == QStringLiteral("Hold"),
+		     "stats JSON ABR state changed during parsing") ||
+	    !require(root.value(QStringLiteral("recommended_video_bps")).toInteger() == 4'000'000,
+		     "stats JSON ABR target changed during parsing") ||
 	    !require(root.value(QStringLiteral("srt_stats_ready")).toBool(),
 		     "stats JSON SRT readiness changed during parsing") ||
 	    !require(links.size() == 1, "stats JSON link array has the wrong size") ||

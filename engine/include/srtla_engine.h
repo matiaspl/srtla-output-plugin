@@ -19,7 +19,8 @@ typedef enum SrtlaSessionState {
 	SRTLA_SESSION_STOPPED = 5,
 } SrtlaSessionState;
 
-typedef struct SrtlaSrtStatsV1 {
+/* SRT feedback used by the BELABOX-style encoder controller. */
+typedef struct SrtlaSrtStats {
 	uint32_t struct_size;
 	uint32_t reserved;
 	uint64_t sampled_at_ms;
@@ -32,16 +33,20 @@ typedef struct SrtlaSrtStatsV1 {
 	uint32_t packets_in_flight;
 	uint32_t sender_loss_packets;
 	uint32_t reserved2;
-} SrtlaSrtStatsV1;
+	uint32_t rtt_ms;
+	uint32_t send_buffer_packets;
+	uint32_t latency_ms;
+	uint32_t reserved3;
+} SrtlaSrtStats;
 
-/* v1 ABI: the queue and control contract is stable.  A successful submit is
+/* The queue and control contract is stable. A successful submit is
  * acceptance into the bounded in-process SRTLA queue, not receiver delivery. */
 /* Return codes: 0 success, -1 invalid argument, -2 bounded queue/JSON error,
  * -3 last-link guard or short receive buffer, -4 engine not running. */
 
 /* JSON is accepted as either an array of {id,label,enabled} links or
  * {"links":[...]}. New adapter IDs are disabled until explicitly enabled. */
-SrtlaEngineHandle *srtla_engine_create_v1(const char *config_json);
+SrtlaEngineHandle *srtla_engine_create(const char *config_json);
 int32_t srtla_engine_start(SrtlaEngineHandle *handle);
 int32_t srtla_engine_stop(SrtlaEngineHandle *handle);
 void srtla_engine_destroy(SrtlaEngineHandle *handle);
@@ -50,7 +55,7 @@ int32_t srtla_engine_receive_srt_datagram(SrtlaEngineHandle *handle, uint8_t *da
 int32_t srtla_engine_set_link_enabled(SrtlaEngineHandle *handle, uint64_t link_id, bool enabled);
 int32_t srtla_engine_update_adapters(SrtlaEngineHandle *handle, const char *adapters_json);
 int32_t srtla_engine_update_link_stats(SrtlaEngineHandle *handle, const char *stats_json);
-int32_t srtla_engine_update_srt_stats(SrtlaEngineHandle *handle, const SrtlaSrtStatsV1 *stats);
+int32_t srtla_engine_update_srt_stats(SrtlaEngineHandle *handle, const SrtlaSrtStats *stats);
 int32_t srtla_engine_set_audio_bitrate(SrtlaEngineHandle *handle, uint64_t audio_bps);
 int32_t srtla_engine_set_video_bitrate(SrtlaEngineHandle *handle, uint64_t video_bps);
 int32_t srtla_engine_set_max_video_bitrate(SrtlaEngineHandle *handle, uint64_t max_video_bps);

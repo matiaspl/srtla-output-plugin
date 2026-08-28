@@ -230,16 +230,15 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	manualBitrate_->setSuffix(tr(" kb/s"));
 	manualBitrate_->setEnabled(false);
 	maxBitrate_ = new QSpinBox(this);
-	maxBitrate_->setRange(500, 200000);
-	maxBitrate_->setValue(100000);
+	maxBitrate_->setRange(500, 30000);
+	maxBitrate_->setValue(6000);
 	maxBitrate_->setSingleStep(50);
 	maxBitrate_->setSuffix(tr(" kb/s"));
 	state_ = new QLabel(tr("Idle"), this);
-	metrics_ = new QLabel(tr("Effective") + QStringLiteral(": -- | ") + tr("Link CC") +
-		QStringLiteral(": -- | ") + tr("SRT estimate") + QStringLiteral(": -- | ") +
-		tr("SRT queue") + QStringLiteral(": --\n") + tr("Offered") +
-		QStringLiteral(": -- | ") + tr("Delivered") + QStringLiteral(": -- | ") +
-		tr("Active links") + QStringLiteral(": 0"), this);
+	metrics_ = new QLabel(tr("ABR") + QStringLiteral(": -- | ") + tr("RTT") +
+		QStringLiteral(": -- | ") + tr("SRT queue") + QStringLiteral(": --\n") +
+		tr("Video") + QStringLiteral(": -- | ") + tr("Target") +
+		QStringLiteral(": -- | ") + tr("Active links") + QStringLiteral(": 0"), this);
 	loadProfile();
 	controls->addRow(tr("State"), state_);
 	controls->addRow(tr("SRTLA URL"), url_);
@@ -250,7 +249,7 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	controls->addRow(tr("Custom audio encoder"), customAudioEncoder_);
 	controls->addRow(tr("Bitrate"), autoBitrate_);
 	controls->addRow(tr("Manual"), manualBitrate_);
-	controls->addRow(tr("Maximum"), maxBitrate_);
+	controls->addRow(tr("Auto maximum"), maxBitrate_);
 	layout->addLayout(controls);
 	layout->addWidget(metrics_);
 	layout->addWidget(startStop_);
@@ -310,7 +309,7 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	});
 	connect(maxBitrate_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int bitrate_kbps) {
 		if (running_ && output_ && srtla_output_set_max_bitrate(output_, bitrate_kbps) != 0) {
-			const int previous = settings_ ? static_cast<int>(obs_data_get_int(settings_, "max_bitrate")) : 100000;
+			const int previous = settings_ ? static_cast<int>(obs_data_get_int(settings_, "max_bitrate")) : 6000;
 			QSignalBlocker blocker(maxBitrate_);
 			maxBitrate_->setValue(previous);
 			state_->setToolTip(tr("The selected encoder cannot change bitrate while active"));
@@ -380,7 +379,10 @@ void SrtlaDock::loadProfile()
 	select_combo_data(customAudioEncoder_, profile_string("CustomAudioEncoder"));
 	autoBitrate_->setChecked(profile_bool("AutoBitrate", true));
 	manualBitrate_->setValue(profile_int("Bitrate", 1500));
-	maxBitrate_->setValue(profile_int("MaxBitrate", 100000));
+	int maximum_bitrate = profile_int("MaxBitrate", 6000);
+	if (maximum_bitrate == 100000)
+		maximum_bitrate = 6000;
+	maxBitrate_->setValue(maximum_bitrate);
 
 	const auto enabled_links = profile_string("EnabledLinks").toStdString();
 	std::size_t start = 0;
@@ -627,20 +629,9 @@ void SrtlaDock::toggleOutput()
 	obs_data_set_string(settings_, "enabled_links", enabled_links.c_str());
 	obs_data_set_bool(settings_, "auto_bitrate", autoBitrate_->isChecked());
 	obs_data_set_int(settings_, "bitrate", manualBitrate_->value());
-	int start_bitrate_kbps = manualBitrate_->value();
-	if (autoBitrate_->isChecked()) {
-		if (auto *encoder_settings = obs_encoder_get_settings(video_encoder)) {
-			const auto encoder_bitrate = obs_data_get_int(encoder_settings, "bitrate");
-			if (encoder_bitrate > 0)
-				start_bitrate_kbps = static_cast<int>(encoder_bitrate);
-			obs_data_release(encoder_settings);
-		}
-	}
-	obs_data_set_int(settings_, "start_bitrate", start_bitrate_kbps);
 	obs_data_set_int(settings_, "min_bitrate", 500);
 	obs_data_set_int(settings_, "max_bitrate", maxBitrate_->value());
 	obs_data_set_int(settings_, "audio_bitrate", 128);
-	obs_data_set_double(settings_, "safety_margin", 0.80);
 	obs_data_set_int(settings_, "latency_ms", latency_ms_);
 	obs_data_set_int(settings_, "pbkeylen", pbkeylen_);
 	obs_data_set_string(settings_, "scheduler", "enhanced");
@@ -735,26 +726,32 @@ void SrtlaDock::refreshStatus()
 		}
 	}
 	const auto linkCapacity = root.value(QStringLiteral("link_capacity_bps")).toInteger(ccTarget);
-	const auto effectiveCapacity = root.value(QStringLiteral("estimated_capacity_bps")).toInteger(linkCapacity);
-	const auto srtReady = root.value(QStringLiteral("srt_stats_ready")).toBool();
 	const auto srtRaw = root.value(QStringLiteral("srt_bandwidth_bps")).toInteger();
-	const auto srtCapacity = srtReady ?
-		QString::number(root.value(QStringLiteral("srt_capacity_bps")).toInteger() / 1000) + QStringLiteral(" kb/s") :
-		srtRaw > 0 ? QString::number(srtRaw / 1000) + QStringLiteral(" kb/s (") + tr("Warming") + QStringLiteral(")") :
-		tr("Warming");
 	const auto srtQueue = root.value(QStringLiteral("srt_connected")).toBool() ?
-		QString::number(root.value(QStringLiteral("srt_send_buffer_ms")).toInteger()) + QStringLiteral(" ms") :
+		QStringLiteral("%1 packets / %2 ms")
+			.arg(root.value(QStringLiteral("srt_send_buffer_packets")).toInteger())
+			.arg(root.value(QStringLiteral("srt_send_buffer_ms")).toInteger()) :
 		QStringLiteral("--");
-	metrics_->setText(tr("Effective") + QStringLiteral(": %1 kb/s | ").arg(effectiveCapacity / 1000) +
-		tr("Link CC") + QStringLiteral(": %1 kb/s | ").arg(linkCapacity / 1000) +
-		tr("SRT estimate") + QStringLiteral(": %1 | ").arg(srtCapacity) + tr("SRT queue") +
-		QStringLiteral(": %1\n").arg(srtQueue) + tr("Offered") +
-		QStringLiteral(": %1 kb/s | ").arg(offered / 1000) + tr("Delivered") +
-		QStringLiteral(": %1 kb/s | ").arg(delivered / 1000) + tr("Video") +
+	const auto rtt = root.value(QStringLiteral("srt_connected")).toBool() ?
+		QStringLiteral("%1 / %2 ms")
+			.arg(root.value(QStringLiteral("srt_rtt_ms")).toInteger())
+			.arg(root.value(QStringLiteral("srt_latency_ms")).toInteger()) :
+		QStringLiteral("--");
+	metrics_->setText(tr("ABR") + QStringLiteral(": %1 | ").arg(root.value(QStringLiteral("abr_state")).toString()) +
+		tr("RTT") + QStringLiteral(": %1 | ").arg(rtt) + tr("SRT queue") +
+		QStringLiteral(": %1\n").arg(srtQueue) + tr("Video") +
 		QStringLiteral(": %1 kb/s | ").arg(root.value(QStringLiteral("current_video_bps")).toInteger() / 1000) +
-		tr("Recommended") + QStringLiteral(": %1 kb/s | ").arg(root.value(QStringLiteral("recommended_video_bps")).toInteger() / 1000) +
+		tr("Target") + QStringLiteral(": %1 kb/s | ").arg(root.value(QStringLiteral("recommended_video_bps")).toInteger() / 1000) +
+		tr("Link CC") + QStringLiteral(": %1 kb/s | ").arg(linkCapacity / 1000) +
+		tr("Offered") + QStringLiteral(": %1 kb/s | ").arg(offered / 1000) +
+		tr("Delivered") + QStringLiteral(": %1 kb/s | ").arg(delivered / 1000) +
 		tr("Active links") + QStringLiteral(": %1").arg(active));
-	metrics_->setToolTip(tr("SRT raw: %1 kb/s | send: %2 kb/s | retransmissions: %3% | sender loss: %4 | dropped: %5 bytes")
+	metrics_->setToolTip(tr("Queue thresholds L/H/S: %1/%2/%3 packets | RTT grow below: %4 ms | RTT reduce above: %5 ms | SRT estimate: %6 kb/s | send: %7 kb/s | retransmissions: %8% | sender loss: %9 | dropped: %10 bytes")
+		.arg(root.value(QStringLiteral("abr_queue_light_packets")).toInteger())
+		.arg(root.value(QStringLiteral("abr_queue_heavy_packets")).toInteger())
+		.arg(root.value(QStringLiteral("abr_queue_severe_packets")).toInteger())
+		.arg(root.value(QStringLiteral("abr_rtt_increase_below_ms")).toInteger())
+		.arg(root.value(QStringLiteral("abr_rtt_decrease_above_ms")).toInteger())
 		.arg(srtRaw / 1000)
 		.arg(root.value(QStringLiteral("srt_send_rate_bps")).toInteger() / 1000)
 		.arg(root.value(QStringLiteral("srt_retransmit_permille")).toInteger() / 10.0, 0, 'f', 1)

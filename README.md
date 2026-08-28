@@ -18,17 +18,16 @@ does **not** ship a production receiver. For a local Windows smoke test, see
   monitoring the session.
 - Streaming or recording encoder reuse, plus independent custom encoders.
 - H.264 and HEVC video with AAC or Opus audio.
-- Automatic video bitrate control based on the lower of the eligible-link CC
-  aggregate and a validated end-to-end SRT bandwidth estimate. SRT sender-queue
-  pressure can trigger an immediate hysteretic reduction; manual bitrate and
-  maximum-bitrate controls remain available.
+- BELABOX-style automatic video bitrate control driven by end-to-end SRT RTT
+  and instantaneous sender-queue depth. Manual bitrate and maximum-bitrate
+  controls remain available.
 - Per-adapter IPv4 and IPv6 uplinks that can be enabled or disabled while the
   output is running. Newly discovered links are opt-in, and the last enabled
   link cannot be disabled.
-- Effective, link-aggregate, and SRT capacity telemetry, SRT sender-queue
-  pressure, offered and ACK-delivered traffic, current/recommended video
-  bitrate, plus per-link state, NAK-recency score, RTT, retransmission-request
-  rate, congestion, and scheduler diagnostics.
+- ABR state and thresholds, end-to-end SRT RTT and sender-queue pressure,
+  offered and ACK-delivered traffic, current/target video bitrate, raw SRT
+  bandwidth and per-link CC telemetry, plus per-link state, NAK-recency score,
+  RTT, retransmission-request rate, congestion, and scheduler diagnostics.
 - SRT stream ID and optional passphrase authentication. Saved passphrases are
   protected with Windows DPAPI instead of being stored in plaintext.
 - Automatic SRT reconnection and a bounded, keyframe-aware media queue. After a
@@ -39,8 +38,8 @@ does **not** ship a production receiver. For a local Windows smoke test, see
 Automatic bitrate and live manual-bitrate changes require an OBS encoder that
 advertises dynamic bitrate support. With a compatible encoder, automatic mode
 can be toggled and the manual bitrate adjusted while the output is live. Other
-encoders remain usable at a fixed bitrate while the dock continues to show the
-recommended bitrate as telemetry.
+encoders remain usable at a fixed bitrate while the dock continues to show
+transport telemetry.
 
 ## Current status and limitations
 
@@ -113,88 +112,60 @@ such as invalid socket, engine, encoder, muxer, or queue state.
 
 ## Automatic bitrate control
 
-The automatic bitrate controller runs once per second while the output is
-active. It starts from the selected encoder's actual bitrate, treats the
-configured maximum as a ceiling, reserves the configured audio bitrate, and
-uses an 80% capacity safety margin by default. The minimum video bitrate is
-500 kb/s by default.
+The automatic controller ports the closed-loop congestion response from
+[BELABOX `belacoder`](https://github.com/BELABOX/belacoder/blob/master/belacoder.c)
+to Rust. While the output is active, it samples the SRT socket every 20 ms and
+observes:
 
-The controller combines three kinds of evidence:
+- the instantaneous number of unacknowledged packets in the SRT sender buffer;
+- end-to-end smoothed SRT RTT and the negotiated SRT latency;
+- the current SRT send rate, used only to express part of the queue threshold
+  in packets.
 
-- **Per-link capacity:** each enabled, payload-eligible link has its own
-  congestion-control target. Only measured targets are summed; bootstrap and
-  initial placeholder targets are not considered capacity-ready. A link becomes
-  ready only after a complete offered-rate window exists and its congestion
-  control has left bootstrap.
-- **Proven traffic:** per-link SRTLA acknowledgements provide the rate already
-  delivered successfully. When the SRT sender is healthy, the current video
-  plus audio rate is also treated as proven load. This lower bound prevents a
-  working high-rate stream from being reduced by a startup placeholder or a
-  bandwidth estimate that merely follows the offered load.
-- **End-to-end SRT state:** libsrt supplies its bandwidth estimate, sender
-  buffer delay, retransmitted bytes, and dropped bytes. A bandwidth estimate
-  must be non-zero and appear in three distinct fresh samples before it can cap
-  the link aggregate. Decreases are filtered faster than increases. Without
-  independent congestion evidence, an estimate is rejected if applying the
-  safety margin would place it below traffic that is already working.
+The controller learns moving queue and RTT baselines, positive jitter, RTT
+trend, and a slowly adapting minimum RTT. It does not use the SRT packet-pair
+bandwidth estimate or the sum of per-link SRTLA CC targets to select the encoder
+bitrate. Those values remain visible as diagnostics. SRTLA CC controls packet
+scheduling across links; end-to-end queue growth and RTT inflation determine
+whether the offered encoder rate is sustainable.
 
-In steady state, the calculation is conceptually:
+Bitrate changes follow BELABOX's asymmetric control law:
 
-```text
-measured link capacity = sum(ready eligible link CC targets)
-proven capacity floor  = proven media load / safety margin
-effective link capacity = max(measured link capacity, proven capacity floor)
-effective capacity = min(effective link capacity, validated SRT capacity)
-recommended video = clamp(effective capacity * safety margin - audio,
-                          minimum video, maximum video)
-```
+- If RTT reaches one third of negotiated SRT latency, or queue growth crosses
+  the severe adaptive threshold, video immediately drops to the configured
+  minimum.
+- Under heavy congestion (RTT above one fifth of latency or a high queue), the
+  controller subtracts 100 kb/s plus 10% of its internal target, no more than
+  once every 250 ms.
+- Under light congestion (RTT or queue above its learned baseline), it
+  subtracts 100 kb/s, no more than once every 200 ms.
+- With RTT close to the learned minimum and no upward RTT trend, it adds
+  30 kb/s plus one thirtieth of the internal target, no more than once every
+  500 ms.
+- The internal target is clamped to the configured minimum and maximum. Values
+  applied to OBS are rounded down to 100 kb/s, while sub-step changes continue
+  accumulating internally.
 
-If no validated SRT estimate is available, effective link capacity is used on
-its own. The dock therefore shows separate **Link**, **SRT**, and **Effective**
-capacity values. **Recommended** is the controller's full target; **Current**
-is the encoder bitrate after the controller's stability and step limits.
+Automatic mode starts at the configured maximum, matching BELABOX. The default
+automatic maximum is 6000 kb/s and its range is capped at 30000 kb/s; the old
+100000 kb/s sentinel is migrated to the new default. This ceiling does not
+limit the separate manual-bitrate setting. If the SRT session or
+every enabled link is down, the output falls to the minimum to avoid an
+unbounded queue. Missing or repeated statistics hold the current target rather
+than replaying a congestion event. Learned queue and RTT state is reset after a
+session transition.
 
-The per-link **NAK score** and **NAK rate** are SRTLA steering signals, not
+The per-link **NAK score** and **NAK rate** remain SRTLA steering signals, not
 end-to-end unrecovered packet loss. A NAK is a retransmission request, and the
 rate includes packets that SRT later repairs within its latency window. It is
 therefore expected that `srt-live-transmit` can report no final loss while the
 dock shows a non-zero NAK rate and a temporarily reduced NAK score.
 
-Bitrate changes use asymmetric hysteresis:
-
-- A recommendation more than 10% below the current bitrate is applied
-  immediately.
-- An increase requires at least 15% headroom for 10 consecutive controller
-  ticks. The first increase is therefore delayed by roughly 10 seconds.
-- Increases are limited to 10% of the current bitrate, with a 50 kb/s minimum
-  step and a 500 kb/s maximum step. Further increases occur no more than once
-  every five ticks while headroom remains stable.
-- Applied values are rounded down to 50 kb/s and clamped to the configured
-  minimum and maximum.
-- Adding or re-enabling a link freezes increases for 10 ticks while it warms
-  up, but does not suppress evidence-based reductions.
-
-Sender pressure provides a separate emergency path. The transport is stressed
-when the SRT send buffer reaches 250 ms, when SRT reports dropped bytes, or when
-the buffer is above 50 ms while retransmissions reach 20%. A newly detected
-stress event immediately caps the next target at 80% of the current bitrate,
-and growth is frozen while stress persists. Another emergency reduction is
-armed only after the buffer returns to at most 50 ms, drops are zero, and
-retransmissions are at most 10%; this prevents a backed-up sender from
-repeatedly cutting the bitrate on every tick.
-
-During initial measurement, automatic mode keeps the greater of the actual
-encoder bitrate and the configured start bitrate instead of reducing from an
-unmeasured value. If the SRT session or every enabled link is down, it switches
-to the minimum bitrate to keep the output alive without growing an unbounded
-queue.
-
-Turning automatic mode off does not stop the calculation: the dock continues
-to display the recommendation as telemetry, while the manual value is applied
-to the encoder. Live automatic/manual switching and live manual changes require
-an encoder that advertises OBS dynamic-bitrate support. The maximum can also be
+Turning automatic mode off stops bitrate probing and applies the manual value.
+Live automatic/manual switching and live manual changes require an encoder that
+advertises OBS dynamic-bitrate support. The automatic maximum can also be
 changed while live; lowering it caps a compatible encoder immediately, while
-raising it lets the normal stability rules govern subsequent growth.
+raising it lets the feedback loop probe upward normally.
 
 ## Architecture
 
