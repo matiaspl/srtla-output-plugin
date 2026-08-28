@@ -43,7 +43,7 @@ transport telemetry.
 
 ## Current status and limitations
 
-This is an early `0.1.0` development slice, not a production release. The
+This is an early `0.1.1` development slice, not a production release. The
 in-process SRT/SRTLA path, OBS output and dock, adaptive-bitrate controller,
 Windows adapter discovery, MPEG-TS muxer, reconnect path, and bounded engine
 ABI are implemented.

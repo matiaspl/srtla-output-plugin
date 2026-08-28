@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(obs-srtla-output VERSION 0.1.0 LANGUAGES C CXX)
+project(obs-srtla-output VERSION 0.1.1 LANGUAGES C CXX)
 
 if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "obs-srtla-output v1 supports Windows x64 only")

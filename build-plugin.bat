@@ -130,6 +130,6 @@ if not "%PACKAGE_RC%"=="0" (
 echo.
 echo Build completed successfully.
 echo DLL: "%BUILD%\plugin\obs-srtla-output.dll"
-if /I "%MODE%"=="/package" echo ZIP: "%BUILD%\obs-srtla-output-0.1.0-win64.zip"
-if /I "%MODE%"=="/all" echo ZIP: "%BUILD%\obs-srtla-output-0.1.0-win64.zip"
+if /I "%MODE%"=="/package" echo ZIP: "%BUILD%\obs-srtla-output-0.1.1-obs32-windows-x64.zip"
+if /I "%MODE%"=="/all" echo ZIP: "%BUILD%\obs-srtla-output-0.1.1-obs32-windows-x64.zip"
 exit /b 0
