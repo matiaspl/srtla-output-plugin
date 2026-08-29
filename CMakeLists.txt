@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(srtla-output VERSION 0.1.1 LANGUAGES C CXX)
+project(srtla-output VERSION 0.1.2 LANGUAGES C CXX)
 
 set(SRTLA_PLUGIN_NAME "${PROJECT_NAME}")
 set(SRTLA_PLUGIN_BUNDLE_ID "com.broadcast-ready.${SRTLA_PLUGIN_NAME}")

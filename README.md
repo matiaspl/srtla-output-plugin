@@ -44,10 +44,10 @@ transport telemetry.
 
 ## Current status and limitations
 
-This is an early `0.1.1` development slice, not a production release. The
-in-process SRT/SRTLA path, OBS output and dock, adaptive-bitrate controller,
-platform-native adapter discovery, MPEG-TS muxer, reconnect path, and bounded
-engine ABI are implemented.
+This is an early `0.1.2` development release, not a production-certified
+release. The in-process SRT/SRTLA path, OBS output and dock,
+adaptive-bitrate controller, platform-native adapter discovery, MPEG-TS muxer,
+reconnect path, and bounded engine ABI are implemented.
 
 Current operational limitations:
 
@@ -63,7 +63,7 @@ Current operational limitations:
   maintained production-receiver compatibility matrix or hardware/link soak
   coverage yet.
 - Packaging produces manual-install archives for Windows, macOS, and Linux.
-  Installer and upgrade QA remain to be completed.
+  Upgrade and release-package QA remain to be completed.
 
 ## TODO
 
@@ -79,7 +79,7 @@ Current operational limitations:
   encoder.
 - Run extended hardware-encoder, multi-link, impairment, reconnect, and soak
   testing.
-- Complete installer, upgrade, and release-package QA.
+- Complete upgrade and release-package QA.
 
 ## Install
 
@@ -326,7 +326,7 @@ matching the CMake project version publishes all packages and
 `SHA256SUMS.txt` as a GitHub Release.
 
 Pushing a plain semantic-version tag that matches the CMake project version
-(for example, `0.1.1`) runs the same checks. Only after both jobs pass, GitHub
+(for example, `0.1.2`) runs the same checks. Only after both jobs pass, GitHub
 Actions publishes the five platform/architecture archives and
 `SHA256SUMS.txt` as a GitHub Release. Re-running the tagged workflow safely
 replaces the release assets. See [TODO](#todo) for the network-namespace/netem
