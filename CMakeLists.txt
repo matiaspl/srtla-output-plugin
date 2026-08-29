@@ -171,6 +171,17 @@ if(OBS_SRTLA_BUILD_VENDOR_SRT)
   set(USE_ENCLIB "mbedtls" CACHE STRING "The crypto library that SRT uses" FORCE)
   set(ENABLE_AEAD_API_PREVIEW OFF CACHE BOOL "" FORCE)
   add_subdirectory(third_party/irlserver-srt EXCLUDE_FROM_ALL)
+  if(UNIX)
+    # The vendored SRT fork is linked into the shared OBS module.  Its CMake
+    # file only enables PIC automatically for shared SRT builds, while this
+    # project intentionally consumes the static target.
+    if(TARGET srt_virtual)
+      set_property(TARGET srt_virtual PROPERTY POSITION_INDEPENDENT_CODE ON)
+    endif()
+    if(TARGET srt_static)
+      set_property(TARGET srt_static PROPERTY POSITION_INDEPENDENT_CODE ON)
+    endif()
+  endif()
   if(MSVC AND TARGET srt_virtual)
     # The vendored SRT sources use C++ exceptions in the MSVC build.  OBS's
     # own dependency toolchain enables this flag globally; mirror it here so
@@ -314,17 +325,31 @@ else()
     list(APPEND _obs_srtla_ffmpeg_library_hints
          "$ENV{OBS_SRTLA_FFMPEG_ROOT}/lib")
   endif()
+  foreach(_obs_srtla_prefix IN LISTS CMAKE_PREFIX_PATH CMAKE_FRAMEWORK_PATH)
+    if(_obs_srtla_prefix)
+      list(APPEND _obs_srtla_ffmpeg_include_hints
+           "${_obs_srtla_prefix}/include")
+      list(APPEND _obs_srtla_ffmpeg_library_hints
+           "${_obs_srtla_prefix}/lib")
+    endif()
+  endforeach()
   find_path(OBS_SRTLA_FFMPEG_INCLUDE_DIR
             NAMES libavformat/avformat.h
             HINTS ${_obs_srtla_ffmpeg_include_hints})
   find_library(OBS_SRTLA_FFMPEG_AVFORMAT
-               NAMES avformat avformat-61 avformat-60 avformat-59
+               NAMES avformat avformat.so.61 avformat.so.60 avformat.so.59
+                     avformat.61 avformat.60 avformat.59
+                     avformat-61 avformat-60 avformat-59
                HINTS ${_obs_srtla_ffmpeg_library_hints})
   find_library(OBS_SRTLA_FFMPEG_AVCODEC
-               NAMES avcodec avcodec-61 avcodec-60 avcodec-59
+               NAMES avcodec avcodec.so.61 avcodec.so.60 avcodec.so.59
+                     avcodec.61 avcodec.60 avcodec.59
+                     avcodec-61 avcodec-60 avcodec-59
                HINTS ${_obs_srtla_ffmpeg_library_hints})
   find_library(OBS_SRTLA_FFMPEG_AVUTIL
-               NAMES avutil avutil-59 avutil-58 avutil-57
+               NAMES avutil avutil.so.59 avutil.so.58 avutil.so.57
+                     avutil.59 avutil.58 avutil.57
+                     avutil-59 avutil-58 avutil-57
                HINTS ${_obs_srtla_ffmpeg_library_hints})
   if(NOT OBS_SRTLA_FFMPEG_INCLUDE_DIR OR NOT OBS_SRTLA_FFMPEG_AVFORMAT OR
      NOT OBS_SRTLA_FFMPEG_AVCODEC OR NOT OBS_SRTLA_FFMPEG_AVUTIL)
