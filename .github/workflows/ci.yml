@@ -61,7 +61,7 @@ jobs:
             arch: x86_64
             artifact: obs-srtla-output-linux-x86_64
           - name: Linux arm64
-            os: ubuntu-24.04-arm
+            os: ubuntu-26.04-arm
             platform: linux
             arch: arm64
             artifact: obs-srtla-output-linux-arm64
@@ -84,11 +84,50 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Provision OBS 32 development environment
         id: obs-deps
+        if: matrix.platform != 'linux' || matrix.arch != 'arm64'
         uses: norihiro/obs-studio-devel-action@4d9bd843ff3f720432ccab26bf913f1435bc6618
         with:
           obs: ${{ env.OBS_VERSION }}
           qt: true
           arch: ${{ matrix.arch }}
+      - name: Provision OBS 32 development environment (Linux arm64)
+        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libmbedtls-dev \
+            libobs-dev \
+            libsimde-dev \
+            libswresample-dev \
+            libswscale-dev \
+            ninja-build \
+            obs-studio \
+            pkg-config \
+            qt6-base-dev
+          obs_version="$(dpkg-query -W -f='${Version}' obs-studio)"
+          case "$obs_version" in
+            32.*) ;;
+            *)
+              echo "Expected OBS 32 on the arm64 runner, found $obs_version" >&2
+              exit 1
+              ;;
+          esac
+      - name: Install mbedTLS development package (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libmbedtls-dev
       - name: Configure Release build
         if: matrix.platform == 'windows'
         shell: pwsh

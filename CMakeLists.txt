@@ -76,6 +76,20 @@ if(OBS_SRTLA_MBEDTLS_ROOT)
   set(_obs_srtla_mbedtls_search_policy NO_DEFAULT_PATH)
 endif()
 
+# The macOS OBS dependency bundle is exposed through CMAKE_FRAMEWORK_PATH,
+# while Linux package managers normally expose the same layout through
+# CMAKE_PREFIX_PATH.  Both variables can contain a complete OBS dependency
+# prefix, so include their conventional include/ and lib/ children in the
+# direct mbedTLS lookup below.
+foreach(_obs_srtla_prefix IN LISTS CMAKE_PREFIX_PATH CMAKE_FRAMEWORK_PATH)
+  if(_obs_srtla_prefix)
+    list(APPEND _obs_srtla_mbedtls_include_hints
+         "${_obs_srtla_prefix}/include")
+    list(APPEND _obs_srtla_mbedtls_library_hints
+         "${_obs_srtla_prefix}/lib")
+  endif()
+endforeach()
+
 # A complete OBS development prefix (as used by GitHub Actions) carries
 # mbedTLS alongside libobs, Qt, and FFmpeg.  When no explicit root is supplied,
 # allow normal CMake prefix discovery to find that copy.
