@@ -1358,7 +1358,7 @@ mod tests {
         let adapters = CString::new(r#"[{"id":1,"label":"old"},{"id":2,"label":"new"}]"#).unwrap();
         assert_eq!(srtla_engine_update_adapters(handle, adapters.as_ptr()), 0);
         let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
-        let mut out = vec![0i8; needed];
+        let mut out = vec![0 as c_char; needed];
         assert_eq!(
             srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len()),
             needed
@@ -1375,7 +1375,7 @@ mod tests {
         let stats = CString::new(r#"[{"id":1,"connected":true,"capacity_ready":true,"target_bps":4000000,"quality_percent":92,"rtt_ms":80,"loss_permille":3,"used_bps":1200000,"delivered_bps":1100000,"state":"Live"}]"#).unwrap();
         assert_eq!(srtla_engine_update_link_stats(handle, stats.as_ptr()), 0);
         let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
-        let mut out = vec![0i8; needed];
+        let mut out = vec![0 as c_char; needed];
         srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len());
         let json = unsafe { CStr::from_ptr(out.as_ptr()) }.to_string_lossy();
         assert!(json.contains("4000000"));
@@ -1464,7 +1464,7 @@ mod tests {
         assert_eq!(srtla_engine_apply_abr(handle, 20), 7_100_000);
 
         let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
-        let mut out = vec![0i8; needed];
+        let mut out = vec![0 as c_char; needed];
         srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len());
         let json = unsafe { CStr::from_ptr(out.as_ptr()) }.to_string_lossy();
         assert!(json.contains(r#""link_capacity_bps":10000000"#));
@@ -1494,7 +1494,7 @@ mod tests {
 
         fn stats(handle: *mut SrtlaEngineHandle) -> String {
             let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
-            let mut out = vec![0i8; needed];
+            let mut out = vec![0 as c_char; needed];
             assert_eq!(
                 srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len()),
                 needed

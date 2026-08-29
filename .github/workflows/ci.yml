@@ -197,7 +197,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cmake --build build --config Release --parallel
+          build_config=Release
+          if [[ '${{ matrix.platform }}' == 'macos' ]]; then
+            build_config=RelWithDebInfo
+          fi
+          cmake --build build --config "$build_config" --parallel
           if [[ '${{ matrix.platform }}' == 'macos' ]]; then
             plugin_path="$(find build -name 'obs-srtla-output.plugin' -type d -print -quit)"
           else
@@ -213,7 +217,12 @@ jobs:
       - name: Test Release (POSIX)
         if: matrix.platform != 'windows'
         shell: bash
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: |
+          build_config=Release
+          if [[ '${{ matrix.platform }}' == 'macos' ]]; then
+            build_config=RelWithDebInfo
+          fi
+          ctest --test-dir build -C "$build_config" --output-on-failure
       - name: Package Release
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -238,7 +247,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cpack -B package --config build/CPackConfig.cmake -C Release
+          build_config=Release
+          if [[ '${{ matrix.platform }}' == 'macos' ]]; then
+            build_config=RelWithDebInfo
+          fi
+          cpack -B package --config build/CPackConfig.cmake -C "$build_config"
           case '${{ matrix.platform }}' in
             macos)
               archive="$(find package -type f -name '*.zip' -print -quit)"
