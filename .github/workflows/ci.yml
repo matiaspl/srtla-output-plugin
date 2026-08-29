@@ -323,10 +323,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(artifacts/*.zip artifacts/*.tar.gz artifacts/SHA256SUMS.txt)
+          if (( ${#assets[@]} != 6 )); then
+            echo "Expected five archives and SHA256SUMS.txt, found ${#assets[@]} release assets" >&2
+            exit 1
+          fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" artifacts/* \
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
               --verify-tag \
               --generate-notes \
               --title "srtla-output $GITHUB_REF_NAME"
