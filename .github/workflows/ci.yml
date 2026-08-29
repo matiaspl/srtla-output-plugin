@@ -44,8 +44,37 @@ jobs:
         run: cargo test --manifest-path third_party/srtla_send/Cargo.toml --workspace
 
   native-plugin:
-    name: OBS 32 plugin (Windows x64)
-    runs-on: windows-2022
+    name: OBS 32 plugin (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2022
+            platform: windows
+            arch: x86_64
+            artifact: obs-srtla-output-windows-x64
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            artifact: obs-srtla-output-linux-x86_64
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            artifact: obs-srtla-output-linux-arm64
+          - name: macOS x86_64
+            os: macos-15-intel
+            platform: macos
+            arch: x86_64
+            artifact: obs-srtla-output-macos-x86_64
+          - name: macOS arm64
+            os: macos-15
+            platform: macos
+            arch: arm64
+            artifact: obs-srtla-output-macos-arm64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,8 +88,9 @@ jobs:
         with:
           obs: ${{ env.OBS_VERSION }}
           qt: true
-          arch: x86_64
+          arch: ${{ matrix.arch }}
       - name: Configure Release build
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $cmakeArgs = @(
@@ -76,7 +106,37 @@ jobs:
             ' ', [System.StringSplitOptions]::RemoveEmptyEntries)
           cmake @cmakeArgs @obsArgs
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+      - name: Configure Release build (POSIX)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake_args=(
+            -S .
+            -B build
+            -DOBS_SRTLA_BUILD_TESTS=ON
+            -DOBS_SRTLA_BUILD_VENDOR_SRT=ON
+            -DOBS_SRTLA_REQUIRE_PLUGIN=ON
+          )
+          if [[ '${{ matrix.platform }}' == 'macos' ]]; then
+            deployment_target='${{ steps.obs-deps.outputs.MACOSX_DEPLOYMENT_TARGET }}'
+            if [[ -z "$deployment_target" ]]; then
+              deployment_target=12.0
+            fi
+            cmake_args+=(
+              -G Xcode
+              -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="$deployment_target"
+            )
+          else
+            cmake_args+=(
+              -G Ninja
+              -DCMAKE_BUILD_TYPE=Release
+            )
+          fi
+          cmake "${cmake_args[@]}" ${{ steps.obs-deps.outputs.PLUGIN_CMAKE_OPTIONS }}
       - name: Build Release
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           cmake --build build --config Release --parallel
@@ -85,12 +145,30 @@ jobs:
             Select-Object -First 1
           if (!$plugin) { throw 'The build did not produce obs-srtla-output.dll' }
           Write-Host "Built $($plugin.FullName)"
+      - name: Build Release (POSIX)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build --config Release --parallel
+          if [[ '${{ matrix.platform }}' == 'macos' ]]; then
+            plugin_path="$(find build -name 'obs-srtla-output.plugin' -type d -print -quit)"
+          else
+            plugin_path="$(find build -name 'obs-srtla-output.so' -type f -print -quit)"
+          fi
+          test -n "$plugin_path"
       - name: Test Release
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           ctest --test-dir build -C Release --output-on-failure
           if ($LASTEXITCODE -ne 0) { throw 'Release tests failed' }
+      - name: Test Release (POSIX)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure
       - name: Package Release
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           cpack -B package --config build\CPackConfig.cmake -C Release
@@ -99,13 +177,39 @@ jobs:
           if ($archives.Count -ne 1) {
             throw "Expected one release ZIP, found $($archives.Count)"
           }
+          $contents = @(tar -tf $archives[0].FullName)
+          if (-not ($contents | Where-Object { $_ -match '/obs-plugins/64bit/obs-srtla-output\.dll$' })) {
+            throw 'The Windows package is missing the plugin DLL'
+          }
+          if (-not ($contents | Where-Object { $_ -match '/data/obs-plugins/obs-srtla-output/locale/en-US\.ini$' })) {
+            throw 'The Windows package is missing locale data'
+          }
           Get-FileHash -Algorithm SHA256 -LiteralPath $archives[0].FullName |
             Format-List
-      - name: Upload Windows package
+      - name: Package Release (POSIX)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpack -B package --config build/CPackConfig.cmake -C Release
+          case '${{ matrix.platform }}' in
+            macos)
+              archive="$(find package -type f -name '*.zip' -print -quit)"
+              test -n "$archive"
+              unzip -l "$archive" | grep 'obs-srtla-output.plugin/Contents/Resources/locale/en-US.ini' > /dev/null
+              ;;
+            linux)
+              archive="$(find package -type f -name '*.tar.gz' -print -quit)"
+              test -n "$archive"
+              tar -tzf "$archive" | grep '/obs-srtla-output.so$' > /dev/null
+              tar -tzf "$archive" | grep '/obs-srtla-output/locale/en-US.ini$' > /dev/null
+              ;;
+          esac
+      - name: Upload package
         uses: actions/upload-artifact@v7
         with:
-          name: obs-srtla-output-windows-x64
-          path: package/*.zip
+          name: ${{ matrix.artifact }}
+          path: package/*
           if-no-files-found: error
           retention-days: 14
 
@@ -132,16 +236,26 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match project version $project_version" >&2
             exit 1
           fi
-      - name: Download Windows package
+      - name: Download all native packages
         uses: actions/download-artifact@v8
         with:
-          name: obs-srtla-output-windows-x64
+          pattern: obs-srtla-output-*
           path: artifacts
+          merge-multiple: true
       - name: Generate checksums
         shell: bash
         run: |
+          set -euo pipefail
           cd artifacts
-          sha256sum -- *.zip > SHA256SUMS.txt
+          shopt -s nullglob
+          archives=(./*.zip ./*.tar.gz)
+          if (( ${#archives[@]} != 5 )); then
+            echo "Expected five native archives, found ${#archives[@]}" >&2
+            exit 1
+          fi
+          find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 |
+            sort -z |
+            xargs -0 sha256sum > SHA256SUMS.txt
       - name: Create or update release
         shell: bash
         env:

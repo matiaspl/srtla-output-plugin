@@ -1,13 +1,34 @@
 cmake_minimum_required(VERSION 3.28)
 project(obs-srtla-output VERSION 0.1.1 LANGUAGES C CXX)
 
-if(WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-  message(FATAL_ERROR "obs-srtla-output v1 supports Windows x64 only")
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "obs-srtla-output requires a 64-bit target")
 endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include(GNUInstallDirs)
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING
+      "Minimum macOS deployment target")
+endif()
+if(WIN32)
+  set(_obs_srtla_plugin_dir_default "obs-plugins/64bit")
+  set(_obs_srtla_data_dir_default "data/obs-plugins")
+elseif(APPLE)
+  # macOS plugins are installed as bundles. These cache variables remain
+  # available for consumers that include the project from a larger build, but
+  # the plugin subdirectory owns the bundle's install layout.
+  set(_obs_srtla_plugin_dir_default ".")
+  set(_obs_srtla_data_dir_default ".")
+elseif(UNIX)
+  set(_obs_srtla_plugin_dir_default "${CMAKE_INSTALL_LIBDIR}/obs-plugins")
+  set(_obs_srtla_data_dir_default "${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins")
+else()
+  message(FATAL_ERROR "Unsupported host platform")
+endif()
 
 option(OBS_SRTLA_BUILD_TESTS "Build native unit tests" ON)
 option(OBS_SRTLA_BUILD_VENDOR_SRT "Build the vendored libsrt fork" ON)
@@ -15,8 +36,11 @@ option(OBS_SRTLA_REQUIRE_PLUGIN
        "Fail configuration when the OBS plugin target cannot be built" OFF)
 option(OBS_SRTLA_USE_OBS_RUNTIME_DEPS
        "Use Qt/FFmpeg/libobs DLLs supplied by the installed OBS runtime" ON)
-set(OBS_SRTLA_OBS_PLUGIN_DIR "obs-plugins/64bit" CACHE PATH "OBS plugin install directory")
-set(OBS_SRTLA_OBS_DATA_DIR "data/obs-plugins" CACHE PATH "OBS plugin data directory")
+set(OBS_SRTLA_OBS_PLUGIN_DIR "${_obs_srtla_plugin_dir_default}" CACHE PATH
+    "OBS plugin install directory")
+set(OBS_SRTLA_OBS_DATA_DIR "${_obs_srtla_data_dir_default}" CACHE PATH
+    "OBS plugin data directory")
+set(OBS_SRTLA_USE_OBS_COMPAT_CONFIG OFF)
 set(_ffmpeg_root_default "")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev/include/libavformat/avformat.h")
   set(_ffmpeg_root_default "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev")
@@ -143,20 +167,56 @@ endif()
 
 set(CPACK_PACKAGE_NAME "obs-srtla-output")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_GENERATOR "ZIP")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
 if(WIN32)
+  set(CPACK_GENERATOR "ZIP")
   set(CPACK_SYSTEM_NAME "obs32-windows-x64")
+elseif(APPLE)
+  set(CPACK_GENERATOR "ZIP")
+  set(_obs_srtla_package_arch "${CMAKE_OSX_ARCHITECTURES}")
+  if(NOT _obs_srtla_package_arch)
+    set(_obs_srtla_package_arch "${CMAKE_SYSTEM_PROCESSOR}")
+  endif()
+  string(REPLACE ";" "-" _obs_srtla_package_arch "${_obs_srtla_package_arch}")
+  string(TOLOWER "${_obs_srtla_package_arch}" _obs_srtla_package_arch)
+  if(_obs_srtla_package_arch STREQUAL "amd64")
+    set(_obs_srtla_package_arch "x86_64")
+  elseif(_obs_srtla_package_arch STREQUAL "aarch64")
+    set(_obs_srtla_package_arch "arm64")
+  endif()
+  set(CPACK_SYSTEM_NAME "macos-${_obs_srtla_package_arch}")
+  set(CPACK_PACKAGE_FILE_NAME
+      "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_SYSTEM_NAME}")
+elseif(UNIX)
+  set(CPACK_GENERATOR "TGZ")
+  set(_obs_srtla_package_arch "${CMAKE_SYSTEM_PROCESSOR}")
+  string(TOLOWER "${_obs_srtla_package_arch}" _obs_srtla_package_arch)
+  if(_obs_srtla_package_arch STREQUAL "amd64")
+    set(_obs_srtla_package_arch "x86_64")
+  elseif(_obs_srtla_package_arch STREQUAL "aarch64")
+    set(_obs_srtla_package_arch "arm64")
+  endif()
+  set(CPACK_SYSTEM_NAME "linux-${_obs_srtla_package_arch}")
+  set(CPACK_PACKAGE_FILE_NAME
+      "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_SYSTEM_NAME}")
+else()
+  message(FATAL_ERROR "Unsupported packaging platform")
 endif()
 include(CPack)
 
+if(APPLE)
+  set(_obs_srtla_metadata_dir "obs-srtla-output.plugin/Contents/Resources/obs-srtla-output")
+else()
+  set(_obs_srtla_metadata_dir "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output")
+endif()
+
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
-        DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output")
+        DESTINATION "${_obs_srtla_metadata_dir}")
 install(FILES
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/VENDORING.md"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/irlserver-srt/LICENSE"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/srtla_send/LICENSE"
-        DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output/licenses")
+        DESTINATION "${_obs_srtla_metadata_dir}/licenses")
 
 if(NOT TARGET OBS::libobs)
   find_package(libobs CONFIG QUIET)
@@ -205,6 +265,7 @@ if(NOT TARGET OBS::libobs AND WIN32 AND
     set_property(TARGET OBS::frontend-api PROPERTY IMPORTED_LOCATION
                  "${OBS_SRTLA_OBS_RUNTIME_DIR}/obs-frontend-api.dll")
   endif()
+  set(OBS_SRTLA_USE_OBS_COMPAT_CONFIG ON)
   message(STATUS "Using OBS runtime DLLs with generated import libraries from ${OBS_SRTLA_OBS_IMPORT_LIB_DIR}")
 endif()
 
@@ -279,6 +340,7 @@ if(OBS_SRTLA_BUILD_TESTS)
     target_include_directories(srt_transport_abi_test PRIVATE
       third_party/irlserver-srt/srtcore
       third_party/irlserver-srt/common
+      "${OBS_SRTLA_MBEDTLS_INCLUDE_DIR}"
       "${CMAKE_CURRENT_BINARY_DIR}/third_party/irlserver-srt")
     target_link_libraries(srt_transport_abi_test PRIVATE srt_static Threads::Threads)
     if(OBS_SRTLA_MBEDTLS_LIBRARIES)
@@ -300,10 +362,8 @@ if(OBS_SRTLA_BUILD_TESTS)
           "PATH=path_list_prepend:$<TARGET_FILE_DIR:Qt6::Core>")
     endif()
   endif()
-  add_executable(srtla_secret_store_test tests/secret_store_test.cpp plugin/secret-store.cpp)
-  target_include_directories(srtla_secret_store_test PRIVATE plugin)
-  if(WIN32)
-    target_link_libraries(srtla_secret_store_test PRIVATE crypt32)
-  endif()
-  add_test(NAME srtla_secret_store_test COMMAND srtla_secret_store_test)
+  add_executable(srtla_passphrase_store_test
+    tests/passphrase_store_test.cpp plugin/passphrase-store.cpp)
+  target_include_directories(srtla_passphrase_store_test PRIVATE plugin)
+  add_test(NAME srtla_passphrase_store_test COMMAND srtla_passphrase_store_test)
 endif()

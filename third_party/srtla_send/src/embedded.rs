@@ -25,7 +25,11 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
 
 use crate::config::DynamicConfig;
-use crate::net::{SourceIpBinder, UplinkBinder};
+#[cfg(target_vendor = "apple")]
+use crate::net::AppleInterfaceBinder;
+#[cfg(not(target_vendor = "apple"))]
+use crate::net::SourceIpBinder;
+use crate::net::UplinkBinder;
 use crate::sender::{
     ConnIoMap, ReaderHandle, RehomeGate, SequenceTracker, apply_connection_changes,
     create_connections_from_ips, create_uplink_channel, drain_packet_queue, flush_all_batches,
@@ -236,6 +240,9 @@ async fn run_embedded(
     mut control_rx: mpsc::Receiver<Control>,
     stats: Arc<Mutex<String>>,
 ) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    let binder: Arc<dyn UplinkBinder> = Arc::new(AppleInterfaceBinder::new());
+    #[cfg(not(target_vendor = "apple"))]
     let binder: Arc<dyn UplinkBinder> = Arc::new(SourceIpBinder);
     let mut configured_links = config.links;
     let mut conn_io = ConnIoMap::new();

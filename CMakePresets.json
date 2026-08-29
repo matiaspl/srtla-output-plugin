@@ -1,0 +1,140 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "common",
+      "hidden": true,
+      "cacheVariables": {
+        "OBS_SRTLA_BUILD_TESTS": true,
+        "OBS_SRTLA_BUILD_VENDOR_SRT": true,
+        "OBS_SRTLA_REQUIRE_PLUGIN": true
+      }
+    },
+    {
+      "name": "windows-x86_64",
+      "inherits": "common",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/build/windows-x86_64",
+      "architecture": "x64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-x86_64",
+      "inherits": "common",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-x86_64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": {
+          "type": "STRING",
+          "value": "Release"
+        },
+        "CMAKE_INSTALL_LIBDIR": {
+          "type": "STRING",
+          "value": "lib/x86_64-linux-gnu"
+        }
+      }
+    },
+    {
+      "name": "linux-arm64",
+      "inherits": "common",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-arm64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": {
+          "type": "STRING",
+          "value": "Release"
+        },
+        "CMAKE_INSTALL_LIBDIR": {
+          "type": "STRING",
+          "value": "lib/aarch64-linux-gnu"
+        }
+      }
+    },
+    {
+      "name": "macos-x86_64",
+      "inherits": "common",
+      "generator": "Xcode",
+      "binaryDir": "${sourceDir}/build/macos-x86_64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": {
+          "type": "STRING",
+          "value": "x86_64"
+        },
+        "CMAKE_OSX_DEPLOYMENT_TARGET": {
+          "type": "STRING",
+          "value": "12.0"
+        }
+      }
+    },
+    {
+      "name": "macos-arm64",
+      "inherits": "common",
+      "generator": "Xcode",
+      "binaryDir": "${sourceDir}/build/macos-arm64",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": {
+          "type": "STRING",
+          "value": "arm64"
+        },
+        "CMAKE_OSX_DEPLOYMENT_TARGET": {
+          "type": "STRING",
+          "value": "12.0"
+        }
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x86_64",
+      "configurePreset": "windows-x86_64",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-x86_64",
+      "configurePreset": "linux-x86_64"
+    },
+    {
+      "name": "linux-arm64",
+      "configurePreset": "linux-arm64"
+    },
+    {
+      "name": "macos-x86_64",
+      "configurePreset": "macos-x86_64",
+      "configuration": "Release"
+    },
+    {
+      "name": "macos-arm64",
+      "configurePreset": "macos-arm64",
+      "configuration": "Release"
+    }
+  ]
+}

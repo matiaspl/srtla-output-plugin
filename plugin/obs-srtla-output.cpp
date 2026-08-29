@@ -9,7 +9,7 @@
 #include "mpegts-avformat-sink.hpp"
 #include "network-monitor.hpp"
 #include "output-capture-lifecycle.hpp"
-#include "secret-store.hpp"
+#include "passphrase-store.hpp"
 #include "srt-session.hpp"
 
 #include <atomic>
@@ -259,15 +259,54 @@ static std::string enumerate_links_json(const std::unordered_set<std::string> *e
 	return "[" + links + "]";
 }
 
+// Passphrases are confidential configuration, not an OS-protected secret.
+// Keep the new setting explicit and plain.  A non-empty legacy DPAPI value is
+// deliberately rejected rather than guessed at or silently discarded.
+static bool normalize_passphrase_setting(obs_data_t *settings)
+{
+	if (!settings)
+		return false;
+	const char *plain = obs_data_get_string(settings, "passphrase");
+	const char *stored = obs_data_get_string(settings, "passphrase_secret");
+	if (plain && *plain) {
+		const auto stored_passphrase = store_srtla_passphrase(plain);
+		obs_data_set_string(settings, "passphrase_secret", stored_passphrase.c_str());
+		obs_data_set_string(settings, "passphrase", "");
+		obs_data_set_string(settings, "passphrase_dpapi", "");
+		return false;
+	}
+	if (stored && *stored) {
+		obs_data_set_string(settings, "passphrase_dpapi", "");
+		return false;
+	}
+	const char *legacy = obs_data_get_string(settings, "passphrase_dpapi");
+	return legacy && *legacy;
+}
+
+static std::string passphrase_from_settings(obs_data_t *settings, bool *legacy_error = nullptr)
+{
+	if (legacy_error)
+		*legacy_error = false;
+	if (!settings)
+		return {};
+	const char *stored = obs_data_get_string(settings, "passphrase_secret");
+	if (stored && *stored)
+		return load_srtla_passphrase(stored);
+	const char *plain = obs_data_get_string(settings, "passphrase");
+	if (plain && *plain)
+		return load_srtla_passphrase(plain);
+	const char *legacy = obs_data_get_string(settings, "passphrase_dpapi");
+	if (legacy_error)
+		*legacy_error = legacy && *legacy;
+	return {};
+}
+
 static SrtlaEngineHandle *create_engine_from_settings(obs_data_t *settings)
 {
 	const auto endpoint = parse_endpoint(settings ? obs_data_get_string(settings, "url") : nullptr);
 	const auto enabled_links = parse_enabled_links(settings ? obs_data_get_string(settings, "enabled_links") : nullptr);
 	const std::string links = enumerate_links_json(&enabled_links);
-	const char *stored_secret = settings ? obs_data_get_string(settings, "passphrase_dpapi") : nullptr;
-	const char *plain_secret = settings ? obs_data_get_string(settings, "passphrase") : nullptr;
-	const std::string passphrase = stored_secret && *stored_secret ? unprotect_srtla_secret(stored_secret) :
-		(plain_secret ? std::string(plain_secret) : std::string());
+	const std::string passphrase = passphrase_from_settings(settings);
 	const char *stream_id = settings ? obs_data_get_string(settings, "stream_id") : nullptr;
 	const auto latency = settings ? obs_data_get_int(settings, "latency_ms") : 2000;
 	const auto pbkeylen = settings ? obs_data_get_int(settings, "pbkeylen") : 16;
@@ -298,20 +337,7 @@ static const char *srtla_output_name(void *)
 static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 {
 	split_url_query_into_settings(settings);
-	bool secret_error = false;
-	if (settings) {
-		const char *plain = obs_data_get_string(settings, "passphrase");
-		if (plain && *plain) {
-			const auto protected_secret = protect_srtla_secret(plain);
-			if (!protected_secret.empty()) {
-				obs_data_set_string(settings, "passphrase_dpapi", protected_secret.c_str());
-				obs_data_set_string(settings, "passphrase", "");
-			} else {
-				secret_error = true;
-				obs_data_set_string(settings, "passphrase", "");
-			}
-		}
-	}
+	bool secret_error = normalize_passphrase_setting(settings);
 	auto *data = new SrtlaOutput();
 	data->output = output;
 	data->hevc = settings && obs_data_get_string(settings, "video_codec") &&
@@ -331,14 +357,9 @@ static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 	data->receiver_host = endpoint.first;
 	data->receiver_port = endpoint.second;
 	data->stream_id = settings && obs_data_get_string(settings, "stream_id") ? obs_data_get_string(settings, "stream_id") : "";
-	const char *stored_secret = settings ? obs_data_get_string(settings, "passphrase_dpapi") : nullptr;
-	const char *plain_secret = settings ? obs_data_get_string(settings, "passphrase") : nullptr;
-	if (stored_secret && *stored_secret) {
-		data->passphrase = unprotect_srtla_secret(stored_secret);
-		secret_error = secret_error || data->passphrase.empty();
-	} else {
-		data->passphrase = plain_secret ? plain_secret : "";
-	}
+	bool legacy_secret_error = false;
+	data->passphrase = passphrase_from_settings(settings, &legacy_secret_error);
+	secret_error = secret_error || legacy_secret_error;
 	data->credential_error = secret_error;
 	data->latency_ms = settings ? std::clamp(static_cast<int>(obs_data_get_int(settings, "latency_ms")), 120, 60000) : 2000;
 	data->pbkeylen = settings ? static_cast<int>(obs_data_get_int(settings, "pbkeylen")) : 16;
@@ -359,17 +380,7 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	data->credential_error = false;
 	if (settings) {
 		split_url_query_into_settings(settings);
-		const char *plain = obs_data_get_string(settings, "passphrase");
-		if (plain && *plain) {
-			const auto protected_secret = protect_srtla_secret(plain);
-			if (!protected_secret.empty()) {
-				obs_data_set_string(settings, "passphrase_dpapi", protected_secret.c_str());
-				obs_data_set_string(settings, "passphrase", "");
-			} else {
-				data->credential_error = true;
-				obs_data_set_string(settings, "passphrase", "");
-			}
-		}
+		data->credential_error = normalize_passphrase_setting(settings);
 	}
 	if (data->engine)
 		srtla_engine_destroy(data->engine);
@@ -391,14 +402,9 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	data->receiver_host = endpoint.first;
 	data->receiver_port = endpoint.second;
 	data->stream_id = settings && obs_data_get_string(settings, "stream_id") ? obs_data_get_string(settings, "stream_id") : "";
-	const char *stored_secret = settings ? obs_data_get_string(settings, "passphrase_dpapi") : nullptr;
-	const char *plain_secret = settings ? obs_data_get_string(settings, "passphrase") : nullptr;
-	if (stored_secret && *stored_secret) {
-		data->passphrase = unprotect_srtla_secret(stored_secret);
-		data->credential_error = data->credential_error || data->passphrase.empty();
-	} else {
-		data->passphrase = plain_secret ? plain_secret : "";
-	}
+	bool legacy_secret_error = false;
+	data->passphrase = passphrase_from_settings(settings, &legacy_secret_error);
+	data->credential_error = data->credential_error || legacy_secret_error;
 	data->latency_ms = settings ? std::clamp(static_cast<int>(obs_data_get_int(settings, "latency_ms")), 120, 60000) : 2000;
 	data->pbkeylen = settings ? static_cast<int>(obs_data_get_int(settings, "pbkeylen")) : 16;
 	if (data->pbkeylen != 16 && data->pbkeylen != 24 && data->pbkeylen != 32) data->pbkeylen = 16;
@@ -801,7 +807,7 @@ static bool srtla_output_start(void *opaque)
 		return false;
 	}
 	if (data->credential_error) {
-		obs_output_set_last_error(data->output, "SRT passphrase could not be protected or decrypted");
+		obs_output_set_last_error(data->output, "SRT passphrase could not be loaded; enter it again");
 		return false;
 	}
 	std::string capture_error;

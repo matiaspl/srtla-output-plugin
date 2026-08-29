@@ -36,6 +36,7 @@ private:
 	QLineEdit *url_ = nullptr;
 	QLineEdit *streamId_ = nullptr;
 	QLineEdit *passphrase_ = nullptr;
+	QLabel *secret_warning_ = nullptr;
 	QComboBox *encoderSource_ = nullptr;
 	QComboBox *customVideoEncoder_ = nullptr;
 	QComboBox *customAudioEncoder_ = nullptr;

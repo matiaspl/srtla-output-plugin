@@ -77,7 +77,9 @@ In the SRTLA dock set:
 
 - **SRTLA URL:** `srtla://127.0.0.1:5000`
 - **Stream ID:** `obs-local-smoke-test`
-- **Passphrase:** leave empty for an explicit unencrypted local test, or use 10–79 UTF-8 bytes and let the plugin protect it with Windows DPAPI.
+- **Passphrase:** leave empty for an explicit unauthenticated local test, or
+  use 10–79 UTF-8 bytes. The plugin stores this confidential configuration
+  plainly in the OBS profile and never writes it to logs or the URL.
 - Select an available video/audio encoder and at least one operational network link.
 
 The URL is endpoint-only. Do not put `streamid`, `passphrase`, or `password` query parameters in it. Legacy query parameters are accepted once and migrated to separate profile fields.

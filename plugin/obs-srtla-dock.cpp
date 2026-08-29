@@ -2,7 +2,7 @@
 #include "stats-json.hpp"
 
 #include "network-monitor.hpp"
-#include "secret-store.hpp"
+#include "passphrase-store.hpp"
 
 #include <obs.h>
 #include <obs-encoder.h>
@@ -214,6 +214,9 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	streamId_ = new QLineEdit(this);
 	passphrase_ = new QLineEdit(this);
 	passphrase_->setEchoMode(QLineEdit::Password);
+	secret_warning_ = new QLabel(tr("Passphrase is stored unencrypted in the OBS profile."), this);
+	secret_warning_->setWordWrap(true);
+	secret_warning_->setStyleSheet(QStringLiteral("color: #b36b00;"));
 	encoderSource_ = new QComboBox(this);
 	encoderSource_->addItem(tr("Streaming"), QStringLiteral("streaming"));
 	encoderSource_->addItem(tr("Recording"), QStringLiteral("recording"));
@@ -240,10 +243,17 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 		tr("Video") + QStringLiteral(": -- | ") + tr("Target") +
 		QStringLiteral(": -- | ") + tr("Active links") + QStringLiteral(": 0"), this);
 	loadProfile();
+	connect(passphrase_, &QLineEdit::textChanged, this, [this] {
+		if (!secret_error_)
+			return;
+		secret_error_ = false;
+		secret_warning_->setText(tr("Passphrase is stored unencrypted in the OBS profile."));
+	});
 	controls->addRow(tr("State"), state_);
 	controls->addRow(tr("SRTLA URL"), url_);
 	controls->addRow(tr("Stream ID"), streamId_);
 	controls->addRow(tr("Passphrase"), passphrase_);
+	controls->addRow(QString(), secret_warning_);
 	controls->addRow(tr("Encoder"), encoderSource_);
 	controls->addRow(tr("Custom video encoder"), customVideoEncoder_);
 	controls->addRow(tr("Custom audio encoder"), customAudioEncoder_);
@@ -364,13 +374,15 @@ void SrtlaDock::loadProfile()
 		stream_id = legacy.stream_id;
 	streamId_->setText(stream_id);
 
-	const auto protected_secret = profile_string("PassphraseDpapi");
-	QString passphrase;
-	if (!protected_secret.isEmpty()) {
-		passphrase = QString::fromStdString(unprotect_srtla_secret(protected_secret.toStdString()));
-		if (passphrase.isEmpty())
-			secret_error_ = true;
-	} else if (legacy.has_passphrase) {
+	const auto stored_secret = profile_string("PassphraseSecret");
+	const auto legacy_dpapi = profile_string("PassphraseDpapi");
+	QString passphrase = QString::fromStdString(load_srtla_passphrase(stored_secret.toStdString()));
+	if (!legacy_dpapi.isEmpty() && stored_secret.isEmpty()) {
+		// DPAPI was intentionally removed. Do not attempt to decrypt a value
+		// whose availability and semantics depend on another Windows account.
+		secret_error_ = true;
+		secret_warning_->setText(tr("This profile contains an unsupported encrypted passphrase. Enter it again."));
+	} else if (passphrase.isEmpty() && legacy.has_passphrase) {
 		passphrase = legacy.passphrase;
 	}
 	passphrase_->setText(passphrase);
@@ -396,10 +408,9 @@ void SrtlaDock::loadProfile()
 		start = end + 1;
 	}
 	if (legacy.endpoint != raw_url) {
-		// Remove legacy query/fragment material even when a previously protected
-		// secret exists.  If that secret cannot be opened, preserve it and keep
-		// startup blocked rather than silently replacing it with plaintext or an
-		// empty encrypted value.
+		// Remove legacy query/fragment material even when an old unsupported
+		// encrypted passphrase exists. If the passphrase needs re-entry, preserve
+		// that state and only clean the URL.
 		if (secret_error_) {
 			if (auto *config = profile_config()) {
 				config_set_string(config, config_section, "Url", legacy.endpoint.toUtf8().constData());
@@ -423,17 +434,15 @@ bool SrtlaDock::saveProfile()
 	if (parsed.has_pbkeylen)
 		pbkeylen_ = parsed.pbkeylen;
 	const auto passphrase = passphrase_->text().toUtf8().toStdString();
-	std::string protected_secret;
 	if (!passphrase.empty()) {
 		if (passphrase.size() < 10 || passphrase.size() > 79)
-			return false;
-		protected_secret = protect_srtla_secret(passphrase);
-		if (protected_secret.empty())
 			return false;
 	}
 	config_set_string(config, config_section, "Url", endpoint.toUtf8().constData());
 	config_set_string(config, config_section, "StreamId", streamId_->text().toUtf8().constData());
-	config_set_string(config, config_section, "PassphraseDpapi", protected_secret.c_str());
+	const auto stored_passphrase = store_srtla_passphrase(passphrase);
+	config_set_string(config, config_section, "PassphraseSecret", stored_passphrase.c_str());
+	config_set_string(config, config_section, "PassphraseDpapi", "");
 	config_set_int(config, config_section, "LatencyMs", latency_ms_);
 	config_set_int(config, config_section, "Pbkeylen", pbkeylen_);
 	config_set_string(config, config_section, "EncoderSource", encoderSource_->currentData().toString().toUtf8().constData());
@@ -444,6 +453,7 @@ bool SrtlaDock::saveProfile()
 	config_set_int(config, config_section, "MaxBitrate", maxBitrate_->value());
 	save_profile_config();
 	secret_error_ = false;
+	secret_warning_->setText(tr("Passphrase is stored unencrypted in the OBS profile."));
 	return true;
 }
 
@@ -610,14 +620,19 @@ void SrtlaDock::toggleOutput()
 		return;
 	}
 
-	if (secret_error_ || !saveProfile()) {
-		state_->setText(tr("Error: passphrase could not be protected"));
+	if (secret_error_) {
+		state_->setText(tr("Error: passphrase could not be loaded; enter it again"));
+		return;
+	}
+	if (!saveProfile()) {
+		state_->setText(tr("Error: passphrase could not be saved"));
 		return;
 	}
 	obs_data_set_string(settings_, "url", parse_legacy_url(url_->text()).endpoint.toUtf8().constData());
 	obs_data_set_string(settings_, "stream_id", streamId_->text().toUtf8().constData());
 	obs_data_set_string(settings_, "passphrase_dpapi", "");
-	obs_data_set_string(settings_, "passphrase", passphrase_->text().toUtf8().constData());
+	obs_data_set_string(settings_, "passphrase_secret", passphrase_->text().toUtf8().constData());
+	obs_data_set_string(settings_, "passphrase", "");
 	std::string enabled_links;
 	for (const auto &[id, enabled] : selected_) {
 		if (enabled) {

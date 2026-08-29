@@ -1,6 +1,6 @@
 # OBS SRTLA Output
 
-Native SRTLA output for OBS Studio on Windows x64.
+Native SRTLA output for OBS Studio on Windows x64, macOS, and Linux.
 
 The plugin muxes OBS-encoded audio and video as MPEG-TS, feeds the SRT packets
 directly into an embedded SRTLA sender, and distributes the resulting datagrams
@@ -28,8 +28,9 @@ does **not** ship a production receiver. For a local Windows smoke test, see
   offered and ACK-delivered traffic, current/target video bitrate, raw SRT
   bandwidth and per-link CC telemetry, plus per-link state, NAK-recency score,
   RTT, retransmission-request rate, congestion, and scheduler diagnostics.
-- SRT stream ID and optional passphrase authentication. Saved passphrases are
-  protected with Windows DPAPI instead of being stored in plaintext.
+- SRT stream ID and optional passphrase authentication. Passphrases are
+  confidential configuration and are stored plainly in the OBS profile; they
+  are never written to logs or back into the SRTLA URL.
 - Automatic SRT reconnection and a bounded, keyframe-aware media queue. After a
   reconnect, stale media is discarded and MPEG-TS resumes with fresh tables at
   the next keyframe.
@@ -45,8 +46,8 @@ transport telemetry.
 
 This is an early `0.1.1` development slice, not a production release. The
 in-process SRT/SRTLA path, OBS output and dock, adaptive-bitrate controller,
-Windows adapter discovery, MPEG-TS muxer, reconnect path, and bounded engine
-ABI are implemented.
+platform-native adapter discovery, MPEG-TS muxer, reconnect path, and bounded
+engine ABI are implemented.
 
 Current operational limitations:
 
@@ -56,13 +57,13 @@ Current operational limitations:
 - The Custom encoder path creates a dedicated encoder from that encoder's
   defaults and applies the selected bitrate. It does not clone all settings
   from the streaming or recording encoder.
-- Network adapters are refreshed by polling once per second; native Windows
-  route-change notifications are not implemented yet.
+- Network adapters are refreshed by polling once per second; native route-
+  change notifications are not implemented yet.
 - Receiver interoperability has a local Windows relay smoke-test path, but no
   maintained production-receiver compatibility matrix or hardware/link soak
   coverage yet.
-- Packaging produces a manual-install ZIP. Installer and upgrade QA remain to
-  be completed.
+- Packaging produces manual-install archives for Windows, macOS, and Linux.
+  Installer and upgrade QA remain to be completed.
 
 ## TODO
 
@@ -82,14 +83,35 @@ Current operational limitations:
 
 ## Install
 
-There is no installer yet. After creating the ZIP described in [Build](#build):
+There is no installer yet. Close OBS before copying a package.
 
-1. Close OBS.
-2. Open the generated ZIP and copy the contents of its top-level directory into
-   the OBS installation directory, preserving the `obs-plugins/64bit` and
-   `data/obs-plugins` paths. The default installation directory is
-   `C:\Program Files\obs-studio`.
-3. Start OBS and open **Docks > SRTLA Output**.
+### Windows
+
+Extract the ZIP into the OBS installation directory, preserving the
+`obs-plugins/64bit` and `data/obs-plugins` paths. The default directory is
+`C:\Program Files\obs-studio`.
+
+### macOS
+
+Copy `obs-srtla-output.plugin` into:
+
+```text
+~/Library/Application Support/obs-studio/plugins/
+```
+
+The release ZIPs are unsigned. If macOS marks the downloaded bundle as
+quarantined, remove that attribute from the copied bundle or approve it in
+System Settings before starting OBS.
+
+### Linux
+
+Extract the `tar.gz` into the same prefix used by OBS. The package follows the
+standard OBS layout and contains `lib*/obs-plugins/obs-srtla-output.so` and
+`share/obs/obs-plugins/obs-srtla-output/`. Distribution packages may use a
+different `lib` directory; set `OBS_SRTLA_OBS_PLUGIN_DIR` when building for
+that prefix.
+
+Start OBS and open **Docks > SRTLA Output**.
 
 ## Use
 
@@ -97,7 +119,9 @@ There is no installer yet. After creating the ZIP described in [Build](#build):
    the URL; legacy `streamid`, `passphrase`, and `password` query parameters are
    migrated to separate profile fields.
 2. Enter the stream ID expected by the receiver and, if encryption is required,
-   a 10–79-byte UTF-8 passphrase.
+   a 10–79-byte UTF-8 passphrase. The passphrase is stored unencrypted in the
+   OBS profile on every supported platform. Profiles created by the removed
+   DPAPI implementation require entering the passphrase again.
 3. Choose **Streaming** or **Recording** to reuse that stopped OBS output's
    encoders, or **Custom** to create independent video and audio encoders.
 4. Select at least one operational network link.
@@ -169,7 +193,7 @@ raising it lets the feedback loop probe upward normally.
 
 ## Architecture
 
-- `plugin/` — OBS output, dock, Windows network monitor, SRT session, and
+- `plugin/` — OBS output, dock, platform network monitors, SRT session, and
   libavformat MPEG-TS sink.
 - `engine/` — Rust FFI facade, bounded queues, statistics, and adaptive-bitrate
   controller.
@@ -186,10 +210,10 @@ contract connects libsrt directly to the bounded engine queues.
 
 ### Requirements
 
-- Windows x64 and an x64 MSVC developer environment
-- CMake 3.28 or newer and Ninja
-- Git and PowerShell
-- Stable Rust 1.88 or newer
+- Windows x64 with an x64 MSVC developer environment;
+- macOS 12 or newer with Xcode command-line tools;
+- Linux x86_64 or arm64 with a C++17 compiler, Ninja, and pkg-config;
+- CMake 3.28 or newer, Git, and stable Rust 1.88 or newer.
 
 The vendored sender has a rustfmt configuration that uses unstable formatting
 options. Nightly Rust is needed only to format that vendored workspace, not to
@@ -226,8 +250,8 @@ cpack --config build-obs\CPackConfig.cmake -C Release
 ```
 
 The SRT fork and mbedTLS are linked statically into the plugin, so no OpenSSL or
-mbedTLS DLL is shipped. Qt, FFmpeg, `obs.dll`, and `obs-frontend-api.dll` are
-resolved from the OBS runtime; no static copy of libobs is embedded.
+mbedTLS runtime library is shipped. Qt, FFmpeg, and OBS are provided by the
+host installation; no static copy of libobs is embedded.
 
 If you already have a compatible OBS SDK and dependency set, provide
 `OBS_SRTLA_OBS_SOURCE_DIR`, `OBS_SRTLA_OBS_IMPORT_LIB_DIR`,
@@ -235,17 +259,55 @@ If you already have a compatible OBS SDK and dependency set, provide
 `OBS_SRTLA_MBEDTLS_ROOT`, and the Qt prefix directly instead of running the
 provisioning script.
 
-Windows CI builds the native plugin and runs the Rust engine, transport ABI,
-output lifecycle, and secret-store tests. Linux CI runs the engine and vendored
-sender workspaces' unit, protocol, and dependency-independent integration
-tests. The Windows job uses the OBS 32 development environment, produces an
-OBS-ready ZIP, and uploads it as a workflow artifact.
+For macOS and Linux, provide an OBS 32 development prefix containing the
+`libobs` and `obs-frontend-api` CMake packages, Qt6 Widgets, FFmpeg headers and
+libraries, and mbedTLS. The same cache variables used by the Windows build can
+be supplied directly:
+
+```sh
+cmake -S . -B build \
+  -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DOBS_SRTLA_BUILD_TESTS=ON \
+  -DOBS_SRTLA_BUILD_VENDOR_SRT=ON \
+  -DOBS_SRTLA_REQUIRE_PLUGIN=ON \
+  -DCMAKE_PREFIX_PATH="$OBS_SRTLA_OBS_PREFIX" \
+  -DOBS_SRTLA_FFMPEG_ROOT="$OBS_SRTLA_FFMPEG_ROOT" \
+  -DOBS_SRTLA_MBEDTLS_ROOT="$OBS_SRTLA_MBEDTLS_ROOT"
+
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+cpack --config build/CPackConfig.cmake
+```
+
+On macOS, configure one architecture at a time:
+
+```sh
+cmake -S . -B build-macos-arm64 -G Xcode \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+  -DOBS_SRTLA_REQUIRE_PLUGIN=ON
+cmake --build build-macos-arm64 --config Release --parallel
+ctest --test-dir build-macos-arm64 -C Release --output-on-failure
+cpack --config build-macos-arm64/CPackConfig.cmake -C Release
+```
+
+On Linux, use `aarch64`/`arm64` or `x86_64` natively and set
+`CMAKE_INSTALL_LIBDIR` when the OBS installation uses a multiarch library
+directory, for example `lib/x86_64-linux-gnu`.
+
+The CI matrix builds the plugin natively for Windows x64, Linux x86_64/arm64,
+and macOS x86_64/arm64, runs the Rust and CTest suites, validates archive
+contents, and uploads one package per architecture. A semantic-version tag
+matching the CMake project version publishes all packages and
+`SHA256SUMS.txt` as a GitHub Release.
 
 Pushing a plain semantic-version tag that matches the CMake project version
-(for example, `0.1.0`) runs the same checks. Only after both jobs pass, GitHub
-Actions publishes the ZIP and its `SHA256SUMS.txt` as a GitHub Release. Re-running
-the tagged workflow safely replaces the release assets. See [TODO](#todo) for
-the network-namespace/netem coverage gap.
+(for example, `0.1.1`) runs the same checks. Only after both jobs pass, GitHub
+Actions publishes the five platform/architecture archives and
+`SHA256SUMS.txt` as a GitHub Release. Re-running the tagged workflow safely
+replaces the release assets. See [TODO](#todo) for the network-namespace/netem
+coverage gap.
 
 ## License
 
