@@ -1,9 +1,9 @@
 if(WIN32)
-  set(OBS_SRTLA_RUST_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libobs_srtla_engine.lib")
-  set(OBS_SRTLA_RUST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/target/release/obs_srtla_engine.lib")
+  set(OBS_SRTLA_RUST_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libsrtla_engine.lib")
+  set(OBS_SRTLA_RUST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/target/release/srtla_engine.lib")
 else()
-  set(OBS_SRTLA_RUST_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libobs_srtla_engine.a")
-  set(OBS_SRTLA_RUST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/target/release/libobs_srtla_engine.a")
+  set(OBS_SRTLA_RUST_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libsrtla_engine.a")
+  set(OBS_SRTLA_RUST_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/target/release/libsrtla_engine.a")
 endif()
 
 # Cargo tracks path dependencies correctly, but CMake still needs to know when
@@ -36,13 +36,13 @@ add_custom_command(
     ${OBS_SRTLA_RUST_MANIFESTS}
 )
 
-add_custom_target(obs-srtla-engine ALL
+add_custom_target(srtla-engine ALL
   DEPENDS ${OBS_SRTLA_RUST_OUTPUT}
 )
 
-add_library(obs-srtla-engine-lib STATIC IMPORTED GLOBAL)
-set_target_properties(obs-srtla-engine-lib PROPERTIES
+add_library(srtla-engine-lib STATIC IMPORTED GLOBAL)
+set_target_properties(srtla-engine-lib PROPERTIES
   IMPORTED_LOCATION "${OBS_SRTLA_RUST_OUTPUT}"
   INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
-add_dependencies(obs-srtla-engine-lib obs-srtla-engine)
+add_dependencies(srtla-engine-lib srtla-engine)

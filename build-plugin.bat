@@ -88,8 +88,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo Building obs-srtla-output incrementally...
-"%CMAKE%" --build "%BUILD%" --config Release --target obs-srtla-output --parallel
+echo Building srtla-output incrementally...
+"%CMAKE%" --build "%BUILD%" --config Release --target srtla-output --parallel
 if errorlevel 1 (
   echo ERROR: Plugin build failed.
   exit /b 1
@@ -129,7 +129,7 @@ if not "%PACKAGE_RC%"=="0" (
 :success
 echo.
 echo Build completed successfully.
-echo DLL: "%BUILD%\plugin\obs-srtla-output.dll"
-if /I "%MODE%"=="/package" echo ZIP: "%BUILD%\obs-srtla-output-0.1.1-obs32-windows-x64.zip"
-if /I "%MODE%"=="/all" echo ZIP: "%BUILD%\obs-srtla-output-0.1.1-obs32-windows-x64.zip"
+echo DLL: "%BUILD%\plugin\srtla-output.dll"
+if /I "%MODE%"=="/package" echo ZIP: "%BUILD%\srtla-output-0.1.1-obs32-windows-x64.zip"
+if /I "%MODE%"=="/all" echo ZIP: "%BUILD%\srtla-output-0.1.1-obs32-windows-x64.zip"
 exit /b 0

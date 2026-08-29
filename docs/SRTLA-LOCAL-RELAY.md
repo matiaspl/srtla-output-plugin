@@ -1,11 +1,11 @@
 # Local SRTLA relay (Windows)
 
-This repository ships the OBS SRTLA output and the Rust sender/transport seam; it does **not** ship a production SRTLA receiver. For local testing, use the Windows-compatible `srtla_rec` build from [manueldev/srtla-windows](https://github.com/manueldev/srtla-windows), plus `srt-live-transmit` and FFmpeg.
+This repository ships the SRTLA output for OBS and the Rust sender/transport seam; it does **not** ship a production SRTLA receiver. For local testing, use the Windows-compatible `srtla_rec` build from [manueldev/srtla-windows](https://github.com/manueldev/srtla-windows), plus `srt-live-transmit` and FFmpeg.
 
 ## Topology
 
 ```text
-OBS SRTLA output
+SRTLA output for OBS
   srtla://127.0.0.1:5000
         | UDP SRTLA
         v

@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
-project(obs-srtla-output VERSION 0.1.1 LANGUAGES C CXX)
+project(srtla-output VERSION 0.1.1 LANGUAGES C CXX)
+
+set(SRTLA_PLUGIN_NAME "${PROJECT_NAME}")
+set(SRTLA_PLUGIN_BUNDLE_ID "com.broadcast-ready.${SRTLA_PLUGIN_NAME}")
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-  message(FATAL_ERROR "obs-srtla-output requires a 64-bit target")
+  message(FATAL_ERROR "srtla-output requires a 64-bit target")
 endif()
 
 set(CMAKE_C_STANDARD 11)
@@ -190,7 +193,7 @@ if(OBS_SRTLA_BUILD_VENDOR_SRT)
   endif()
 endif()
 
-set(CPACK_PACKAGE_NAME "obs-srtla-output")
+set(CPACK_PACKAGE_NAME "${SRTLA_PLUGIN_NAME}")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
 if(WIN32)
@@ -230,9 +233,14 @@ endif()
 include(CPack)
 
 if(APPLE)
-  set(_obs_srtla_metadata_dir "obs-srtla-output.plugin/Contents/Resources/obs-srtla-output")
+  install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/install-macos.command"
+          DESTINATION ".")
+endif()
+
+if(APPLE)
+  set(_obs_srtla_metadata_dir "${SRTLA_PLUGIN_NAME}.plugin/Contents/Resources/${SRTLA_PLUGIN_NAME}")
 else()
-  set(_obs_srtla_metadata_dir "${OBS_SRTLA_OBS_PLUGIN_DIR}/obs-srtla-output")
+  set(_obs_srtla_metadata_dir "${OBS_SRTLA_OBS_PLUGIN_DIR}/${SRTLA_PLUGIN_NAME}")
 endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
@@ -366,8 +374,8 @@ else()
   endif()
 endif()
 
-if(OBS_SRTLA_REQUIRE_PLUGIN AND NOT TARGET obs-srtla-output)
-  message(FATAL_ERROR "obs-srtla-output plugin target was not created; OBS_SRTLA_REQUIRE_PLUGIN is ON")
+if(OBS_SRTLA_REQUIRE_PLUGIN AND NOT TARGET ${SRTLA_PLUGIN_NAME})
+  message(FATAL_ERROR "srtla-output plugin target was not created; OBS_SRTLA_REQUIRE_PLUGIN is ON")
 endif()
 
 if(OBS_SRTLA_BUILD_TESTS)

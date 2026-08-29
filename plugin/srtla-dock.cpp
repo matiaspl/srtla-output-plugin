@@ -1,4 +1,4 @@
-#include "obs-srtla-dock.hpp"
+#include "srtla-dock.hpp"
 #include "stats-json.hpp"
 
 #include "network-monitor.hpp"
@@ -127,7 +127,7 @@ void save_profile_config()
 {
 	auto *config = profile_config();
 	if (config && config_save_safe(config, "tmp", nullptr) != CONFIG_SUCCESS)
-		blog(LOG_WARNING, "[obs-srtla-output] Failed to save dock settings");
+		blog(LOG_WARNING, "[srtla-output] Failed to save dock settings");
 }
 
 bool is_supported_video_codec(const char *codec)
@@ -657,7 +657,7 @@ void SrtlaDock::toggleOutput()
 		obs_data_set_string(settings_, "audio_codec", obs_encoder_get_codec(audio_encoder));
 
 	if (!output_)
-		output_ = obs_output_create("obs_srtla_output", "SRTLA Output", settings_, nullptr);
+		output_ = obs_output_create("srtla_output", "SRTLA Output", settings_, nullptr);
 	if (!output_) {
 		if (custom_encoder)
 			obs_encoder_release(video_encoder);

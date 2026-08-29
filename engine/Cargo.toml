@@ -1,12 +1,12 @@
 [package]
-name = "obs-srtla-engine"
+name = "srtla-engine"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-2.0-or-later"
 
 [lib]
-name = "obs_srtla_engine"
+name = "srtla_engine"
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]

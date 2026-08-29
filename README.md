@@ -1,4 +1,4 @@
-# OBS SRTLA Output
+# SRTLA Output for OBS
 
 Native SRTLA output for OBS Studio on Windows x64, macOS, and Linux.
 
@@ -83,7 +83,8 @@ Current operational limitations:
 
 ## Install
 
-There is no installer yet. Close OBS before copying a package.
+The release packages contain an unsigned macOS installation helper rather than
+a signed native installer. Close OBS before installing a package.
 
 ### Windows
 
@@ -93,21 +94,43 @@ Extract the ZIP into the OBS installation directory, preserving the
 
 ### macOS
 
-Copy `obs-srtla-output.plugin` into:
+The macOS release ZIP includes `install-macos.command`. On Apple Silicon
+(M1/M2/M3/M4), download the `macos-arm64` package. Then:
+
+1. Open the downloaded ZIP and open the extracted folder.
+2. Hold Control and click (or right-click) `install-macos.command`, then choose
+   **Open**.
+3. In the macOS warning, choose **Open** again. This one-time warning is
+   expected because the release package is not notarized.
+4. Wait for the Terminal window to report that installation completed, press
+   Return to close it, and start OBS.
+
+If macOS still blocks the helper, open **System Settings > Privacy & Security**
+and choose **Open Anyway** for `install-macos.command`, then repeat step 2.
+
+The helper copies `srtla-output.plugin` into:
 
 ```text
 ~/Library/Application Support/obs-studio/plugins/
 ```
 
-The release ZIPs are unsigned. If macOS marks the downloaded bundle as
-quarantined, remove that attribute from the copied bundle or approve it in
-System Settings before starting OBS.
+It removes the quarantine flag and applies a local ad-hoc signature. If an
+older plugin is already installed, it is moved aside as a backup before the
+new one is copied.
+
+Manual fallback for technical users:
+
+```sh
+plugin="$HOME/Library/Application Support/obs-studio/plugins/srtla-output.plugin"
+xattr -dr com.apple.quarantine "$plugin"
+codesign --force --deep --sign - "$plugin"
+```
 
 ### Linux
 
 Extract the `tar.gz` into the same prefix used by OBS. The package follows the
-standard OBS layout and contains `lib*/obs-plugins/obs-srtla-output.so` and
-`share/obs/obs-plugins/obs-srtla-output/`. Distribution packages may use a
+standard OBS layout and contains `lib*/obs-plugins/srtla-output.so` and
+`share/obs/obs-plugins/srtla-output/`. Distribution packages may use a
 different `lib` directory; set `OBS_SRTLA_OBS_PLUGIN_DIR` when building for
 that prefix.
 
@@ -244,7 +267,7 @@ cmake -S . -B build-obs -G Ninja `
   -DOBS_SRTLA_FFMPEG_ROOT="$env:OBS_SRTLA_FFMPEG_ROOT" `
   -DOBS_SRTLA_MBEDTLS_ROOT="$env:OBS_SRTLA_MBEDTLS_ROOT"
 
-cmake --build build-obs --config Release --target obs-srtla-output --parallel
+cmake --build build-obs --config Release --target srtla-output --parallel
 ctest --test-dir build-obs -C Release --output-on-failure
 cpack --config build-obs\CPackConfig.cmake -C Release
 ```

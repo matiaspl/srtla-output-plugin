@@ -341,17 +341,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "obs-srtla-engine"
-version = "0.1.1"
-dependencies = [
- "proptest",
- "serde",
- "serde_json",
- "srtla_send",
- "tokio",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -627,6 +616,17 @@ dependencies = [
  "smallvec 2.0.0-alpha.12",
  "srtla-protocol",
  "tracing",
+]
+
+[[package]]
+name = "srtla-engine"
+version = "0.1.1"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "srtla_send",
+ "tokio",
 ]
 
 [[package]]

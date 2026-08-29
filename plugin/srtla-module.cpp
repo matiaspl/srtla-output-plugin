@@ -1,10 +1,10 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 
-#include "obs-srtla-dock.hpp"
+#include "srtla-dock.hpp"
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE("obs-srtla-output", "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("srtla-output", "en-US")
 
 extern struct obs_output_info srtla_output_info;
 
@@ -47,7 +47,7 @@ bool obs_module_load(void)
 	obs_register_output(&srtla_output_info);
 	dock = new SrtlaDock();
 	obs_frontend_add_event_callback(frontend_event, nullptr);
-	if (!obs_frontend_add_dock_by_id("obs-srtla-output-dock", "SRTLA Output", dock)) {
+	if (!obs_frontend_add_dock_by_id("srtla-output-dock", "SRTLA Output", dock)) {
 		obs_frontend_remove_event_callback(frontend_event, nullptr);
 		delete dock;
 		dock = nullptr;
@@ -64,6 +64,6 @@ void obs_module_unload(void)
 	// deleting it again here leaves the dock's output pointer dangling and can
 	// crash in obs_output_release during OBS shutdown.
 	if (dock)
-		obs_frontend_remove_dock("obs-srtla-output-dock");
+		obs_frontend_remove_dock("srtla-output-dock");
 	dock = nullptr;
 }

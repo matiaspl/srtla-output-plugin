@@ -1,4 +1,4 @@
-name: obs-srtla-output
+name: srtla-output
 
 on:
   workflow_dispatch:
@@ -54,27 +54,27 @@ jobs:
             os: windows-2022
             platform: windows
             arch: x86_64
-            artifact: obs-srtla-output-windows-x64
+            artifact: srtla-output-windows-x64
           - name: Linux x86_64
             os: ubuntu-24.04
             platform: linux
             arch: x86_64
-            artifact: obs-srtla-output-linux-x86_64
+            artifact: srtla-output-linux-x86_64
           - name: Linux arm64
             os: ubuntu-26.04-arm
             platform: linux
             arch: arm64
-            artifact: obs-srtla-output-linux-arm64
+            artifact: srtla-output-linux-arm64
           - name: macOS x86_64
             os: macos-15-intel
             platform: macos
             arch: x86_64
-            artifact: obs-srtla-output-macos-x86_64
+            artifact: srtla-output-macos-x86_64
           - name: macOS arm64
             os: macos-15
             platform: macos
             arch: arm64
-            artifact: obs-srtla-output-macos-arm64
+            artifact: srtla-output-macos-arm64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -188,9 +188,9 @@ jobs:
         run: |
           cmake --build build --config Release --parallel
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
-          $plugin = Get-ChildItem build\plugin -Recurse -File -Filter 'obs-srtla-output.dll' |
+          $plugin = Get-ChildItem build\plugin -Recurse -File -Filter 'srtla-output.dll' |
             Select-Object -First 1
-          if (!$plugin) { throw 'The build did not produce obs-srtla-output.dll' }
+          if (!$plugin) { throw 'The build did not produce srtla-output.dll' }
           Write-Host "Built $($plugin.FullName)"
       - name: Build Release (POSIX)
         if: matrix.platform != 'windows'
@@ -203,9 +203,9 @@ jobs:
           fi
           cmake --build build --config "$build_config" --parallel
           if [[ '${{ matrix.platform }}' == 'macos' ]]; then
-            plugin_path="$(find build -name 'obs-srtla-output.plugin' -type d -print -quit)"
+            plugin_path="$(find build -name 'srtla-output.plugin' -type d -print -quit)"
           else
-            plugin_path="$(find build -name 'obs-srtla-output.so' -type f -print -quit)"
+            plugin_path="$(find build -name 'srtla-output.so' -type f -print -quit)"
           fi
           test -n "$plugin_path"
       - name: Test Release
@@ -234,10 +234,10 @@ jobs:
             throw "Expected one release ZIP, found $($archives.Count)"
           }
           $contents = @(tar -tf $archives[0].FullName)
-          if (-not ($contents | Where-Object { $_ -match '/obs-plugins/64bit/obs-srtla-output\.dll$' })) {
+          if (-not ($contents | Where-Object { $_ -match '/obs-plugins/64bit/srtla-output\.dll$' })) {
             throw 'The Windows package is missing the plugin DLL'
           }
-          if (-not ($contents | Where-Object { $_ -match '/data/obs-plugins/obs-srtla-output/locale/en-US\.ini$' })) {
+          if (-not ($contents | Where-Object { $_ -match '/data/obs-plugins/srtla-output/locale/en-US\.ini$' })) {
             throw 'The Windows package is missing locale data'
           }
           Get-FileHash -Algorithm SHA256 -LiteralPath $archives[0].FullName |
@@ -256,13 +256,14 @@ jobs:
             macos)
               archive="$(find package -type f -name '*.zip' -print -quit)"
               test -n "$archive"
-              unzip -l "$archive" | grep 'obs-srtla-output.plugin/Contents/Resources/locale/en-US.ini' > /dev/null
+              unzip -l "$archive" | grep 'install-macos\.command$' > /dev/null
+              unzip -l "$archive" | grep 'srtla-output.plugin/Contents/Resources/locale/en-US.ini' > /dev/null
               ;;
             linux)
               archive="$(find package -type f -name '*.tar.gz' -print -quit)"
               test -n "$archive"
-              tar -tzf "$archive" | grep '/obs-srtla-output.so$' > /dev/null
-              tar -tzf "$archive" | grep '/obs-srtla-output/locale/en-US.ini$' > /dev/null
+              tar -tzf "$archive" | grep '/srtla-output.so$' > /dev/null
+              tar -tzf "$archive" | grep '/srtla-output/locale/en-US.ini$' > /dev/null
               ;;
           esac
       - name: Upload package
@@ -291,7 +292,7 @@ jobs:
             echo "Release tag must be a plain semantic version, got: $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          project_version="$(sed -nE 's/^project\(obs-srtla-output VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
+          project_version="$(sed -nE 's/^project\(srtla-output VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' CMakeLists.txt)"
           if [[ "$GITHUB_REF_NAME" != "$project_version" ]]; then
             echo "Tag $GITHUB_REF_NAME does not match project version $project_version" >&2
             exit 1
@@ -299,7 +300,7 @@ jobs:
       - name: Download all native packages
         uses: actions/download-artifact@v8
         with:
-          pattern: obs-srtla-output-*
+          pattern: srtla-output-*
           path: artifacts
           merge-multiple: true
       - name: Generate checksums
@@ -328,5 +329,5 @@ jobs:
             gh release create "$GITHUB_REF_NAME" artifacts/* \
               --verify-tag \
               --generate-notes \
-              --title "obs-srtla-output $GITHUB_REF_NAME"
+              --title "srtla-output $GITHUB_REF_NAME"
           fi

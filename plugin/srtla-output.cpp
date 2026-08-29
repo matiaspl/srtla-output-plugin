@@ -1072,7 +1072,7 @@ static int srtla_output_dropped_frames(void *opaque)
 
 struct obs_output_info srtla_output_info = [] {
 	struct obs_output_info info{};
-	info.id = "obs_srtla_output";
+	info.id = "srtla_output";
 	info.flags = OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED;
 	info.get_name = srtla_output_name;
 	info.create = srtla_output_create;
