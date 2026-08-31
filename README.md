@@ -95,18 +95,23 @@ Extract the ZIP into the OBS installation directory, preserving the
 ### macOS
 
 The macOS release ZIP includes `install-macos.command`. On Apple Silicon
-(M1/M2/M3/M4), download the `macos-arm64` package. Then:
+(M1/M2/M3/M4), download the `macos-arm64` package. The helper is not notarized,
+so Finder may show an Apple warning with only **Done** and **Move to Trash**.
+Use Terminal to run it instead:
 
 1. Open the downloaded ZIP and open the extracted folder.
-2. Hold Control and click (or right-click) `install-macos.command`, then choose
-   **Open**.
-3. In the macOS warning, choose **Open** again. This one-time warning is
-   expected because the release package is not notarized.
-4. Wait for the Terminal window to report that installation completed, press
-   Return to close it, and start OBS.
+2. Open **Terminal** (press Command-Space, type `Terminal`, and press Return).
+3. Type `zsh ` in Terminal, including the space after `zsh`, but do not press
+   Return yet.
+4. Drag `install-macos.command` from the extracted folder into the Terminal
+   window. macOS will insert the full path automatically.
+5. Press Return and wait for the Terminal window to report that installation
+   completed. Press Return once more to close it, then start OBS.
 
-If macOS still blocks the helper, open **System Settings > Privacy & Security**
-and choose **Open Anyway** for `install-macos.command`, then repeat step 2.
+The helper uses macOS's standard `zsh` shell; do not replace `zsh` with `bash`.
+If macOS still blocks the helper, first try to run it as above, then open
+**System Settings > Privacy & Security** and choose **Open Anyway** for
+`install-macos.command`. Repeat steps 2–5 afterwards.
 
 The helper copies `srtla-output.plugin` into:
 
