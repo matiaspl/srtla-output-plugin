@@ -143,13 +143,10 @@ Start OBS and open **Docks > SRTLA Output**.
 
 ## Use
 
-1. Enter the receiver endpoint as `srtla://host:port`. Keep credentials out of
-   the URL; legacy `streamid`, `passphrase`, and `password` query parameters are
-   migrated to separate profile fields.
+1. Enter the receiver endpoint as `srtla://host:port`.
 2. Enter the stream ID expected by the receiver and, if encryption is required,
    a 10–79-byte UTF-8 passphrase. The passphrase is stored unencrypted in the
-   OBS profile on every supported platform. Profiles created by the removed
-   DPAPI implementation require entering the passphrase again.
+   OBS profile on every supported platform.
 3. Choose **Streaming** or **Recording** to reuse that stopped OBS output's
    encoders, or **Custom** to create independent video and audio encoders.
 4. Select at least one operational network link.
