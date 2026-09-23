@@ -199,9 +199,8 @@ Bitrate changes follow BELABOX's asymmetric control law:
   accumulating internally.
 
 Automatic mode starts at the configured maximum, matching BELABOX. The default
-automatic maximum is 6000 kb/s and its range is capped at 30000 kb/s; the old
-100000 kb/s sentinel is migrated to the new default. This ceiling does not
-limit the separate manual-bitrate setting. If the SRT session or
+automatic maximum is 6000 kb/s and its range is capped at 30000 kb/s. This ceiling 
+does not limit the separate manual-bitrate setting. If the SRT session or
 every enabled link is down, the output falls to the minimum to avoid an
 unbounded queue. Missing or repeated statistics hold the current target rather
 than replaying a congestion event. Learned queue and RTT state is reset after a
