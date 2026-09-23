@@ -95,7 +95,7 @@ Extract the ZIP into the OBS installation directory, preserving the
 ### macOS
 
 The macOS release ZIP includes `install-macos.command`. On Apple Silicon
-(M1/M2/M3/M4), download the `macos-arm64` package. The helper is not notarized,
+(M-series CPUs), download the `macos-arm64` package. The helper is not notarized,
 so Finder may show an Apple warning with only **Done** and **Move to Trash**.
 Use Terminal to run it instead:
 
