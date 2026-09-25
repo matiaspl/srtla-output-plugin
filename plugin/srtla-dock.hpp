@@ -2,18 +2,25 @@
 
 #include <QWidget>
 
+#include <array>
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
 
 class QCheckBox;
 class QComboBox;
+class QGridLayout;
 class QLabel;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
 class QTableWidget;
 class QTimer;
+class QResizeEvent;
+class QToolButton;
+class HistoryChartWidget;
+class SparklineWidget;
 
 class SrtlaDock final : public QWidget {
 public:
@@ -25,9 +32,16 @@ public:
 	void reloadProfile();
 	bool sharesEncoderWith(struct obs_output *other) const;
 
+protected:
+	void resizeEvent(QResizeEvent *event) override;
+
 private:
 	void toggleOutput();
 	void refreshStatus();
+	void arrangeOverview();
+	void applyAdapterVisibility();
+	void updateOverviewSparklines();
+	void updateHistoryPanel();
 	void saveSelectedLinks();
 	void loadProfile();
 	bool saveProfile();
@@ -44,8 +58,27 @@ private:
 	QSpinBox *manualBitrate_ = nullptr;
 	QSpinBox *maxBitrate_ = nullptr;
 	QLabel *state_ = nullptr;
-	QLabel *metrics_ = nullptr;
+	QLabel *overviewTitle_ = nullptr;
+	QLabel *trendHint_ = nullptr;
+	QLabel *settingsSummary_ = nullptr;
+	QWidget *connectionSettings_ = nullptr;
+	QGridLayout *overviewLayout_ = nullptr;
+	std::array<QWidget *, 6> metricTiles_{};
+	std::array<QLabel *, 6> metricValues_{};
+	std::array<SparklineWidget *, 6> metricSparklines_{};
+	std::array<std::deque<double>, 6> metricHistory_{};
 	QTableWidget *links_ = nullptr;
+	QCheckBox *showAllAdapters_ = nullptr;
+	QLabel *adapterCount_ = nullptr;
+	QLabel *historyTitle_ = nullptr;
+	QLabel *historyNow_ = nullptr;
+	QComboBox *historyRange_ = nullptr;
+	QToolButton *historyCollapse_ = nullptr;
+	std::array<HistoryChartWidget *, 3> historyCharts_{};
+	QWidget *historyPanel_ = nullptr;
+	std::unordered_map<std::string, std::array<std::deque<double>, 6>> linkHistory_;
+	std::string selectedLinkKey_;
+	int historyWindowSeconds_ = 60;
 	QTimer *timer_ = nullptr;
 	bool running_ = false;
 	bool secret_error_ = false;

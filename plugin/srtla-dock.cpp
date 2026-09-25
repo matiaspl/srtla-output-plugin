@@ -12,15 +12,23 @@
 #include <QCheckBox>
 #include <QAbstractItemView>
 #include <QComboBox>
-#include <QFormLayout>
+#include <QFrame>
+#include <QGridLayout>
+#include <QHBoxLayout>
 #include <QHeaderView>
+#include <QFrame>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPainter>
+#include <QPainterPath>
 #include <QSignalBlocker>
 #include <QPushButton>
+#include <QResizeEvent>
+#include <QSizePolicy>
+#include <QToolButton>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QSpinBox>
@@ -28,10 +36,16 @@
 #include <QTableWidgetItem>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QGridLayout>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <tuple>
+#include <vector>
 
 extern "C" std::uint64_t srtla_output_link_id(const char *adapter_id);
 extern "C" int srtla_output_set_link_enabled(struct obs_output *output, std::uint64_t link_id, bool enabled);
@@ -204,44 +218,409 @@ obs_encoder_t *create_custom_audio_encoder(const QString &id, int bitrate_kbps)
 
 } // namespace
 
+class SparklineWidget final : public QWidget {
+public:
+	explicit SparklineWidget(QWidget *parent = nullptr) : QWidget(parent)
+	{
+		setMinimumSize(48, 18);
+		setMaximumHeight(24);
+		setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+		setAttribute(Qt::WA_TransparentForMouseEvents);
+	}
+
+	void setHistory(const std::deque<double> &values, const std::deque<double> &reference = {}, bool stepped = false,
+			 int windowSeconds = 60)
+	{
+		values_ = values;
+		reference_ = reference;
+		stepped_ = stepped;
+		windowSeconds_ = std::max(1, windowSeconds);
+		update();
+	}
+
+protected:
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter painter(this);
+		painter.setRenderHint(QPainter::Antialiasing);
+		const QRectF area = QRectF(rect()).adjusted(2.0, 2.0, -2.0, -2.0);
+		if (area.width() < 2.0 || area.height() < 2.0)
+			return;
+		if (values_.size() < 2) {
+			painter.setPen(palette().color(QPalette::WindowText));
+			painter.drawText(area, Qt::AlignCenter, QStringLiteral("—"));
+			return;
+		}
+
+		double minimum = std::numeric_limits<double>::infinity();
+		double maximum = -std::numeric_limits<double>::infinity();
+		const auto inspect = [&](const std::deque<double> &series) {
+			for (const double value : series) {
+				if (!std::isfinite(value))
+					continue;
+				minimum = std::min(minimum, value);
+				maximum = std::max(maximum, value);
+			}
+		};
+		inspect(values_);
+		inspect(reference_);
+		if (!std::isfinite(minimum) || !std::isfinite(maximum))
+			return;
+		if (maximum - minimum < 0.001) {
+			const double padding = std::max(1.0, std::abs(maximum) * 0.08);
+			minimum -= padding;
+			maximum += padding;
+		} else {
+			const double padding = (maximum - minimum) * 0.10;
+			minimum -= padding;
+			maximum += padding;
+		}
+
+		painter.setPen(QPen(palette().color(QPalette::Mid), 1.0));
+		painter.drawLine(QPointF(area.left(), area.bottom()), QPointF(area.right(), area.bottom()));
+		const auto drawSeries = [&](const std::deque<double> &series, const QColor &color, Qt::PenStyle style) {
+			if (series.size() < 2)
+				return;
+			QPainterPath path;
+			bool started = false;
+			QPointF previous;
+			for (size_t index = 0; index < series.size(); ++index) {
+				const double value = series[index];
+				if (!std::isfinite(value)) {
+					started = false;
+					continue;
+				}
+				const double elapsed = static_cast<double>(windowSeconds_ - static_cast<int>(series.size()) + static_cast<int>(index));
+				const double x = area.left() + elapsed * area.width() / std::max(1, windowSeconds_ - 1);
+				const double y = area.bottom() - (value - minimum) / (maximum - minimum) * area.height();
+				const QPointF point(x, y);
+				if (!started) {
+					path.moveTo(point);
+					started = true;
+				} else if (stepped_) {
+					path.lineTo(point.x(), previous.y());
+					path.lineTo(point);
+				} else {
+					path.lineTo(point);
+				}
+				previous = point;
+			}
+			painter.setPen(QPen(color, 1.5, style, Qt::RoundCap, Qt::RoundJoin));
+			painter.drawPath(path);
+		};
+		drawSeries(reference_, QColor(225, 173, 82), Qt::DashLine);
+		drawSeries(values_, palette().color(QPalette::Highlight), Qt::SolidLine);
+	}
+
+private:
+	std::deque<double> values_;
+	std::deque<double> reference_;
+	bool stepped_ = false;
+	int windowSeconds_ = 60;
+};
+
+class HistoryChartWidget final : public QWidget {
+public:
+	struct Series {
+		QString name;
+		std::deque<double> values;
+		QColor color;
+		Qt::PenStyle style = Qt::SolidLine;
+	};
+
+	explicit HistoryChartWidget(QWidget *parent = nullptr) : QWidget(parent)
+	{
+		setMinimumHeight(94);
+		setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+	}
+
+	void setSeries(std::vector<Series> series, int windowSeconds)
+	{
+		series_ = std::move(series);
+		windowSeconds_ = windowSeconds;
+		update();
+	}
+
+protected:
+	void paintEvent(QPaintEvent *) override
+	{
+		QPainter painter(this);
+		painter.setRenderHint(QPainter::Antialiasing);
+		const QRectF bounds = QRectF(rect()).adjusted(2.0, 2.0, -2.0, -2.0);
+		if (bounds.width() < 60.0 || bounds.height() < 35.0)
+			return;
+
+		size_t sampleCount = 0;
+		for (const auto &series : series_)
+			sampleCount = std::max(sampleCount, std::min(series.values.size(), static_cast<size_t>(windowSeconds_)));
+		if (sampleCount < 2) {
+			painter.setPen(palette().color(QPalette::WindowText));
+			painter.drawText(bounds, Qt::AlignCenter, tr("No history yet"));
+			return;
+		}
+
+		double minimum = std::numeric_limits<double>::infinity();
+		double maximum = -std::numeric_limits<double>::infinity();
+		for (const auto &series : series_) {
+			const size_t count = std::min(series.values.size(), static_cast<size_t>(windowSeconds_));
+			for (size_t index = series.values.size() - count; index < series.values.size(); ++index) {
+				const double value = series.values[index];
+				if (!std::isfinite(value))
+					continue;
+				minimum = std::min(minimum, value);
+				maximum = std::max(maximum, value);
+			}
+		}
+		if (!std::isfinite(minimum) || !std::isfinite(maximum)) {
+			painter.setPen(palette().color(QPalette::Mid));
+			painter.drawText(bounds, Qt::AlignCenter, tr("Waiting for telemetry"));
+			return;
+		}
+		if (maximum - minimum < 0.001) {
+			const double padding = std::max(1.0, std::abs(maximum) * 0.08);
+			minimum = std::max(0.0, minimum - padding);
+			maximum += padding;
+		} else {
+			const double padding = (maximum - minimum) * 0.10;
+			minimum = std::max(0.0, minimum - padding);
+			maximum += padding;
+		}
+
+		const QRectF plot = bounds.adjusted(34.0, 5.0, -5.0, -20.0);
+		QColor grid = palette().color(QPalette::Midlight);
+		grid.setAlpha(130);
+		const QColor text = palette().color(QPalette::WindowText);
+		for (int tick = 0; tick < 3; ++tick) {
+			const double fraction = tick / 2.0;
+			const double value = minimum + fraction * (maximum - minimum);
+			const double y = plot.bottom() - fraction * plot.height();
+			painter.setPen(QPen(grid, 1.0));
+			painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+			painter.setPen(text);
+			painter.drawText(QRectF(bounds.left(), y - 8.0, 29.0, 16.0), Qt::AlignRight | Qt::AlignVCenter,
+				QString::number(value, 'f', maximum < 10.0 ? 1 : 0));
+		}
+		const std::array<QString, 3> times = {
+			QStringLiteral("−%1s").arg(windowSeconds_),
+			QStringLiteral("−%1s").arg(windowSeconds_ / 2), QStringLiteral("Now")};
+		for (size_t tick = 0; tick < times.size(); ++tick) {
+			const double x = plot.left() + tick * plot.width() / 2.0;
+			painter.setPen(text);
+			painter.drawText(QRectF(x - 35.0, plot.bottom() + 2.0, 70.0, 16.0), Qt::AlignHCenter | Qt::AlignVCenter, times[tick]);
+		}
+
+		for (const auto &series : series_) {
+			const size_t count = std::min(series.values.size(), static_cast<size_t>(windowSeconds_));
+			if (count < 2)
+				continue;
+			const size_t start = series.values.size() - count;
+			QPainterPath path;
+			bool started = false;
+			for (size_t index = 0; index < count; ++index) {
+				const double value = series.values[start + index];
+				if (!std::isfinite(value)) {
+					started = false;
+					continue;
+				}
+				const double elapsedOffset = static_cast<double>(windowSeconds_ - count + index);
+				const double x = plot.left() + elapsedOffset * plot.width() /
+					std::max(1, windowSeconds_ - 1);
+				const double y = plot.bottom() - (value - minimum) * plot.height() / (maximum - minimum);
+				if (!started) {
+					path.moveTo(x, y);
+					started = true;
+				} else {
+					path.lineTo(x, y);
+				}
+			}
+			painter.setPen(QPen(series.color, 1.7, series.style, Qt::RoundCap, Qt::RoundJoin));
+			painter.drawPath(path);
+		}
+	}
+
+private:
+	std::vector<Series> series_;
+	int windowSeconds_ = 60;
+};
+
+namespace {
+
+void append_sample(std::deque<double> &history, double value)
+{
+	history.push_back(value);
+	while (history.size() > 900)
+		history.pop_front();
+}
+
+std::deque<double> history_tail(const std::deque<double> &history, int seconds)
+{
+	const auto count = std::min(history.size(), static_cast<size_t>(seconds));
+	return {history.end() - static_cast<std::ptrdiff_t>(count), history.end()};
+}
+
+void set_telemetry_cell(QTableWidget *table, int row, int column, const QString &value,
+			const std::deque<double> &history, const std::deque<double> &reference = {}, int windowSeconds = 60)
+{
+	auto *cell = table->cellWidget(row, column);
+	if (!cell) {
+		cell = new QWidget(table);
+		auto *cellLayout = new QVBoxLayout(cell);
+		cellLayout->setContentsMargins(2, 1, 2, 1);
+		cellLayout->setSpacing(0);
+		auto *text = new QLabel(cell);
+		text->setObjectName(QStringLiteral("telemetryValue"));
+		text->setAlignment(Qt::AlignCenter);
+		cellLayout->addWidget(text);
+		auto *plot = new SparklineWidget(cell);
+		plot->setObjectName(QStringLiteral("telemetryHistory"));
+		plot->setToolTip(QObject::tr("Recent trend; independently scaled. Select a link for full history."));
+		cellLayout->addWidget(plot);
+		table->setCellWidget(row, column, cell);
+	}
+	if (auto *text = cell->findChild<QLabel *>(QStringLiteral("telemetryValue")))
+		text->setText(value);
+	if (auto *plot = cell->findChild<QWidget *>(QStringLiteral("telemetryHistory")))
+		static_cast<SparklineWidget *>(plot)->setHistory(history_tail(history, windowSeconds), history_tail(reference, windowSeconds), false, windowSeconds);
+}
+
+QString abr_sparkline_label(const QString &state)
+{
+	if (state == QStringLiteral("Increasing")) return QStringLiteral("Increasing");
+	if (state == QStringLiteral("Light congestion")) return QStringLiteral("Light");
+	if (state == QStringLiteral("Heavy congestion")) return QStringLiteral("Heavy");
+	if (state == QStringLiteral("Severe congestion")) return QStringLiteral("Severe");
+	if (state == QStringLiteral("Disconnected")) return QStringLiteral("Disconnected");
+	if (state == QStringLiteral("Waiting for SRT feedback")) return QStringLiteral("Waiting");
+	return QStringLiteral("Stable");
+}
+
+double abr_sparkline_level(const QString &state)
+{
+	if (state == QStringLiteral("Increasing")) return 1.0;
+	if (state == QStringLiteral("Light congestion")) return 2.0;
+	if (state == QStringLiteral("Heavy congestion")) return 3.0;
+	if (state == QStringLiteral("Severe congestion")) return 4.0;
+	if (state == QStringLiteral("Disconnected")) return -1.0;
+	if (state == QStringLiteral("Waiting for SRT feedback")) return 0.0;
+	return 0.5;
+}
+
+} // namespace
+
 SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 {
 	setObjectName(QStringLiteral("SrtlaOutputDock"));
 	auto *layout = new QVBoxLayout(this);
-	auto *controls = new QFormLayout();
+	layout->setContentsMargins(8, 8, 8, 8);
+	layout->setSpacing(6);
 	startStop_ = new QPushButton(tr("Start"), this);
-	url_ = new QLineEdit(QStringLiteral("srtla://receiver.example:5000"), this);
-	streamId_ = new QLineEdit(this);
-	passphrase_ = new QLineEdit(this);
-	passphrase_->setEchoMode(QLineEdit::Password);
-	secret_warning_ = new QLabel(tr("Passphrase is stored unencrypted in the OBS profile."), this);
-	secret_warning_->setWordWrap(true);
-	secret_warning_->setStyleSheet(QStringLiteral("color: #b36b00;"));
-	encoderSource_ = new QComboBox(this);
-	encoderSource_->addItem(tr("Streaming"), QStringLiteral("streaming"));
-	encoderSource_->addItem(tr("Recording"), QStringLiteral("recording"));
-	encoderSource_->addItem(tr("Custom"), QStringLiteral("custom"));
-	customVideoEncoder_ = new QComboBox(this);
-	add_encoder_choices(customVideoEncoder_, OBS_ENCODER_VIDEO);
-	customAudioEncoder_ = new QComboBox(this);
-	add_encoder_choices(customAudioEncoder_, OBS_ENCODER_AUDIO);
+	state_ = new QLabel(tr("Idle"), this);
+	state_->setStyleSheet(QStringLiteral("font-weight: 600;"));
+
+	auto *overview = new QFrame(this);
+	overview->setFrameShape(QFrame::StyledPanel);
+	auto *overviewBox = new QVBoxLayout(overview);
+	overviewBox->setContentsMargins(8, 6, 8, 6);
+	overviewBox->setSpacing(5);
+	auto *statusBar = new QHBoxLayout();
+	statusBar->setContentsMargins(0, 0, 0, 0);
+	statusBar->addWidget(state_);
+	overviewTitle_ = new QLabel(tr("Output overview · last 60 seconds"), overview);
+	statusBar->addStretch(1);
+	statusBar->addWidget(overviewTitle_);
+	statusBar->addStretch(1);
+	statusBar->addWidget(startStop_);
+	overviewBox->addLayout(statusBar);
+	overviewLayout_ = new QGridLayout();
+	overviewLayout_->setContentsMargins(0, 0, 0, 0);
+	overviewLayout_->setHorizontalSpacing(14);
+	overviewLayout_->setVerticalSpacing(5);
+	const std::array<QString, 6> metricNames = {
+		tr("ABR"), tr("RTT / latency"), tr("SRT queue"),
+		tr("Video"), tr("Target"), tr("Active links")};
+	for (int index = 0; index < static_cast<int>(metricNames.size()); ++index) {
+		auto *tile = new QWidget(overview);
+		metricTiles_[static_cast<size_t>(index)] = tile;
+		auto *tileLayout = new QVBoxLayout(tile);
+		tileLayout->setContentsMargins(0, 0, 0, 0);
+		tileLayout->setSpacing(1);
+		auto *title = new QLabel(metricNames[static_cast<size_t>(index)], tile);
+		QFont titleFont = title->font();
+		titleFont.setPointSize(std::max(8, titleFont.pointSize() - 1));
+		title->setFont(titleFont);
+		metricValues_[static_cast<size_t>(index)] = new QLabel(QStringLiteral("--"), tile);
+		QFont valueFont = metricValues_[static_cast<size_t>(index)]->font();
+		valueFont.setPointSize(valueFont.pointSize() + 2);
+		valueFont.setWeight(QFont::DemiBold);
+		metricValues_[static_cast<size_t>(index)]->setFont(valueFont);
+		metricValues_[static_cast<size_t>(index)]->setMinimumWidth(55);
+		metricSparklines_[static_cast<size_t>(index)] = new SparklineWidget(tile);
+		metricSparklines_[static_cast<size_t>(index)]->setToolTip(tr("Recent history; updates once per second"));
+		tileLayout->addWidget(title);
+		tileLayout->addWidget(metricValues_[static_cast<size_t>(index)]);
+		tileLayout->addWidget(metricSparklines_[static_cast<size_t>(index)]);
+	}
+	overviewBox->addLayout(overviewLayout_);
+	arrangeOverview();
+	layout->addWidget(overview);
+
+	auto *bitrateRow = new QHBoxLayout();
+	bitrateRow->setContentsMargins(0, 0, 0, 0);
 	autoBitrate_ = new QCheckBox(tr("Auto bitrate"), this);
 	autoBitrate_->setChecked(true);
+	auto *videoBitrateLabel = new QLabel(tr("Video bitrate"), this);
 	manualBitrate_ = new QSpinBox(this);
 	manualBitrate_->setRange(500, 100000);
 	manualBitrate_->setValue(1500);
 	manualBitrate_->setSuffix(tr(" kb/s"));
 	manualBitrate_->setEnabled(false);
+	videoBitrateLabel->setBuddy(manualBitrate_);
 	maxBitrate_ = new QSpinBox(this);
 	maxBitrate_->setRange(500, 30000);
 	maxBitrate_->setValue(6000);
 	maxBitrate_->setSingleStep(50);
-	maxBitrate_->setSuffix(tr(" kb/s"));
-	state_ = new QLabel(tr("Idle"), this);
-	metrics_ = new QLabel(tr("ABR") + QStringLiteral(": -- | ") + tr("RTT") +
-		QStringLiteral(": -- | ") + tr("SRT queue") + QStringLiteral(": --\n") +
-		tr("Video") + QStringLiteral(": -- | ") + tr("Target") +
-		QStringLiteral(": -- | ") + tr("Active links") + QStringLiteral(": 0"), this);
+	maxBitrate_->setSuffix(tr(" kb/s max"));
+	bitrateRow->addWidget(autoBitrate_);
+	bitrateRow->addWidget(videoBitrateLabel);
+	bitrateRow->addWidget(manualBitrate_, 1);
+	bitrateRow->addWidget(maxBitrate_, 1);
+	layout->addLayout(bitrateRow);
+
+	auto *settingsHeader = new QHBoxLayout();
+	settingsHeader->setContentsMargins(0, 0, 0, 0);
+	auto *settingsToggle = new QToolButton(this);
+	settingsToggle->setText(tr("Connection && encoding settings"));
+	settingsToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+	settingsToggle->setArrowType(Qt::RightArrow);
+	settingsToggle->setCheckable(true);
+	settingsToggle->setChecked(false);
+	settingsSummary_ = new QLabel(this);
+	settingsSummary_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	settingsHeader->addWidget(settingsToggle);
+	settingsHeader->addWidget(settingsSummary_, 1);
+	layout->addLayout(settingsHeader);
+
+	connectionSettings_ = new QWidget(this);
+	connectionSettings_->setVisible(false);
+	auto *settingsGrid = new QGridLayout(connectionSettings_);
+	settingsGrid->setContentsMargins(0, 0, 0, 2);
+	settingsGrid->setHorizontalSpacing(8);
+	settingsGrid->setVerticalSpacing(4);
+	url_ = new QLineEdit(QStringLiteral("srtla://receiver.example:5000"), connectionSettings_);
+	streamId_ = new QLineEdit(connectionSettings_);
+	passphrase_ = new QLineEdit(connectionSettings_);
+	passphrase_->setEchoMode(QLineEdit::Password);
+	secret_warning_ = new QLabel(tr("Passphrase is stored unencrypted in the OBS profile."), connectionSettings_);
+	secret_warning_->setWordWrap(true);
+	secret_warning_->setStyleSheet(QStringLiteral("color: #b36b00;"));
+	encoderSource_ = new QComboBox(connectionSettings_);
+	encoderSource_->addItem(tr("Streaming"), QStringLiteral("streaming"));
+	encoderSource_->addItem(tr("Recording"), QStringLiteral("recording"));
+	encoderSource_->addItem(tr("Custom"), QStringLiteral("custom"));
+	customVideoEncoder_ = new QComboBox(connectionSettings_);
+	add_encoder_choices(customVideoEncoder_, OBS_ENCODER_VIDEO);
+	customAudioEncoder_ = new QComboBox(connectionSettings_);
+	add_encoder_choices(customAudioEncoder_, OBS_ENCODER_AUDIO);
 	loadProfile();
 	connect(passphrase_, &QLineEdit::textChanged, this, [this] {
 		if (!secret_error_)
@@ -249,28 +628,82 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 		secret_error_ = false;
 		secret_warning_->setText(tr("Passphrase is stored unencrypted in the OBS profile."));
 	});
-	controls->addRow(tr("State"), state_);
-	controls->addRow(tr("SRTLA URL"), url_);
-	controls->addRow(tr("Stream ID"), streamId_);
-	controls->addRow(tr("Passphrase"), passphrase_);
-	controls->addRow(QString(), secret_warning_);
-	controls->addRow(tr("Encoder"), encoderSource_);
-	controls->addRow(tr("Custom video encoder"), customVideoEncoder_);
-	controls->addRow(tr("Custom audio encoder"), customAudioEncoder_);
-	controls->addRow(tr("Bitrate"), autoBitrate_);
-	controls->addRow(tr("Manual"), manualBitrate_);
-	controls->addRow(tr("Auto maximum"), maxBitrate_);
-	layout->addLayout(controls);
-	layout->addWidget(metrics_);
-	layout->addWidget(startStop_);
+	url_->setPlaceholderText(tr("srtla://host:port"));
+	streamId_->setPlaceholderText(tr("Optional"));
+	passphrase_->setPlaceholderText(tr("Optional"));
+	settingsGrid->addWidget(new QLabel(tr("SRTLA URL"), connectionSettings_), 0, 0);
+	settingsGrid->addWidget(url_, 0, 1, 1, 3);
+	settingsGrid->addWidget(new QLabel(tr("Stream ID"), connectionSettings_), 1, 0);
+	settingsGrid->addWidget(streamId_, 1, 1);
+	settingsGrid->addWidget(new QLabel(tr("Passphrase"), connectionSettings_), 1, 2);
+	settingsGrid->addWidget(passphrase_, 1, 3);
+	settingsGrid->addWidget(secret_warning_, 2, 1, 1, 3);
+	settingsGrid->addWidget(new QLabel(tr("Encoder source"), connectionSettings_), 3, 0);
+	settingsGrid->addWidget(encoderSource_, 3, 1);
+	settingsGrid->addWidget(new QLabel(tr("Custom video encoder"), connectionSettings_), 3, 2);
+	settingsGrid->addWidget(customVideoEncoder_, 3, 3);
+	settingsGrid->addWidget(new QLabel(tr("Custom audio encoder"), connectionSettings_), 4, 2);
+	settingsGrid->addWidget(customAudioEncoder_, 4, 3);
+	layout->addWidget(connectionSettings_);
+	auto updateSettingsSummary = [this] {
+		const auto endpoint = url_->text().isEmpty() ? tr("No receiver URL") : url_->text();
+		auto encoder = encoderSource_->currentText();
+		if (encoderSource_->currentData().toString() == QStringLiteral("custom"))
+			encoder += QStringLiteral(" · %1 / %2").arg(customVideoEncoder_->currentText(), customAudioEncoder_->currentText());
+		settingsSummary_->setText(QStringLiteral("%1  ·  %2").arg(endpoint, encoder));
+	};
+	connect(settingsToggle, &QToolButton::toggled, this, [this, settingsToggle](bool expanded) {
+		connectionSettings_->setVisible(expanded);
+		settingsToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+	});
+	connect(url_, &QLineEdit::textChanged, this, [updateSettingsSummary] { updateSettingsSummary(); });
+	connect(encoderSource_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+		[updateSettingsSummary](int) { updateSettingsSummary(); });
+	connect(customVideoEncoder_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+		[updateSettingsSummary](int) { updateSettingsSummary(); });
+	connect(customAudioEncoder_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+		[updateSettingsSummary](int) { updateSettingsSummary(); });
+	updateSettingsSummary();
+
+	auto *adapterHeader = new QHBoxLayout();
+	adapterHeader->setContentsMargins(0, 0, 0, 0);
+	auto *adapterTitle = new QLabel(tr("Network adapters"), this);
+	QFont sectionFont = adapterTitle->font();
+	sectionFont.setWeight(QFont::DemiBold);
+	adapterTitle->setFont(sectionFont);
+	adapterCount_ = new QLabel(this);
+	showAllAdapters_ = new QCheckBox(tr("Show all adapters"), this);
+	showAllAdapters_->setToolTip(tr("Include unchecked adapters in the list"));
+	adapterHeader->addWidget(adapterTitle);
+	adapterHeader->addWidget(adapterCount_);
+	adapterHeader->addStretch(1);
+	adapterHeader->addWidget(showAllAdapters_);
+	layout->addLayout(adapterHeader);
+	connect(showAllAdapters_, &QCheckBox::toggled, this, [this] { applyAdapterVisibility(); });
+	trendHint_ = new QLabel(tr("Inline trends · same window"), this);
+	trendHint_->setAlignment(Qt::AlignRight);
+	layout->addWidget(trendHint_);
 
 	links_ = new QTableWidget(this);
 	links_->setColumnCount(9);
-	links_->setHorizontalHeaderLabels({tr("Use"), tr("Adapter / IP"), tr("State"), tr("NAK score"), tr("RTT"), tr("NAK rate"), tr("Offered"), tr("Delivered"), tr("CC target")});
-	links_->horizontalHeaderItem(3)->setToolTip(tr("NAK score tooltip"));
-	links_->horizontalHeaderItem(5)->setToolTip(tr("NAK rate tooltip"));
-	links_->horizontalHeader()->setStretchLastSection(true);
+	links_->setHorizontalHeaderLabels({tr("Use"), tr("Adapter / IP"), tr("State"), tr("NAK score\n%"), tr("RTT\nms"), tr("NAK rate\n%"), tr("Offered\nMb/s"), tr("Delivered\nMb/s"), tr("CC target\nMb/s")});
+	links_->horizontalHeaderItem(3)->setToolTip(tr("Network path quality score used by the link scheduler."));
+	links_->horizontalHeaderItem(5)->setToolTip(tr("SRT retransmission-request rate. Requests may be recovered; this is not final packet loss."));
+	links_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+	links_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+	links_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+	for (int column = 3; column < links_->columnCount(); ++column)
+		links_->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+	links_->verticalHeader()->setDefaultSectionSize(43);
+	links_->verticalHeader()->setMinimumSectionSize(40);
+	links_->setAlternatingRowColors(true);
 	links_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+	links_->setWordWrap(false);
+	links_->setTextElideMode(Qt::ElideMiddle);
+	links_->setSelectionBehavior(QAbstractItemView::SelectRows);
+	links_->setSelectionMode(QAbstractItemView::SingleSelection);
+	links_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+	links_->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
 	connect(links_, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *item) {
 		if (!item || item->column() != 0)
 			return;
@@ -286,8 +719,97 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 		}
 		selected_[key] = enabled;
 		saveSelectedLinks();
+		applyAdapterVisibility();
 	});
-	layout->addWidget(links_, 1);
+	connect(links_, &QTableWidget::itemSelectionChanged, this, [this] {
+		const int row = links_->currentRow();
+		const auto *identity = row >= 0 ? links_->item(row, 1) : nullptr;
+		if (identity)
+			selectedLinkKey_ = identity->data(Qt::UserRole).toString().toStdString();
+		updateHistoryPanel();
+	});
+	layout->addWidget(links_);
+
+	auto *historyPanel = new QFrame(this);
+	historyPanel->setFrameShape(QFrame::StyledPanel);
+	historyPanel_ = historyPanel;
+	auto *historyLayout = new QVBoxLayout(historyPanel);
+	historyLayout->setContentsMargins(8, 6, 8, 6);
+	historyLayout->setSpacing(4);
+	auto *historyHeader = new QHBoxLayout();
+	historyHeader->setContentsMargins(0, 0, 0, 0);
+	historyTitle_ = new QLabel(tr("Link history"), historyPanel);
+	QFont historyTitleFont = historyTitle_->font();
+	historyTitleFont.setWeight(QFont::DemiBold);
+	historyTitle_->setFont(historyTitleFont);
+	historyHeader->addWidget(historyTitle_);
+	historyHeader->addStretch(1);
+	historyRange_ = new QComboBox(historyPanel);
+	historyRange_->addItem(tr("1 min"), 60);
+	historyRange_->addItem(tr("5 min"), 300);
+	historyRange_->addItem(tr("15 min"), 900);
+	historyRange_->setToolTip(tr("History window for the overview and selected adapter"));
+	historyHeader->addWidget(historyRange_);
+	historyCollapse_ = new QToolButton(historyPanel);
+	historyCollapse_->setText(tr("Hide history"));
+	historyCollapse_->setCheckable(true);
+	historyCollapse_->setChecked(true);
+	historyHeader->addWidget(historyCollapse_);
+	historyLayout->addLayout(historyHeader);
+	auto *historyBody = new QWidget(historyPanel);
+	auto *historyBodyLayout = new QVBoxLayout(historyBody);
+	historyBodyLayout->setContentsMargins(0, 0, 0, 0);
+	historyBodyLayout->setSpacing(4);
+	auto *legend = new QHBoxLayout();
+	legend->setContentsMargins(0, 0, 0, 0);
+	const auto addLegendItem = [legend, historyPanel](const QString &name, const QColor &color, Qt::PenStyle style) {
+		auto *swatch = new QLabel(style == Qt::DashLine ? QStringLiteral("┄┄") : QStringLiteral("━━"), historyPanel);
+		swatch->setStyleSheet(QStringLiteral("color: %1; font-weight: 600;").arg(color.name()));
+		legend->addWidget(swatch);
+		legend->addWidget(new QLabel(name, historyPanel));
+	};
+	addLegendItem(tr("Offered"), QColor(184, 196, 216), Qt::SolidLine);
+	addLegendItem(tr("Delivered"), QColor(111, 199, 164), Qt::SolidLine);
+	addLegendItem(tr("CC target"), QColor(225, 173, 82), Qt::DashLine);
+	legend->addWidget(new QLabel(tr("Mb/s · shared scale"), historyPanel));
+	legend->addStretch(1);
+	historyBodyLayout->addLayout(legend);
+	auto *chartGrid = new QGridLayout();
+	chartGrid->setContentsMargins(0, 0, 0, 0);
+	chartGrid->setHorizontalSpacing(12);
+	chartGrid->setVerticalSpacing(4);
+	const std::array<QString, 3> chartTitles = {tr("Offered, delivered & congestion target"), tr("RTT · ms"), tr("NAK rate · %")};
+	for (size_t index = 0; index < historyCharts_.size(); ++index) {
+		auto *container = new QWidget(historyBody);
+		auto *chartLayout = new QVBoxLayout(container);
+		chartLayout->setContentsMargins(0, 0, 0, 0);
+		chartLayout->setSpacing(1);
+		auto *title = new QLabel(chartTitles[index], container);
+		chartLayout->addWidget(title);
+		historyCharts_[index] = new HistoryChartWidget(container);
+		historyCharts_[index]->setMinimumHeight(index == 0 ? 124 : 96);
+		chartLayout->addWidget(historyCharts_[index], 1);
+		chartGrid->addWidget(container, index == 0 ? 0 : 1, index == 0 ? 0 : static_cast<int>(index - 1),
+			index == 0 ? 1 : 1, index == 0 ? 2 : 1);
+	}
+	chartGrid->setColumnStretch(0, 1);
+	chartGrid->setColumnStretch(1, 1);
+	historyBodyLayout->addLayout(chartGrid, 1);
+	historyNow_ = new QLabel(tr("No history yet · start output to collect link telemetry"), historyBody);
+	historyBodyLayout->addWidget(historyNow_);
+	historyLayout->addWidget(historyBody, 1);
+	connect(historyRange_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+		historyWindowSeconds_ = historyRange_->itemData(index).toInt();
+		updateOverviewSparklines();
+		updateHistoryPanel();
+	});
+	connect(historyCollapse_, &QToolButton::toggled, this, [this, historyBody](bool expanded) {
+		historyBody->setVisible(expanded);
+		historyCollapse_->setText(expanded ? tr("Hide history") : tr("Show history"));
+	});
+	layout->addWidget(historyPanel_);
+	layout->addStretch(1);
+	updateHistoryPanel();
 
 	connect(startStop_, &QPushButton::clicked, this, &SrtlaDock::toggleOutput);
 	connect(autoBitrate_, &QCheckBox::toggled, this, [this](bool automatic) {
@@ -503,6 +1025,14 @@ void SrtlaDock::stopOutput()
 	}
 	if (startStop_) startStop_->setText(tr("Start"));
 	if (state_) state_->setText(tr("Idle"));
+	for (size_t index = 0; index < metricValues_.size(); ++index) {
+		metricValues_[index]->setText(QStringLiteral("--"));
+		metricSparklines_[index]->setHistory({});
+		metricHistory_[index].clear();
+	}
+	linkHistory_.clear();
+	updateOverviewSparklines();
+	updateHistoryPanel();
 }
 
 void SrtlaDock::refreshAdapters()
@@ -519,17 +1049,180 @@ void SrtlaDock::refreshAdapters()
 		links_->setItem(row, 0, use);
 		auto *identity = new QTableWidgetItem(QString::fromStdString(adapter.label + " / " + adapter.address));
 		identity->setData(Qt::UserRole, QString::fromStdString(adapter.id));
+		identity->setToolTip(QString::fromStdString(adapter.label + " / " + adapter.address));
 		links_->setItem(row, 1, identity);
-		links_->setItem(row, 2, new QTableWidgetItem(adapter.operational ? tr("Ready") : tr("Offline")));
-		links_->setItem(row, 3, new QTableWidgetItem(adapter.operational ? tr("Warming") : tr("Offline")));
-		links_->setItem(row, 4, new QTableWidgetItem(QStringLiteral("--")));
-		links_->setItem(row, 5, new QTableWidgetItem(QStringLiteral("--")));
-		links_->setItem(row, 6, new QTableWidgetItem(QStringLiteral("--")));
-		links_->setItem(row, 7, new QTableWidgetItem(QStringLiteral("--")));
-		links_->setItem(row, 8, new QTableWidgetItem(QStringLiteral("--")));
+		auto *state = new QTableWidgetItem(adapter.operational ? tr("Ready") : tr("Offline"));
+		links_->setItem(row, 2, state);
+		auto &history = linkHistory_[adapter.id];
+		set_telemetry_cell(links_, row, 3, QStringLiteral("--"), history[0], {}, historyWindowSeconds_);
+		for (int column = 4; column < 9; ++column)
+			set_telemetry_cell(links_, row, column, QStringLiteral("--"), history[static_cast<size_t>(column - 3)], {}, historyWindowSeconds_);
+		links_->setRowHeight(row, 46);
+	}
+	applyAdapterVisibility();
+	int selectedRow = -1;
+	int firstSelectedRow = -1;
+	for (int row = 0; row < links_->rowCount(); ++row) {
+		auto *identity = links_->item(row, 1);
+		if (!identity)
+			continue;
+		const bool selected = links_->item(row, 0)->checkState() == Qt::Checked;
+		if (selected && firstSelectedRow < 0)
+			firstSelectedRow = row;
+		if (identity->data(Qt::UserRole).toString().toStdString() == selectedLinkKey_ && !links_->isRowHidden(row))
+			selectedRow = row;
+	}
+	if (selectedRow < 0)
+		selectedRow = firstSelectedRow;
+	if (selectedRow < 0 && links_->rowCount() > 0)
+		selectedRow = 0;
+	if (selectedRow >= 0) {
+		links_->setCurrentCell(selectedRow, 1);
+		links_->selectRow(selectedRow);
+		if (const auto *identity = links_->item(selectedRow, 1))
+			selectedLinkKey_ = identity->data(Qt::UserRole).toString().toStdString();
+	} else {
+		selectedLinkKey_.clear();
 	}
 	if (output_ && running_)
 		srtla_output_update_adapters(output_);
+	updateHistoryPanel();
+}
+
+void SrtlaDock::resizeEvent(QResizeEvent *event)
+{
+	QWidget::resizeEvent(event);
+	arrangeOverview();
+}
+
+void SrtlaDock::arrangeOverview()
+{
+	if (!overviewLayout_)
+		return;
+	const int columns = width() >= 880 ? 6 : (width() >= 540 ? 3 : 2);
+	for (size_t index = 0; index < metricTiles_.size(); ++index) {
+		auto *tile = metricTiles_[index];
+		if (!tile)
+			continue;
+		overviewLayout_->removeWidget(tile);
+		overviewLayout_->addWidget(tile, static_cast<int>(index) / columns, static_cast<int>(index) % columns);
+	}
+	for (int column = 0; column < columns; ++column)
+		overviewLayout_->setColumnStretch(column, 1);
+}
+
+void SrtlaDock::applyAdapterVisibility()
+{
+	if (!links_ || !showAllAdapters_)
+		return;
+	int selectedCount = 0;
+	for (int row = 0; row < links_->rowCount(); ++row) {
+		const auto *use = links_->item(row, 0);
+		if (use && use->checkState() == Qt::Checked)
+			++selectedCount;
+	}
+	const bool showAll = showAllAdapters_->isChecked() || selectedCount == 0;
+	int visibleCount = 0;
+	{
+		QSignalBlocker blocker(links_);
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			const auto *use = links_->item(row, 0);
+			const bool selected = use && use->checkState() == Qt::Checked;
+			const bool visible = showAll || selected;
+			links_->setRowHidden(row, !visible);
+			if (visible)
+				++visibleCount;
+		}
+	}
+	adapterCount_->setText(selectedCount == 0 ? tr("· none selected") : tr("· %1 selected").arg(selectedCount));
+	showAllAdapters_->setText(tr("Show all adapters (%1)").arg(links_->rowCount()));
+	const int headerHeight = links_->horizontalHeader()->height();
+	const int rowHeight = links_->verticalHeader()->defaultSectionSize();
+	links_->setMaximumHeight(headerHeight + visibleCount * rowHeight + 2 * links_->frameWidth() + 8);
+	links_->setMinimumHeight(headerHeight + 2 * links_->frameWidth() + 8);
+	if (trendHint_)
+		trendHint_->setText(tr("Inline trends · %1 min").arg(historyWindowSeconds_ / 60));
+
+	int currentRow = links_->currentRow();
+	if (currentRow < 0 || links_->isRowHidden(currentRow)) {
+		currentRow = -1;
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			if (!links_->isRowHidden(row)) {
+				currentRow = row;
+				break;
+			}
+		}
+		if (currentRow >= 0) {
+			QSignalBlocker blocker(links_);
+			links_->setCurrentCell(currentRow, 1);
+			links_->selectRow(currentRow);
+		}
+	}
+	if (currentRow >= 0) {
+		if (const auto *identity = links_->item(currentRow, 1))
+			selectedLinkKey_ = identity->data(Qt::UserRole).toString().toStdString();
+	}
+	updateHistoryPanel();
+}
+
+void SrtlaDock::updateOverviewSparklines()
+{
+	if (!metricSparklines_[0])
+		return;
+	const int windowSeconds = std::max(1, historyWindowSeconds_);
+	const QString minutes = QString::number(windowSeconds / 60);
+	if (overviewTitle_)
+		overviewTitle_->setText(tr("Output overview · last %1 min").arg(minutes));
+	for (size_t index = 0; index < metricHistory_.size(); ++index) {
+		const auto values = history_tail(metricHistory_[index], windowSeconds);
+		if (index == 0 || index == 5)
+			metricSparklines_[index]->setHistory(values, {}, true, windowSeconds);
+		else if (index == 3)
+			metricSparklines_[index]->setHistory(values, history_tail(metricHistory_[4], windowSeconds), false, windowSeconds);
+		else
+			metricSparklines_[index]->setHistory(values, {}, false, windowSeconds);
+	}
+}
+
+void SrtlaDock::updateHistoryPanel()
+{
+	if (!historyTitle_ || !historyCharts_[0])
+		return;
+	QString adapterName = tr("No adapter selected");
+	auto found = linkHistory_.find(selectedLinkKey_);
+	if (!selectedLinkKey_.empty() && links_) {
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			const auto *identity = links_->item(row, 1);
+			if (identity && identity->data(Qt::UserRole).toString().toStdString() == selectedLinkKey_) {
+				adapterName = identity->text();
+				break;
+			}
+		}
+	}
+	historyTitle_->setText(tr("%1 · history").arg(adapterName));
+	const auto noHistory = std::array<std::deque<double>, 6>{};
+	const auto &history = found == linkHistory_.end() ? noHistory : found->second;
+	if (history[3].empty() || history[4].empty() || history[5].empty()) {
+		historyNow_->setText(tr("No history yet · start output to collect link telemetry"));
+	} else {
+		historyNow_->setText(tr("Now · Offered %1 Mb/s · Delivered %2 Mb/s · CC target %3 Mb/s · RTT %4 ms · NAK %5%")
+			.arg(history[3].back(), 0, 'f', 1)
+			.arg(history[4].back(), 0, 'f', 1)
+			.arg(history[5].back(), 0, 'f', 1)
+			.arg(history[1].empty() ? 0.0 : history[1].back(), 0, 'f', 0)
+			.arg(history[2].empty() ? 0.0 : history[2].back(), 0, 'f', 1));
+	}
+	const std::vector<HistoryChartWidget::Series> bandwidth = {
+		{tr("Offered"), history_tail(history[3], historyWindowSeconds_), QColor(184, 196, 216), Qt::SolidLine},
+		{tr("Delivered"), history_tail(history[4], historyWindowSeconds_), QColor(111, 199, 164), Qt::SolidLine},
+		{tr("CC target"), history_tail(history[5], historyWindowSeconds_), QColor(225, 173, 82), Qt::DashLine}};
+	const std::vector<HistoryChartWidget::Series> rtt = {
+		{tr("RTT"), history_tail(history[1], historyWindowSeconds_), QColor(130, 185, 255), Qt::SolidLine}};
+	const std::vector<HistoryChartWidget::Series> nak = {
+		{tr("NAK rate"), history_tail(history[2], historyWindowSeconds_), QColor(199, 146, 234), Qt::SolidLine}};
+	historyCharts_[0]->setSeries(bandwidth, historyWindowSeconds_);
+	historyCharts_[1]->setSeries(rtt, historyWindowSeconds_);
+	historyCharts_[2]->setSeries(nak, historyWindowSeconds_);
 }
 
 void SrtlaDock::saveSelectedLinks()
@@ -711,6 +1404,9 @@ void SrtlaDock::refreshStatus()
 	quint64 ccTarget = 0;
 	quint64 offered = 0;
 	quint64 delivered = 0;
+	const auto appendMetric = [this](size_t index, double value) {
+		append_sample(metricHistory_[index], value);
+	};
 	for (const auto &value : links) {
 		const auto link = value.toObject();
 		if (link.value(QStringLiteral("payload_eligible")).toBool()) {
@@ -725,12 +1421,25 @@ void SrtlaDock::refreshStatus()
 			if (!identity || QString::number(static_cast<qulonglong>(srtla_output_link_id(identity->data(Qt::UserRole).toString().toUtf8().constData()))) != id)
 				continue;
 			links_->item(row, 2)->setText(link.value(QStringLiteral("state")).toString());
-			links_->item(row, 3)->setText(QString::number(link.value(QStringLiteral("quality_percent")).toInt()) + QStringLiteral("%"));
-			links_->item(row, 4)->setText(QString::number(link.value(QStringLiteral("rtt_ms")).toInt()) + QStringLiteral(" ms"));
-			links_->item(row, 5)->setText(QString::number(link.value(QStringLiteral("loss_permille")).toInt() / 10.0, 'f', 1) + QStringLiteral("%"));
-			links_->item(row, 6)->setText(QString::number(link.value(QStringLiteral("used_bps")).toInteger() / 1000) + QStringLiteral(" kb/s"));
-			links_->item(row, 7)->setText(QString::number(link.value(QStringLiteral("delivered_bps")).toInteger() / 1000) + QStringLiteral(" kb/s"));
-			links_->item(row, 8)->setText(QString::number(link.value(QStringLiteral("target_bps")).toInteger() / 1000) + QStringLiteral(" kb/s"));
+			auto &history = linkHistory_[identity->data(Qt::UserRole).toString().toStdString()];
+			const auto quality = link.value(QStringLiteral("quality_percent")).toInt();
+			const auto rttMs = link.value(QStringLiteral("rtt_ms")).toInt();
+			const auto nakRate = link.value(QStringLiteral("loss_permille")).toInt() / 10.0;
+			const auto linkOffered = link.value(QStringLiteral("used_bps")).toInteger();
+			const auto linkDelivered = link.value(QStringLiteral("delivered_bps")).toInteger();
+			const auto target = link.value(QStringLiteral("target_bps")).toInteger();
+			append_sample(history[0], quality);
+			append_sample(history[1], rttMs);
+			append_sample(history[2], nakRate);
+			append_sample(history[3], static_cast<double>(linkOffered) / 1000000.0);
+			append_sample(history[4], static_cast<double>(linkDelivered) / 1000000.0);
+			append_sample(history[5], static_cast<double>(target) / 1000000.0);
+			set_telemetry_cell(links_, row, 3, QString::number(quality), history[0], {}, historyWindowSeconds_);
+			set_telemetry_cell(links_, row, 4, QString::number(rttMs), history[1], {}, historyWindowSeconds_);
+			set_telemetry_cell(links_, row, 5, QString::number(nakRate, 'f', 1), history[2], {}, historyWindowSeconds_);
+			set_telemetry_cell(links_, row, 6, QString::number(static_cast<double>(linkOffered) / 1000000.0, 'f', 1), history[3], {}, historyWindowSeconds_);
+			set_telemetry_cell(links_, row, 7, QString::number(static_cast<double>(linkDelivered) / 1000000.0, 'f', 1), history[4], {}, historyWindowSeconds_);
+			set_telemetry_cell(links_, row, 8, QString::number(static_cast<double>(target) / 1000000.0, 'f', 1), history[5], {}, historyWindowSeconds_);
 			identity->setToolTip(tr("CC: %1 | stall events: %2 | NAK: %3 | scheduler eligibility: %4 | reason: %5")
 				.arg(link.value(QStringLiteral("cc_state")).toString())
 				.arg(link.value(QStringLiteral("stall_gate_events")).toInteger())
@@ -742,26 +1451,32 @@ void SrtlaDock::refreshStatus()
 	}
 	const auto linkCapacity = root.value(QStringLiteral("link_capacity_bps")).toInteger(ccTarget);
 	const auto srtRaw = root.value(QStringLiteral("srt_bandwidth_bps")).toInteger();
-	const auto srtQueue = root.value(QStringLiteral("srt_connected")).toBool() ?
-		QStringLiteral("%1 packets / %2 ms")
-			.arg(root.value(QStringLiteral("srt_send_buffer_packets")).toInteger())
-			.arg(root.value(QStringLiteral("srt_send_buffer_ms")).toInteger()) :
-		QStringLiteral("--");
-	const auto rtt = root.value(QStringLiteral("srt_connected")).toBool() ?
-		QStringLiteral("%1 / %2 ms")
-			.arg(root.value(QStringLiteral("srt_rtt_ms")).toInteger())
-			.arg(root.value(QStringLiteral("srt_latency_ms")).toInteger()) :
-		QStringLiteral("--");
-	metrics_->setText(tr("ABR") + QStringLiteral(": %1 | ").arg(root.value(QStringLiteral("abr_state")).toString()) +
-		tr("RTT") + QStringLiteral(": %1 | ").arg(rtt) + tr("SRT queue") +
-		QStringLiteral(": %1\n").arg(srtQueue) + tr("Video") +
-		QStringLiteral(": %1 kb/s | ").arg(root.value(QStringLiteral("current_video_bps")).toInteger() / 1000) +
-		tr("Target") + QStringLiteral(": %1 kb/s | ").arg(root.value(QStringLiteral("recommended_video_bps")).toInteger() / 1000) +
-		tr("Link CC") + QStringLiteral(": %1 kb/s | ").arg(linkCapacity / 1000) +
-		tr("Offered") + QStringLiteral(": %1 kb/s | ").arg(offered / 1000) +
-		tr("Delivered") + QStringLiteral(": %1 kb/s | ").arg(delivered / 1000) +
-		tr("Active links") + QStringLiteral(": %1").arg(active));
-	metrics_->setToolTip(tr("Queue thresholds L/H/S: %1/%2/%3 packets | RTT grow below: %4 ms | RTT reduce above: %5 ms | SRT estimate: %6 kb/s | send: %7 kb/s | retransmissions: %8% | sender loss: %9 | dropped: %10 bytes")
+	const auto abrState = root.value(QStringLiteral("abr_state")).toString();
+	const bool srtReady = root.value(QStringLiteral("srt_stats_ready")).toBool();
+	const double rttValue = srtReady ? static_cast<double>(root.value(QStringLiteral("srt_rtt_ms")).toInteger()) :
+		std::numeric_limits<double>::quiet_NaN();
+	const double queueValue = srtReady ? static_cast<double>(root.value(QStringLiteral("srt_send_buffer_ms")).toInteger()) :
+		std::numeric_limits<double>::quiet_NaN();
+	const double videoValue = static_cast<double>(root.value(QStringLiteral("current_video_bps")).toInteger()) / 1000000.0;
+	const double targetValue = static_cast<double>(root.value(QStringLiteral("recommended_video_bps")).toInteger()) / 1000000.0;
+	appendMetric(0, abr_sparkline_level(abrState));
+	appendMetric(1, rttValue);
+	appendMetric(2, queueValue);
+	appendMetric(3, videoValue);
+	appendMetric(4, targetValue);
+	appendMetric(5, active);
+	metricValues_[0]->setText(abr_sparkline_label(abrState));
+	metricValues_[0]->setToolTip(abrState);
+	metricValues_[1]->setText(srtReady ? QStringLiteral("%1 / %2").arg(root.value(QStringLiteral("srt_rtt_ms")).toInteger()).arg(root.value(QStringLiteral("srt_latency_ms")).toInteger()) : QStringLiteral("--"));
+	metricValues_[1]->setToolTip(tr("Measured SRT RTT / configured latency, in milliseconds"));
+	metricValues_[2]->setText(srtReady ? tr("%1 pkt · %2 ms").arg(root.value(QStringLiteral("srt_send_buffer_packets")).toInteger()).arg(root.value(QStringLiteral("srt_send_buffer_ms")).toInteger()) : QStringLiteral("--"));
+	metricValues_[2]->setToolTip(tr("Current SRT sender queue: packet count and time"));
+	metricValues_[3]->setText(QStringLiteral("%1 Mb/s").arg(videoValue, 0, 'f', 1));
+	metricValues_[4]->setText(QStringLiteral("%1 Mb/s").arg(targetValue, 0, 'f', 1));
+	metricValues_[5]->setText(tr("%1 / %2").arg(active).arg(links.size()));
+	metricValues_[5]->setToolTip(tr("Active network paths / all configured paths"));
+	updateOverviewSparklines();
+	metricSparklines_[0]->setToolTip(tr("Queue thresholds L/H/S: %1/%2/%3 packets | RTT grow below: %4 ms | RTT reduce above: %5 ms | SRT estimate: %6 kb/s | send: %7 kb/s | link capacity: %8 kb/s | offered: %9 kb/s | delivered: %10 kb/s | retransmissions: %11% | sender loss: %12 | dropped: %13 bytes")
 		.arg(root.value(QStringLiteral("abr_queue_light_packets")).toInteger())
 		.arg(root.value(QStringLiteral("abr_queue_heavy_packets")).toInteger())
 		.arg(root.value(QStringLiteral("abr_queue_severe_packets")).toInteger())
@@ -769,6 +1484,9 @@ void SrtlaDock::refreshStatus()
 		.arg(root.value(QStringLiteral("abr_rtt_decrease_above_ms")).toInteger())
 		.arg(srtRaw / 1000)
 		.arg(root.value(QStringLiteral("srt_send_rate_bps")).toInteger() / 1000)
+		.arg(linkCapacity / 1000)
+		.arg(offered / 1000)
+		.arg(delivered / 1000)
 		.arg(root.value(QStringLiteral("srt_retransmit_permille")).toInteger() / 10.0, 0, 'f', 1)
 		.arg(root.value(QStringLiteral("srt_sender_loss_packets")).toInteger())
 		.arg(root.value(QStringLiteral("srt_dropped_bytes")).toInteger()));
@@ -776,4 +1494,5 @@ void SrtlaDock::refreshStatus()
 	state_->setText(state);
 	const auto error = root.value(QStringLiteral("error")).toString();
 	state_->setToolTip(error);
+	updateHistoryPanel();
 }
