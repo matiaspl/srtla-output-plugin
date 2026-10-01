@@ -20,6 +20,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPainter>
@@ -54,6 +55,7 @@ extern "C" int srtla_output_set_bitrate_control(struct obs_output *output, bool 
 extern "C" int srtla_output_set_max_bitrate(struct obs_output *output, int max_bitrate_kbps);
 extern "C" int srtla_output_update_adapters(struct obs_output *output);
 extern "C" std::size_t srtla_output_copy_stats_json(struct obs_output *output, char *buffer, std::size_t capacity);
+void srtla_websocket_emit_status_json(const char *json);
 
 namespace {
 
@@ -878,6 +880,136 @@ SrtlaDock::~SrtlaDock()
 		obs_data_release(settings_);
 }
 
+QByteArray SrtlaDock::websocketStatusJson()
+{
+	if (!running_ || !output_) {
+		QJsonObject status;
+		status.insert(QStringLiteral("running"), false);
+		const auto dockState = state_ ? state_->text() : QString();
+		const bool failedStart = dockState.startsWith(QStringLiteral("Error:"));
+		status.insert(QStringLiteral("state"), failedStart ? QStringLiteral("Error") : QStringLiteral("Idle"));
+		if (failedStart)
+			status.insert(QStringLiteral("error"), dockState.mid(6).trimmed());
+		status.insert(QStringLiteral("automatic_bitrate"), autoBitrate_->isChecked());
+		status.insert(QStringLiteral("manual_bitrate_kbps"), manualBitrate_->value());
+		status.insert(QStringLiteral("max_bitrate_kbps"), maxBitrate_->value());
+		QJsonArray links;
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			const auto *identity = links_->item(row, 1);
+			if (!identity)
+				continue;
+			const auto adapterId = identity->data(Qt::UserRole).toString();
+			QJsonObject link;
+			link.insert(QStringLiteral("id"), QString::number(static_cast<qulonglong>(
+				srtla_output_link_id(adapterId.toUtf8().constData()))));
+			link.insert(QStringLiteral("label"), identity->text());
+			link.insert(QStringLiteral("admin_enabled"), selected_[adapterId.toStdString()]);
+			link.insert(QStringLiteral("connected"), false);
+			link.insert(QStringLiteral("state"), QStringLiteral("Idle"));
+			links.append(link);
+		}
+		status.insert(QStringLiteral("links"), links);
+		return QJsonDocument(status).toJson(QJsonDocument::Compact);
+	}
+	const auto required = srtla_output_copy_stats_json(output_, nullptr, 0);
+	if (required == 0)
+		return {};
+	QByteArray buffer(static_cast<qsizetype>(required), '\0');
+	const auto actual = srtla_output_copy_stats_json(output_, buffer.data(), required);
+	if (actual == 0 || actual > required)
+		return {};
+	QJsonParseError parseError{};
+	const auto document = srtla::parse_stats_json(buffer, actual, &parseError);
+	if (parseError.error != QJsonParseError::NoError || !document.isObject())
+		return {};
+	// Keep stable 64-bit adapter IDs exact for clients whose JSON number type
+	// cannot represent every integer (notably JavaScript's Number type).
+	QByteArray json(buffer.constData(), static_cast<qsizetype>(actual - 1));
+	const auto controlSettings = QStringLiteral("\"automatic_bitrate\":%1,\"manual_bitrate_kbps\":%2,\"max_bitrate_kbps\":%3,")
+		.arg(autoBitrate_->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
+		.arg(manualBitrate_->value())
+		.arg(maxBitrate_->value()).toUtf8();
+	json.insert(1, controlSettings);
+	return QString::fromUtf8(json)
+		.replace(QRegularExpression(QStringLiteral("\\\"id\\\"\\s*:\\s*(\\d+)")),
+			QStringLiteral("\"id\":\"\\1\""))
+		.toUtf8();
+}
+
+bool SrtlaDock::websocketSetOutputActive(bool active, QString &error)
+{
+	if (running_ == active)
+		return true;
+	toggleOutput();
+	if (running_ != active) {
+		error = state_ ? state_->text() : tr("Unable to change SRTLA output state.");
+		return false;
+	}
+	return true;
+}
+
+bool SrtlaDock::websocketSetLinkEnabled(std::uint64_t linkId, bool enabled, QString &error)
+{
+	for (int row = 0; row < links_->rowCount(); ++row) {
+		auto *identity = links_->item(row, 1);
+		auto *checkbox = links_->item(row, 0);
+		if (!identity || !checkbox)
+			continue;
+		const auto key = identity->data(Qt::UserRole).toString();
+		if (srtla_output_link_id(key.toUtf8().constData()) != linkId)
+			continue;
+		checkbox->setCheckState(enabled ? Qt::Checked : Qt::Unchecked);
+		if (selected_[key.toStdString()] != enabled) {
+			error = tr("The link could not be changed. The last enabled link cannot be disabled while output is running.");
+			return false;
+		}
+		return true;
+	}
+	error = tr("Unknown link ID.");
+	return false;
+}
+
+bool SrtlaDock::websocketSetBitrateControl(bool automatic, int manualBitrateKbps, QString &error)
+{
+	if (manualBitrateKbps < manualBitrate_->minimum() || manualBitrateKbps > manualBitrate_->maximum()) {
+		error = tr("Manual bitrate must be between %1 and %2 kb/s.")
+			.arg(manualBitrate_->minimum()).arg(manualBitrate_->maximum());
+		return false;
+	}
+	if (running_ && output_ && srtla_output_set_bitrate_control(output_, automatic, manualBitrateKbps) != 0) {
+		error = tr("The selected encoder cannot change bitrate while active.");
+		return false;
+	}
+	const QSignalBlocker manualBlocker(manualBitrate_);
+	const QSignalBlocker automaticBlocker(autoBitrate_);
+	manualBitrate_->setValue(manualBitrateKbps);
+	autoBitrate_->setChecked(automatic);
+	manualBitrate_->setDisabled(automatic);
+	if (settings_) {
+		obs_data_set_bool(settings_, "auto_bitrate", automatic);
+		obs_data_set_int(settings_, "bitrate", manualBitrateKbps);
+	}
+	return true;
+}
+
+bool SrtlaDock::websocketSetMaxBitrate(int maxBitrateKbps, QString &error)
+{
+	if (maxBitrateKbps < maxBitrate_->minimum() || maxBitrateKbps > maxBitrate_->maximum()) {
+		error = tr("Maximum bitrate must be between %1 and %2 kb/s.")
+			.arg(maxBitrate_->minimum()).arg(maxBitrate_->maximum());
+		return false;
+	}
+	if (running_ && output_ && srtla_output_set_max_bitrate(output_, maxBitrateKbps) != 0) {
+		error = tr("The selected encoder cannot change bitrate while active.");
+		return false;
+	}
+	const QSignalBlocker maximumBlocker(maxBitrate_);
+	maxBitrate_->setValue(maxBitrateKbps);
+	if (settings_)
+		obs_data_set_int(settings_, "max_bitrate", maxBitrateKbps);
+	return true;
+}
+
 void SrtlaDock::loadProfile()
 {
 	secret_error_ = false;
@@ -1495,4 +1627,7 @@ void SrtlaDock::refreshStatus()
 	const auto error = root.value(QStringLiteral("error")).toString();
 	state_->setToolTip(error);
 	updateHistoryPanel();
+	const auto vendorStatus = websocketStatusJson();
+	if (!vendorStatus.isEmpty())
+		srtla_websocket_emit_status_json(vendorStatus.constData());
 }

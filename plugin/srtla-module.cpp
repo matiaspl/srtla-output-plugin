@@ -2,6 +2,7 @@
 #include <obs-frontend-api.h>
 
 #include "srtla-dock.hpp"
+#include "srtla-websocket.hpp"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("srtla-output", "en-US")
@@ -56,8 +57,15 @@ bool obs_module_load(void)
 	return true;
 }
 
+void obs_module_post_load(void)
+{
+	if (dock)
+		srtla_websocket_initialize(dock);
+}
+
 void obs_module_unload(void)
 {
+	srtla_websocket_shutdown();
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
 	// obs_frontend_add_dock_by_id transfers ownership of the QWidget to OBS.
 	// obs_frontend_remove_dock() drops OBS's shared_ptr and destroys the dock;

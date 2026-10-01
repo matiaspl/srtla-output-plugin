@@ -1,8 +1,11 @@
 #pragma once
 
 #include <QWidget>
+#include <QByteArray>
+#include <QString>
 
 #include <array>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <string>
@@ -31,6 +34,11 @@ public:
 	void stopOutput();
 	void reloadProfile();
 	bool sharesEncoderWith(struct obs_output *other) const;
+	QByteArray websocketStatusJson();
+	bool websocketSetOutputActive(bool active, QString &error);
+	bool websocketSetLinkEnabled(std::uint64_t linkId, bool enabled, QString &error);
+	bool websocketSetBitrateControl(bool automatic, int manualBitrateKbps, QString &error);
+	bool websocketSetMaxBitrate(int maxBitrateKbps, QString &error);
 
 protected:
 	void resizeEvent(QResizeEvent *event) override;

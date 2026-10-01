@@ -6,6 +6,8 @@ endif()
 
 add_library(${SRTLA_PLUGIN_NAME} MODULE
   srtla-module.cpp
+  srtla-websocket.cpp
+  srtla-websocket.hpp
   srtla-output.cpp
   srtla-dock.cpp
   srtla-dock.hpp

@@ -42,9 +42,40 @@ can be toggled and the manual bitrate adjusted while the output is live. Other
 encoders remain usable at a fixed bitrate while the dock continues to show
 transport telemetry.
 
+## obs-websocket integration
+
+On OBS Studio 28 and later, this plugin registers the `obs-srtla-output` vendor
+with the built-in obs-websocket server. Use the standard `CallVendorRequest`
+request with `vendorName: "obs-srtla-output"` and one of these request types:
+
+| Request type | Request data | Purpose |
+| --- | --- | --- |
+| `GetStatus` | `{}` | Return the current SRTLA and SRT telemetry snapshot. |
+| `SetOutputActive` | `{"active":true}` | Start or stop using the connection and encoder settings in the current OBS profile. |
+| `SetLinkEnabled` | `{"linkId":"<decimal ID>","enabled":true}` | Enable or disable a configured link. |
+| `SetBitrateControl` | `{"automatic":true,"manualBitrateKbps":1500}` | Select automatic or manual video bitrate control. |
+| `SetMaxBitrate` | `{"maxBitrateKbps":6000}` | Set the automatic bitrate ceiling. |
+
+While the output is running, `GetStatus` returns the same telemetry fields
+shown in the dock, including per-link quality, RTT, retransmission-request rate,
+offered and delivered rate, scheduler state, end-to-end SRT RTT and queue depth,
+and ABR state. When stopped, it returns the configured links and bitrate
+settings. Link `id` values are decimal strings so clients preserve the full
+64-bit identifier. The snapshot includes `automatic_bitrate`,
+`manual_bitrate_kbps`, and `max_bitrate_kbps` for reading back control settings.
+`StatusChanged` vendor events carry that same status object once per second
+while the output is running. Subscribe to the obs-websocket `Vendors` event
+category to receive them.
+
+Control requests return `success`; failed requests also include an `error`
+string. Link changes preserve the dock's last-enabled-link guard. Bitrate values
+use kb/s and must fit the ranges shown in the dock. The encoder's dynamic
+bitrate capability still applies to live bitrate changes. The vendor API does
+not expose the SRT passphrase.
+
 ## Current status and limitations
 
-This is an early `0.1.2` development release, not a production-certified
+This is an early `0.1.3` development release, not a production-certified
 release. The in-process SRT/SRTLA path, OBS output and dock,
 adaptive-bitrate controller, platform-native adapter discovery, MPEG-TS muxer,
 reconnect path, and bounded engine ABI are implemented.
