@@ -75,7 +75,7 @@ not expose the SRT passphrase.
 
 ## Current status and limitations
 
-This is an early `0.1.5` development release, not a production-certified
+This is an early `0.1.6` development release, not a production-certified
 release. The in-process SRT/SRTLA path, OBS output and dock,
 adaptive-bitrate controller, platform-native adapter discovery, MPEG-TS muxer,
 reconnect path, and bounded engine ABI are implemented.

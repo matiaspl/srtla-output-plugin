@@ -58,6 +58,33 @@ struct SrtSession::Impl {
 namespace {
 std::once_flag startup_once;
 
+void close_socket(SrtSession::Impl *session, SRTSOCKET socket)
+{
+	if (!session || socket == SRT_INVALID_SOCK)
+		return;
+	std::lock_guard<std::mutex> lock(session->socket_mutex);
+	if (session->socket != socket)
+		return;
+	// Claim the socket before closing it so Stop and the connector thread cannot
+	// both pass the same handle to libsrt. Its garbage collector frees the
+	// underlying socket asynchronously, so a duplicate close can corrupt its
+	// internal lifetime state.
+	session->socket = SRT_INVALID_SOCK;
+	srt_close(socket);
+}
+
+void close_current_socket(SrtSession::Impl *session)
+{
+	if (!session)
+		return;
+	std::lock_guard<std::mutex> lock(session->socket_mutex);
+	const SRTSOCKET socket = session->socket;
+	if (socket == SRT_INVALID_SOCK)
+		return;
+	session->socket = SRT_INVALID_SOCK;
+	srt_close(socket);
+}
+
 void set_status(SrtSession::Impl *session, SrtSession::Status status, std::string error = {})
 {
 	if (!session)
@@ -277,19 +304,14 @@ bool SrtSession::start()
 				impl_->socket = socket;
 			}
 			if (impl_->stop.load()) {
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				srt_close(socket);
-				impl_->socket = SRT_INVALID_SOCK;
+				close_socket(impl_.get(), socket);
 				return;
 			}
 			auto set_option = [&](SRT_SOCKOPT option, const void *value, int length, const char *name) {
 				if (srt_setsockopt(socket, 0, option, value, length) == 0)
 					return true;
 				set_status(impl_.get(), Status::Fatal, srt_error(name));
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				if (impl_->socket == socket)
-					impl_->socket = SRT_INVALID_SOCK;
-				srt_close(socket);
+				close_socket(impl_.get(), socket);
 				return false;
 			};
 			int latency = impl_->latency_ms;
@@ -319,9 +341,7 @@ bool SrtSession::start()
 			}
 			if (srt_set_external_transport(socket, &impl_->transport) != 0) {
 				set_status(impl_.get(), Status::Fatal, srt_error("srt_set_external_transport"));
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				srt_close(socket);
-				impl_->socket = SRT_INVALID_SOCK;
+				close_socket(impl_.get(), socket);
 				return;
 			}
 			sockaddr_storage local{};
@@ -338,9 +358,7 @@ bool SrtSession::start()
 			if (srt_bind(socket, reinterpret_cast<sockaddr *>(&local), remote.ss_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6)) != 0) {
 				const auto error = srt_error("srt_bind");
 				set_status(impl_.get(), ever_connected ? Status::Reconnecting : Status::Connecting, error);
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				srt_close(socket);
-				impl_->socket = SRT_INVALID_SOCK;
+				close_socket(impl_.get(), socket);
 				for (unsigned wait = 0; wait < backoff * 10 && !impl_->stop.load(); ++wait)
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				continue;
@@ -351,9 +369,7 @@ bool SrtSession::start()
 					set_status(impl_.get(), Status::Connecting, error);
 				else
 					set_status(impl_.get(), Status::Reconnecting, error);
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				srt_close(socket);
-				impl_->socket = SRT_INVALID_SOCK;
+				close_socket(impl_.get(), socket);
 				for (unsigned wait = 0; wait < backoff * 10 && !impl_->stop.load(); ++wait)
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
 				continue;
@@ -379,9 +395,7 @@ bool SrtSession::start()
 				const auto error = srt_error("SRT connection handshake");
 				set_status(impl_.get(), ever_connected ? Status::Reconnecting : Status::Connecting,
 				           error.empty() ? "SRT connection timed out" : error);
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				srt_close(socket);
-				impl_->socket = SRT_INVALID_SOCK;
+				close_socket(impl_.get(), socket);
 				continue;
 			}
 			int negotiated_latency = impl_->latency_ms;
@@ -404,13 +418,7 @@ bool SrtSession::start()
 			connected_.store(false);
 			if (!impl_->stop.load())
 				set_status(impl_.get(), Status::Reconnecting, "SRT session disconnected");
-			{
-				std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-				if (impl_->socket == socket) {
-					srt_close(socket);
-					impl_->socket = SRT_INVALID_SOCK;
-				}
-			}
+			close_socket(impl_.get(), socket);
 			if (!impl_->stop.load())
 				for (unsigned wait = 0; wait < backoff * 10 && !impl_->stop.load(); ++wait)
 					std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -430,13 +438,7 @@ void SrtSession::stop()
 	if (!impl_)
 		return;
 	impl_->stop.store(true);
-	{
-		std::lock_guard<std::mutex> lock(impl_->socket_mutex);
-		if (impl_->socket != SRT_INVALID_SOCK) {
-			srt_close(impl_->socket);
-			impl_->socket = SRT_INVALID_SOCK;
-		}
-	}
+	close_current_socket(impl_.get());
 	if (impl_->connector.joinable())
 		impl_->connector.join();
 	connected_.store(false);
