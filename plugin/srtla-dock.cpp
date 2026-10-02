@@ -27,6 +27,7 @@
 #include <QSignalBlocker>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScrollBar>
 #include <QSizePolicy>
 #include <QToolButton>
 #include <QUrl>
@@ -230,12 +231,13 @@ public:
 	}
 
 	void setHistory(const std::deque<double> &values, const std::deque<double> &reference = {}, bool stepped = false,
-			 int windowSeconds = 60)
+			 int windowSeconds = 60, QColor valueColor = QColor(130, 185, 255))
 	{
 		values_ = values;
 		reference_ = reference;
 		stepped_ = stepped;
 		windowSeconds_ = std::max(1, windowSeconds);
+		valueColor_ = std::move(valueColor);
 		update();
 	}
 
@@ -306,11 +308,15 @@ protected:
 				}
 				previous = point;
 			}
+			// Keep a narrow base-colored edge around each series so it remains
+			// distinct over both the normal cell background and the row selection.
+			painter.setPen(QPen(palette().color(QPalette::Window), 3.2, style, Qt::RoundCap, Qt::RoundJoin));
+			painter.drawPath(path);
 			painter.setPen(QPen(color, 1.5, style, Qt::RoundCap, Qt::RoundJoin));
 			painter.drawPath(path);
 		};
 		drawSeries(reference_, QColor(225, 173, 82), Qt::DashLine);
-		drawSeries(values_, palette().color(QPalette::Highlight), Qt::SolidLine);
+		drawSeries(values_, valueColor_, Qt::SolidLine);
 	}
 
 private:
@@ -318,6 +324,7 @@ private:
 	std::deque<double> reference_;
 	bool stepped_ = false;
 	int windowSeconds_ = 60;
+	QColor valueColor_{130, 185, 255};
 };
 
 class HistoryChartWidget final : public QWidget {
@@ -459,6 +466,19 @@ std::deque<double> history_tail(const std::deque<double> &history, int seconds)
 	return {history.end() - static_cast<std::ptrdiff_t>(count), history.end()};
 }
 
+QColor link_sparkline_color(int column)
+{
+	switch (column) {
+	case 3: return QColor(111, 199, 164);  // NAK score
+	case 4: return QColor(130, 185, 255);  // RTT
+	case 5: return QColor(199, 146, 234);  // NAK rate
+	case 6: return QColor(184, 196, 216);  // Offered
+	case 7: return QColor(111, 199, 164);  // Delivered
+	case 8: return QColor(225, 173, 82);   // CC target
+	default: return QColor(130, 185, 255);
+	}
+}
+
 void set_telemetry_cell(QTableWidget *table, int row, int column, const QString &value,
 			const std::deque<double> &history, const std::deque<double> &reference = {}, int windowSeconds = 60)
 {
@@ -481,7 +501,8 @@ void set_telemetry_cell(QTableWidget *table, int row, int column, const QString 
 	if (auto *text = cell->findChild<QLabel *>(QStringLiteral("telemetryValue")))
 		text->setText(value);
 	if (auto *plot = cell->findChild<QWidget *>(QStringLiteral("telemetryHistory")))
-		static_cast<SparklineWidget *>(plot)->setHistory(history_tail(history, windowSeconds), history_tail(reference, windowSeconds), false, windowSeconds);
+		static_cast<SparklineWidget *>(plot)->setHistory(history_tail(history, windowSeconds), history_tail(reference, windowSeconds), false,
+										 windowSeconds, link_sparkline_color(column));
 }
 
 QString abr_sparkline_label(const QString &state)
@@ -1164,55 +1185,110 @@ void SrtlaDock::stopOutput()
 void SrtlaDock::refreshAdapters()
 {
 	const auto adapters = NetworkMonitor().enumerate();
-	QSignalBlocker blocker(links_);
-	links_->setRowCount(static_cast<int>(adapters.size()));
-	for (int row = 0; row < links_->rowCount(); ++row) {
-		const auto &adapter = adapters[static_cast<size_t>(row)];
-		const auto selection = selected_.try_emplace(adapter.id, adapter.enabled).first;
-		const bool enabled = selection->second;
-		auto *use = new QTableWidgetItem();
-		use->setCheckState(enabled ? Qt::Checked : Qt::Unchecked);
-		links_->setItem(row, 0, use);
-		auto *identity = new QTableWidgetItem(QString::fromStdString(adapter.label + " / " + adapter.address));
-		identity->setData(Qt::UserRole, QString::fromStdString(adapter.id));
-		identity->setToolTip(QString::fromStdString(adapter.label + " / " + adapter.address));
-		links_->setItem(row, 1, identity);
-		auto *state = new QTableWidgetItem(adapter.operational ? tr("Ready") : tr("Offline"));
-		links_->setItem(row, 2, state);
-		auto &history = linkHistory_[adapter.id];
-		set_telemetry_cell(links_, row, 3, QStringLiteral("--"), history[0], {}, historyWindowSeconds_);
-		for (int column = 4; column < 9; ++column)
-			set_telemetry_cell(links_, row, column, QStringLiteral("--"), history[static_cast<size_t>(column - 3)], {}, historyWindowSeconds_);
-		links_->setRowHeight(row, 46);
+	bool topologyChanged = links_->rowCount() != static_cast<int>(adapters.size());
+	if (!topologyChanged) {
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			const auto *identity = links_->item(row, 1);
+			if (!identity || !links_->item(row, 0) || !links_->item(row, 2) ||
+			    identity->data(Qt::UserRole).toString().toStdString() != adapters[static_cast<size_t>(row)].id) {
+				topologyChanged = true;
+				break;
+			}
+		}
 	}
-	applyAdapterVisibility();
-	int selectedRow = -1;
-	int firstSelectedRow = -1;
-	for (int row = 0; row < links_->rowCount(); ++row) {
-		auto *identity = links_->item(row, 1);
-		if (!identity)
-			continue;
-		const bool selected = links_->item(row, 0)->checkState() == Qt::Checked;
-		if (selected && firstSelectedRow < 0)
-			firstSelectedRow = row;
-		if (identity->data(Qt::UserRole).toString().toStdString() == selectedLinkKey_ && !links_->isRowHidden(row))
-			selectedRow = row;
+
+	if (!topologyChanged) {
+		bool visibilityChanged = false;
+		bool historyTitleChanged = false;
+		{
+			QSignalBlocker blocker(links_);
+			for (int row = 0; row < links_->rowCount(); ++row) {
+				const auto &adapter = adapters[static_cast<size_t>(row)];
+				const auto selection = selected_.try_emplace(adapter.id, adapter.enabled).first;
+				auto *use = links_->item(row, 0);
+				const auto desiredCheckState = selection->second ? Qt::Checked : Qt::Unchecked;
+				if (use && use->checkState() != desiredCheckState) {
+					use->setCheckState(desiredCheckState);
+					visibilityChanged = true;
+				}
+				auto *identity = links_->item(row, 1);
+				const QString label = QString::fromStdString(adapter.label + " / " + adapter.address);
+				if (identity && identity->text() != label) {
+					identity->setText(label);
+					identity->setToolTip(label);
+					if (identity->data(Qt::UserRole).toString().toStdString() == selectedLinkKey_)
+						historyTitleChanged = true;
+				}
+				if (auto *state = links_->item(row, 2))
+					state->setText(adapter.operational ? tr("Ready") : tr("Offline"));
+			}
+		}
+		if (visibilityChanged)
+			applyAdapterVisibility();
+		else if (historyTitleChanged)
+			updateHistoryPanel();
+		if (output_ && running_)
+			srtla_output_update_adapters(output_);
+		return;
 	}
-	if (selectedRow < 0)
-		selectedRow = firstSelectedRow;
-	if (selectedRow < 0 && links_->rowCount() > 0)
-		selectedRow = 0;
-	if (selectedRow >= 0) {
-		links_->setCurrentCell(selectedRow, 1);
-		links_->selectRow(selectedRow);
-		if (const auto *identity = links_->item(selectedRow, 1))
-			selectedLinkKey_ = identity->data(Qt::UserRole).toString().toStdString();
-	} else {
-		selectedLinkKey_.clear();
+
+	const int verticalScrollPosition = links_->verticalScrollBar()->value();
+	const int horizontalScrollPosition = links_->horizontalScrollBar()->value();
+	{
+		QSignalBlocker blocker(links_);
+		links_->setRowCount(static_cast<int>(adapters.size()));
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			const auto &adapter = adapters[static_cast<size_t>(row)];
+			const auto selection = selected_.try_emplace(adapter.id, adapter.enabled).first;
+			const bool enabled = selection->second;
+			auto *use = new QTableWidgetItem();
+			use->setCheckState(enabled ? Qt::Checked : Qt::Unchecked);
+			links_->setItem(row, 0, use);
+			auto *identity = new QTableWidgetItem(QString::fromStdString(adapter.label + " / " + adapter.address));
+			identity->setData(Qt::UserRole, QString::fromStdString(adapter.id));
+			identity->setToolTip(QString::fromStdString(adapter.label + " / " + adapter.address));
+			links_->setItem(row, 1, identity);
+			auto *state = new QTableWidgetItem(adapter.operational ? tr("Ready") : tr("Offline"));
+			links_->setItem(row, 2, state);
+			auto &history = linkHistory_[adapter.id];
+			set_telemetry_cell(links_, row, 3, QStringLiteral("--"), history[0], {}, historyWindowSeconds_);
+			for (int column = 4; column < 9; ++column)
+				set_telemetry_cell(links_, row, column, QStringLiteral("--"), history[static_cast<size_t>(column - 3)], {}, historyWindowSeconds_);
+			links_->setRowHeight(row, 46);
+		}
+		applyAdapterVisibility();
+		int selectedRow = -1;
+		int firstSelectedRow = -1;
+		for (int row = 0; row < links_->rowCount(); ++row) {
+			auto *identity = links_->item(row, 1);
+			if (!identity)
+				continue;
+			const bool selected = links_->item(row, 0)->checkState() == Qt::Checked;
+			if (selected && firstSelectedRow < 0)
+				firstSelectedRow = row;
+			if (identity->data(Qt::UserRole).toString().toStdString() == selectedLinkKey_ && !links_->isRowHidden(row))
+				selectedRow = row;
+		}
+		if (selectedRow < 0)
+			selectedRow = firstSelectedRow;
+		if (selectedRow < 0 && links_->rowCount() > 0)
+			selectedRow = 0;
+		if (selectedRow >= 0) {
+			links_->setCurrentCell(selectedRow, 1);
+			links_->selectRow(selectedRow);
+			if (const auto *identity = links_->item(selectedRow, 1))
+				selectedLinkKey_ = identity->data(Qt::UserRole).toString().toStdString();
+		} else {
+			selectedLinkKey_.clear();
+		}
+		if (output_ && running_)
+			srtla_output_update_adapters(output_);
+		updateHistoryPanel();
 	}
-	if (output_ && running_)
-		srtla_output_update_adapters(output_);
-	updateHistoryPanel();
+	QTimer::singleShot(0, links_, [this, verticalScrollPosition, horizontalScrollPosition] {
+		links_->verticalScrollBar()->setValue(verticalScrollPosition);
+		links_->horizontalScrollBar()->setValue(horizontalScrollPosition);
+	});
 }
 
 void SrtlaDock::resizeEvent(QResizeEvent *event)
