@@ -59,6 +59,10 @@ modified by
 #include "socketconfig.h"
 #include "netinet_any.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+
 namespace srt
 {
 
@@ -95,7 +99,7 @@ public:
     /// Install or replace the external transport on an existing channel.
     void setExternalTransport(const SRT_TRANSPORT_V1& transport);
 
-    bool hasExternalTransport() const { return m_externalTransport != NULL; }
+    bool hasExternalTransport() const { return m_hasExternalTransport.load(std::memory_order_acquire); }
 
     /// Disconnect and close the UDP entity.
 
@@ -176,13 +180,19 @@ public:
 
 private:
     void setUDPSockOpt();
+    bool beginExternalCallback(SRT_TRANSPORT_V1& transport) const;
+    void endExternalCallback() const;
 
 private:
     UDPSOCKET m_iSocket; // socket descriptor
 
-    const SRT_TRANSPORT_V1* m_externalTransport;
+    std::atomic<bool> m_hasExternalTransport;
     SRT_TRANSPORT_V1 m_externalTransportValue;
+    mutable std::mutex m_externalTransportMutex;
+    mutable std::condition_variable m_externalCallbacksDrained;
+    mutable size_t m_externalCallbacksInFlight;
     mutable bool m_externalClosed;
+    mutable bool m_externalCloseInProgress;
     // Logical peer address used when no kernel UDP socket exists.  It is
     // learned from the first external send and remains available to
     // srt_getpeername()/channel diagnostics.

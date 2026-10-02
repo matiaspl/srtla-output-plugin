@@ -2,13 +2,22 @@
 
 #include <cassert>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 
 namespace {
 struct TransportState {
 	std::atomic<int> wake_count{0};
 	std::atomic<int> close_count{0};
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool receive_entered = false;
+	bool allow_receive_return = false;
+	bool receive_finished = false;
 };
 
 int send_datagram(void *, const std::uint8_t *, std::size_t, const std::uint8_t *, std::size_t,
@@ -20,15 +29,32 @@ int send_datagram(void *, const std::uint8_t *, std::size_t, const std::uint8_t 
 int receive_datagram(void *opaque, std::uint8_t *, std::size_t, std::size_t *received,
                     sockaddr_storage *, int)
 {
-	if (static_cast<TransportState *>(opaque)->wake_count.load() > 0)
-		return -1;
+	auto *state = static_cast<TransportState *>(opaque);
+	std::unique_lock<std::mutex> lock(state->mutex);
+	state->receive_entered = true;
+	state->changed.notify_all();
+	state->changed.wait(lock, [state] { return state->allow_receive_return; });
+	state->receive_finished = true;
+	state->changed.notify_all();
 	if (received)
 		*received = 0;
 	return 0;
 }
 
-void wake(void *opaque) { ++static_cast<TransportState *>(opaque)->wake_count; }
-void close_transport(void *opaque) { ++static_cast<TransportState *>(opaque)->close_count; }
+void wake(void *opaque)
+{
+	auto *state = static_cast<TransportState *>(opaque);
+	std::lock_guard<std::mutex> lock(state->mutex);
+	++state->wake_count;
+	state->changed.notify_all();
+}
+void close_transport(void *opaque)
+{
+	auto *state = static_cast<TransportState *>(opaque);
+	std::lock_guard<std::mutex> lock(state->mutex);
+	++state->close_count;
+	state->changed.notify_all();
+}
 } // namespace
 
 int main()
@@ -54,8 +80,36 @@ int main()
 	logical_v4->sin_addr.s_addr = htonl(INADDR_ANY);
 	logical_v4->sin_port = 0;
 	assert(srt_bind(socket, reinterpret_cast<const sockaddr *>(&logical), sizeof(sockaddr_in)) == 0);
-	assert(srt_close(socket) == 0);
+	{
+		std::unique_lock<std::mutex> lock(state.mutex);
+		assert(state.changed.wait_for(lock, std::chrono::seconds(2), [&state] { return state.receive_entered; }));
+	}
+	std::atomic<bool> close_returned{false};
+	std::thread closing([&state, socket, &close_returned] {
+		assert(srt_close(socket) == 0);
+		std::lock_guard<std::mutex> lock(state.mutex);
+		close_returned.store(true);
+		state.changed.notify_all();
+	});
+	bool close_returned_while_callback_active = false;
+	{
+		std::unique_lock<std::mutex> lock(state.mutex);
+		assert(state.changed.wait_for(lock, std::chrono::seconds(2), [&state] {
+			return state.wake_count.load() > 0;
+		}));
+		close_returned_while_callback_active = state.changed.wait_for(
+			lock, std::chrono::milliseconds(30), [&close_returned] { return close_returned.load(); });
+		state.allow_receive_return = true;
+		state.changed.notify_all();
+	}
+	closing.join();
+	assert(!close_returned_while_callback_active);
+	assert(close_returned.load());
 	assert(state.wake_count.load() == 1);
 	assert(state.close_count.load() == 1);
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		assert(state.receive_finished);
+	}
 	assert(srt_cleanup() == 0);
 }

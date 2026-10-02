@@ -140,9 +140,11 @@ static int set_cloexec(int fd, int set)
 
 srt::CChannel::CChannel()
     : m_iSocket(INVALID_SOCKET)
-    , m_externalTransport(NULL)
+    , m_hasExternalTransport(false)
     , m_externalTransportValue()
+    , m_externalCallbacksInFlight(0)
     , m_externalClosed(false)
+    , m_externalCloseInProgress(false)
     , m_externalPeerAddr()
 #ifdef SRT_ENABLE_PKTINFO
     , m_bBindMasked(true)
@@ -167,20 +169,47 @@ srt::CChannel::~CChannel() {}
 
 void srt::CChannel::openExternal(const sockaddr_any& addr, const SRT_TRANSPORT_V1& transport)
 {
+    std::unique_lock<std::mutex> lock(m_externalTransportMutex);
+    m_externalCallbacksDrained.wait(lock, [this] {
+        return !m_externalCloseInProgress && m_externalCallbacksInFlight == 0;
+    });
     m_iSocket = INVALID_SOCKET;
     m_BindAddr = addr;
     m_externalTransportValue = transport;
-    m_externalTransport = &m_externalTransportValue;
+    m_hasExternalTransport.store(true, std::memory_order_release);
     m_externalClosed = false;
     m_externalPeerAddr = sockaddr_any();
 }
 
 void srt::CChannel::setExternalTransport(const SRT_TRANSPORT_V1& transport)
 {
+    std::unique_lock<std::mutex> lock(m_externalTransportMutex);
+    m_externalCallbacksDrained.wait(lock, [this] {
+        return !m_externalCloseInProgress && m_externalCallbacksInFlight == 0;
+    });
     m_externalTransportValue = transport;
-    m_externalTransport = &m_externalTransportValue;
+    m_hasExternalTransport.store(true, std::memory_order_release);
     m_externalClosed = false;
     m_externalPeerAddr = sockaddr_any();
+}
+
+bool srt::CChannel::beginExternalCallback(SRT_TRANSPORT_V1& transport) const
+{
+    std::lock_guard<std::mutex> lock(m_externalTransportMutex);
+    if (!m_hasExternalTransport.load(std::memory_order_acquire) || m_externalClosed)
+        return false;
+    transport = m_externalTransportValue;
+    ++m_externalCallbacksInFlight;
+    return true;
+}
+
+void srt::CChannel::endExternalCallback() const
+{
+    std::lock_guard<std::mutex> lock(m_externalTransportMutex);
+    if (m_externalCallbacksInFlight > 0)
+        --m_externalCallbacksInFlight;
+    if (m_externalCallbacksInFlight == 0)
+        m_externalCallbacksDrained.notify_all();
 }
 
 void srt::CChannel::createSocket(int family)
@@ -606,15 +635,35 @@ void srt::CChannel::setUDPSockOpt()
 
 void srt::CChannel::close() const
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
     {
-        if (m_externalClosed)
-            return;
-        m_externalClosed = true;
-        if (m_externalTransport->wake)
-            m_externalTransport->wake(m_externalTransport->opaque);
-        if (m_externalTransport->close)
-            m_externalTransport->close(m_externalTransport->opaque);
+        SRT_TRANSPORT_V1 transport{};
+        {
+            std::unique_lock<std::mutex> lock(m_externalTransportMutex);
+            if (m_externalClosed)
+            {
+                m_externalCallbacksDrained.wait(lock, [this] {
+                    return !m_externalCloseInProgress && m_externalCallbacksInFlight == 0;
+                });
+                return;
+            }
+            m_externalClosed = true;
+            m_externalCloseInProgress = true;
+            transport = m_externalTransportValue;
+        }
+        if (transport.wake)
+            transport.wake(transport.opaque);
+        if (transport.close)
+            transport.close(transport.opaque);
+
+        // The receive and send queues are shared worker threads.  Wake and
+        // close stop new callbacks, but srt_close must also wait for callbacks
+        // already in progress before the application's opaque context can be
+        // released.
+        std::unique_lock<std::mutex> lock(m_externalTransportMutex);
+        m_externalCallbacksDrained.wait(lock, [this] { return m_externalCallbacksInFlight == 0; });
+        m_externalCloseInProgress = false;
+        m_externalCallbacksDrained.notify_all();
         return;
     }
 #ifndef _WIN32
@@ -626,7 +675,7 @@ void srt::CChannel::close() const
 
 int srt::CChannel::getSndBufSize()
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
         return m_mcfg.iUDPSndBufSize;
     socklen_t size = (socklen_t)sizeof m_mcfg.iUDPSndBufSize;
     ::getsockopt(m_iSocket, SOL_SOCKET, SO_SNDBUF, (char*)&m_mcfg.iUDPSndBufSize, &size);
@@ -635,7 +684,7 @@ int srt::CChannel::getSndBufSize()
 
 int srt::CChannel::getRcvBufSize()
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
         return m_mcfg.iUDPRcvBufSize;
     socklen_t size = (socklen_t)sizeof m_mcfg.iUDPRcvBufSize;
     ::getsockopt(m_iSocket, SOL_SOCKET, SO_RCVBUF, (char*)&m_mcfg.iUDPRcvBufSize, &size);
@@ -649,7 +698,7 @@ void srt::CChannel::setConfig(const CSrtMuxerConfig& config)
 
 void srt::CChannel::getSocketOption(int level, int option, char* pw_dataptr, socklen_t& w_len, int& w_status)
 {
-	if (m_externalTransport)
+	if (hasExternalTransport())
 	{
 		// There is no OS socket behind an embedded transport.  Socket options
 		// that describe the data-plane UDP handle therefore have no value; keep
@@ -662,7 +711,7 @@ void srt::CChannel::getSocketOption(int level, int option, char* pw_dataptr, soc
 
 int srt::CChannel::getIpTTL() const
 {
-	if (m_externalTransport)
+	if (hasExternalTransport())
 		return m_mcfg.iIpTTL;
 	if (m_iSocket == INVALID_SOCKET)
         throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
@@ -687,7 +736,7 @@ int srt::CChannel::getIpTTL() const
 
 int srt::CChannel::getIpToS() const
 {
-	if (m_externalTransport)
+	if (hasExternalTransport())
 		return m_mcfg.iIpToS;
 	if (m_iSocket == INVALID_SOCKET)
         throw CUDTException(MJ_NOTSUP, MN_INVAL, 0);
@@ -733,7 +782,7 @@ bool srt::CChannel::getBind(char* dst, size_t len)
 
 int srt::CChannel::ioctlQuery(int type SRT_ATR_UNUSED) const
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
         return -1;
 #if defined(unix) || defined(__APPLE__)
     int value = 0;
@@ -746,7 +795,7 @@ int srt::CChannel::ioctlQuery(int type SRT_ATR_UNUSED) const
 
 int srt::CChannel::sockoptQuery(int level SRT_ATR_UNUSED, int option SRT_ATR_UNUSED) const
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
         return -1;
 #if defined(unix) || defined(__APPLE__)
     int       value = 0;
@@ -760,7 +809,7 @@ int srt::CChannel::sockoptQuery(int level SRT_ATR_UNUSED, int option SRT_ATR_UNU
 
 void srt::CChannel::getSockAddr(sockaddr_any& w_addr) const
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
     {
         w_addr = m_BindAddr;
         return;
@@ -776,8 +825,9 @@ void srt::CChannel::getSockAddr(sockaddr_any& w_addr) const
 
 void srt::CChannel::getPeerAddr(sockaddr_any& w_addr) const
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
     {
+        std::lock_guard<std::mutex> lock(m_externalTransportMutex);
         w_addr = m_externalPeerAddr.empty() ? m_BindAddr : m_externalPeerAddr;
         return;
     }
@@ -858,22 +908,29 @@ int srt::CChannel::sendto(const sockaddr_any& addr, CPacket& packet, const socka
 
 #endif
 
-    if (m_externalTransport)
+    if (hasExternalTransport())
     {
-        m_externalPeerAddr = addr;
+        SRT_TRANSPORT_V1 transport{};
+        if (!beginExternalCallback(transport))
+            return -1;
+        {
+            std::lock_guard<std::mutex> lock(m_externalTransportMutex);
+            m_externalPeerAddr = addr;
+        }
         packet.toNetworkByteOrder();
         sockaddr_storage destination;
         memset(&destination, 0, sizeof destination);
         memcpy(&destination, addr.get(), addr.size());
-        const int result = m_externalTransport->send_datagram
-            ? m_externalTransport->send_datagram(m_externalTransport->opaque,
-                                                 reinterpret_cast<const uint8_t *>(packet.m_PacketVector[CPacket::PV_HEADER].data()),
-                                                 CPacket::HDR_SIZE,
-                                                 reinterpret_cast<const uint8_t *>(packet.m_PacketVector[CPacket::PV_DATA].data()),
-                                                 packet.m_PacketVector[CPacket::PV_DATA].size(),
-                                                 &destination)
+        const int result = transport.send_datagram
+            ? transport.send_datagram(transport.opaque,
+                                      reinterpret_cast<const uint8_t *>(packet.m_PacketVector[CPacket::PV_HEADER].data()),
+                                      CPacket::HDR_SIZE,
+                                      reinterpret_cast<const uint8_t *>(packet.m_PacketVector[CPacket::PV_DATA].data()),
+                                      packet.m_PacketVector[CPacket::PV_DATA].size(),
+                                      &destination)
             : -1;
         packet.toHostByteOrder();
+        endExternalCallback();
         return result == 0 ? static_cast<int>(CPacket::HDR_SIZE + packet.getLength()) : -1;
     }
 
@@ -984,9 +1041,10 @@ int srt::CChannel::sendto(const sockaddr_any& addr, CPacket& packet, const socka
 
 srt::EReadStatus srt::CChannel::recvfrom(sockaddr_any& w_addr, CPacket& w_packet) const
 {
-    if (m_externalTransport)
+    if (hasExternalTransport())
     {
-        if (m_externalClosed)
+        SRT_TRANSPORT_V1 transport{};
+        if (!beginExternalCallback(transport))
         {
             w_packet.setLength(-1);
             return RST_ERROR;
@@ -996,9 +1054,10 @@ srt::EReadStatus srt::CChannel::recvfrom(sockaddr_any& w_addr, CPacket& w_packet
         size_t received = 0;
         sockaddr_storage source;
         memset(&source, 0, sizeof source);
-        const int result = m_externalTransport->receive_datagram
-            ? m_externalTransport->receive_datagram(m_externalTransport->opaque, datagram.data(), datagram.size(), &received, &source, 10)
+        const int result = transport.receive_datagram
+            ? transport.receive_datagram(transport.opaque, datagram.data(), datagram.size(), &received, &source, 10)
             : -1;
+        endExternalCallback();
         if (result == 0 || received == 0)
         {
             w_packet.setLength(-1);
