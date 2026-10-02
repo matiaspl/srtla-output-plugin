@@ -111,5 +111,31 @@ int main()
 		std::lock_guard<std::mutex> lock(state.mutex);
 		assert(state.receive_finished);
 	}
+
+	// A streaming session creates another SRT socket after a reconnect. Exercise
+	// repeated bind/close cycles while previous sockets are still eligible for
+	// asynchronous GC, as happens when an uplink disappears during a stream.
+	for (int cycle = 0; cycle < 24; ++cycle) {
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.receive_entered = false;
+			state.receive_finished = false;
+		}
+		const SRTSOCKET reconnect_socket = srt_create_socket();
+		assert(reconnect_socket != SRT_INVALID_SOCK);
+		assert(srt_set_external_transport(reconnect_socket, &transport) == 0);
+		assert(srt_bind(reconnect_socket, reinterpret_cast<const sockaddr *>(&logical), sizeof(sockaddr_in)) == 0);
+		{
+			std::unique_lock<std::mutex> lock(state.mutex);
+			assert(state.changed.wait_for(lock, std::chrono::seconds(2), [&state] {
+				return state.receive_entered;
+			}));
+		}
+		assert(srt_close(reconnect_socket) == 0);
+		assert(state.wake_count.load() == cycle + 2);
+		assert(state.close_count.load() == cycle + 2);
+		std::lock_guard<std::mutex> lock(state.mutex);
+		assert(state.receive_finished);
+	}
 	assert(srt_cleanup() == 0);
 }

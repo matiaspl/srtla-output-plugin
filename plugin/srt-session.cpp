@@ -42,8 +42,6 @@ struct SrtSession::Impl {
 	std::mutex remote_mutex;
 	SRTSOCKET socket = SRT_INVALID_SOCK;
 	std::atomic_bool stop{false};
-	std::atomic_bool transport_closed{false};
-	std::atomic_bool wake_requested{false};
 	std::thread connector;
 	StatusCallback status_callback;
 	mutable std::mutex status_mutex;
@@ -197,8 +195,6 @@ int transport_receive(void *opaque, std::uint8_t *buffer, std::size_t capacity, 
 		*received = 0;
 	if (!session || session->stop.load())
 		return -1;
-	if (session->wake_requested.exchange(false))
-		return -1;
 	const int result = srtla_engine_receive_srt_datagram(session->engine, buffer, capacity,
 		static_cast<std::uint32_t>(timeout_ms < 0 ? 0 : timeout_ms));
 	if (result <= 0)
@@ -211,20 +207,6 @@ int transport_receive(void *opaque, std::uint8_t *buffer, std::size_t capacity, 
 		std::memcpy(source, &session->remote, session->remote_len);
 	}
 	return 1;
-}
-
-void transport_wake(void *opaque)
-{
-	if (auto *session = static_cast<SrtSession::Impl *>(opaque))
-		session->wake_requested.store(true);
-}
-
-void transport_close(void *opaque)
-{
-	if (auto *session = static_cast<SrtSession::Impl *>(opaque)) {
-		session->transport_closed.store(true);
-		session->wake_requested.store(true);
-	}
 }
 
 bool resolve_remote(const std::string &host, std::uint16_t port, sockaddr_storage &remote, socklen_t &length)
@@ -255,8 +237,13 @@ SrtSession::SrtSession(SrtlaEngineHandle *engine, std::string host, std::uint16_
 	impl_->transport.opaque = impl_.get();
 	impl_->transport.send_datagram = transport_send;
 	impl_->transport.receive_datagram = transport_receive;
-	impl_->transport.wake = transport_wake;
-	impl_->transport.close = transport_close;
+	// Receive callbacks return within 10 ms. A shared wake latch cannot interrupt
+	// one already in progress and can leak an old socket's close into the next
+	// socket created by the reconnect loop, causing its first receive to fail.
+	// The optional hooks are unnecessary because CChannel::close waits for this
+	// bounded receive callback to return before srt_close completes.
+	impl_->transport.wake = nullptr;
+	impl_->transport.close = nullptr;
 }
 
 SrtSession::~SrtSession() { stop(); }
@@ -273,8 +260,6 @@ bool SrtSession::start()
 	}
 	ensure_srt_startup();
 	impl_->stop.store(false);
-	impl_->wake_requested.store(false);
-	impl_->transport_closed.store(false);
 	set_status(impl_.get(), Status::Connecting);
 	try {
 		impl_->connector = std::thread([this] {

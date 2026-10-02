@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "srtla-engine"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "proptest",
  "serde",
