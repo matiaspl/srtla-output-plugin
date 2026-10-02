@@ -104,7 +104,7 @@ fn default_true() -> bool {
 
 #[derive(Clone, Debug, Serialize)]
 struct LinkSnapshot {
-    id: u64,
+    id: String,
     label: String,
     admin_enabled: bool,
     connected: bool,
@@ -556,7 +556,7 @@ impl Engine {
                 .links
                 .iter()
                 .map(|l| LinkSnapshot {
-                    id: l.id,
+                    id: l.id.to_string(),
                     label: l.label.clone(),
                     admin_enabled: l.enabled,
                     connected: l.connected,
@@ -1364,6 +1364,24 @@ mod tests {
             needed
         );
         assert_eq!(out[needed - 1], 0);
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn stats_json_preserves_full_width_link_ids_as_decimal_strings() {
+        let config =
+            CString::new(r#"{"links":[{"id":18446744073709551615,"label":"adapter"}]}"#).unwrap();
+        let handle = srtla_engine_create(config.as_ptr());
+        assert!(!handle.is_null());
+
+        let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
+        let mut output = vec![0 as c_char; needed];
+        assert_eq!(
+            srtla_engine_copy_stats_json(handle, output.as_mut_ptr(), output.len()),
+            needed
+        );
+        let json = unsafe { CStr::from_ptr(output.as_ptr()) }.to_string_lossy();
+        assert!(json.contains(r#""id":"18446744073709551615""#));
         srtla_engine_destroy(handle);
     }
 

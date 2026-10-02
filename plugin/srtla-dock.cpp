@@ -20,7 +20,6 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QRegularExpression>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPainter>
@@ -922,18 +921,13 @@ QByteArray SrtlaDock::websocketStatusJson()
 	const auto document = srtla::parse_stats_json(buffer, actual, &parseError);
 	if (parseError.error != QJsonParseError::NoError || !document.isObject())
 		return {};
-	// Keep stable 64-bit adapter IDs exact for clients whose JSON number type
-	// cannot represent every integer (notably JavaScript's Number type).
 	QByteArray json(buffer.constData(), static_cast<qsizetype>(actual - 1));
 	const auto controlSettings = QStringLiteral("\"automatic_bitrate\":%1,\"manual_bitrate_kbps\":%2,\"max_bitrate_kbps\":%3,")
 		.arg(autoBitrate_->isChecked() ? QStringLiteral("true") : QStringLiteral("false"))
 		.arg(manualBitrate_->value())
 		.arg(maxBitrate_->value()).toUtf8();
 	json.insert(1, controlSettings);
-	return QString::fromUtf8(json)
-		.replace(QRegularExpression(QStringLiteral("\\\"id\\\"\\s*:\\s*(\\d+)")),
-			QStringLiteral("\"id\":\"\\1\""))
-		.toUtf8();
+	return json;
 }
 
 bool SrtlaDock::websocketSetOutputActive(bool active, QString &error)
