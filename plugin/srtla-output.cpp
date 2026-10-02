@@ -665,16 +665,19 @@ static void srtla_output_destroy(void *opaque)
 	data->capture_active.store(false);
 	stop_abr_worker(data);
 	stop_worker(data);
-	if (data->session)
-		data->session->stop();
+	// SrtSession borrows the engine handle and its destructor reports a final
+	// status through that handle, so destroy the session before the engine.
+	data->session.reset();
 	restore_shared_bitrate(data);
 	data->muxer.reset();
 	{
 		std::lock_guard<std::mutex> lock(output_registry_mutex);
 		output_registry.erase(data->output);
 	}
-	if (data->engine)
+	if (data->engine) {
 		srtla_engine_destroy(data->engine);
+		data->engine = nullptr;
+	}
 	delete data;
 }
 
@@ -869,7 +872,6 @@ static bool srtla_output_start(void *opaque)
 		const auto error = data->session->last_error().empty() ?
 			"SRT receiver did not connect within five seconds" : data->session->last_error();
 		obs_output_set_last_error(data->output, error.c_str());
-		data->session->stop();
 		data->session.reset();
 		srtla_engine_stop(data->engine);
 		return false;
@@ -900,7 +902,6 @@ static bool srtla_output_start(void *opaque)
 	if (srtla_engine_set_video_bitrate(
 		data->engine, static_cast<std::uint64_t>(std::max(1, active_bitrate_kbps)) * 1000ULL) != 0) {
 		obs_output_set_last_error(data->output, "SRTLA video bitrate initialization failed");
-		data->session->stop();
 		data->session.reset();
 		srtla_engine_stop(data->engine);
 		restore_shared_bitrate(data);
@@ -920,7 +921,6 @@ static bool srtla_output_start(void *opaque)
 			});
 	} catch (...) {
 		obs_output_set_last_error(data->output, "MPEG-TS muxer allocation failed");
-		data->session->stop();
 		data->session.reset();
 		srtla_engine_stop(data->engine);
 		restore_shared_bitrate(data);
@@ -942,8 +942,7 @@ static bool srtla_output_start(void *opaque)
 		data->capture_active.store(false);
 		stop_abr_worker(data);
 		stop_worker(data);
-		if (data->session)
-			data->session->stop();
+		data->session.reset();
 		if (data->engine)
 			srtla_engine_stop(data->engine);
 		restore_shared_bitrate(data);
@@ -964,8 +963,7 @@ static void srtla_output_stop(void *opaque, uint64_t ts)
 	data->capture_active.store(false);
 	stop_abr_worker(data);
 	stop_worker(data);
-	if (data->session)
-		data->session->stop();
+	data->session.reset();
 	if (data->engine)
 		srtla_engine_stop(data->engine);
 	restore_shared_bitrate(data);
