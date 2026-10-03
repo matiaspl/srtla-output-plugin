@@ -42,6 +42,10 @@ can be toggled and the manual bitrate adjusted while the output is live. Other
 encoders remain usable at a fixed bitrate while the dock continues to show
 transport telemetry.
 
+## Dock screenshot
+
+![SRTLA Output dock showing live stream status, network adapters, and link history](docs/srtla_dock.png)
+
 ## obs-websocket integration
 
 On OBS Studio 28 and later, this plugin registers the `obs-srtla-output` vendor
