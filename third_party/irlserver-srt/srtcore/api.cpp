@@ -2209,6 +2209,13 @@ int srt::CUDTUnited::close(CUDTSocket* s)
         // very socket is used, this shall not block the central database.
         s->core().closeInternal();
 
+        // closeInternal() can return early (already closed by the GC, or a
+        // non-blocking linger).  An embedded transport's opaque context is
+        // owned by the application, which may release it as soon as
+        // srt_close() returns, so the callback channel must be closed and
+        // drained here unconditionally.
+        s->core().closeExternalChannel();
+
         // synchronize with garbage collection.
         HLOGC(smlog.Debug,
               log << "@" << u << "U::close done. GLOBAL CLOSE: " << s->core().CONID()
@@ -2887,6 +2894,16 @@ void srt::CUDTUnited::checkBrokenSockets()
 
         // close broken connections and start removal timer
         s->setClosed();
+        // Once the socket leaves m_Sockets, srt_close() can no longer find it
+        // and returns without closing anything, while the multiplexer (and
+        // its receive/send workers) stays alive until removeSocket() runs at
+        // least one GC period later.  For an embedded transport that would
+        // leave libsrt calling into an opaque context the application may
+        // already have freed.  Close and drain the callback channel now, so
+        // that a socket absent from m_Sockets never invokes the transport.
+        // The drain only waits for in-flight transport callbacks, which do
+        // not take m_GlobControlLock.
+        s->core().closeExternalChannel();
         tbc.push_back(i->first);
         m_ClosedSockets[i->first] = s;
 
