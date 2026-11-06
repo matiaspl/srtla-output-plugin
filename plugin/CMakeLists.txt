@@ -106,9 +106,9 @@ else()
     RUNTIME DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}"
     LIBRARY DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}")
   install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../README.md"
-    DESTINATION "${OBS_SRTLA_OBS_PLUGIN_DIR}/${SRTLA_PLUGIN_NAME}")
+    DESTINATION "${OBS_SRTLA_PLUGIN_METADATA_INSTALL_DIR}")
   install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
-    DESTINATION "${OBS_SRTLA_OBS_DATA_DIR}/${SRTLA_PLUGIN_NAME}")
+    DESTINATION "${OBS_SRTLA_PLUGIN_DATA_INSTALL_DIR}")
 endif()
 
 # mbedTLS is statically linked, matching the OBS SRT dependency.  Preserve its
@@ -120,7 +120,7 @@ if(OBS_SRTLA_MBEDTLS_ROOT AND
         "${SRTLA_PLUGIN_NAME}.plugin/Contents/Resources/${SRTLA_PLUGIN_NAME}/licenses")
   else()
     set(_obs_srtla_mbedtls_license_dir
-        "${OBS_SRTLA_OBS_PLUGIN_DIR}/${SRTLA_PLUGIN_NAME}/licenses")
+        "${OBS_SRTLA_PLUGIN_METADATA_INSTALL_DIR}/licenses")
   endif()
   install(FILES "${OBS_SRTLA_MBEDTLS_ROOT}/share/mbedtls/copyright"
           DESTINATION "${_obs_srtla_mbedtls_license_dir}"

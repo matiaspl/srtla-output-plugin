@@ -13,19 +13,57 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(GNUInstallDirs)
-if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-  set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING
-      "Minimum macOS deployment target")
+
+# The OBS major version selects the install layout and the package name.  OBS
+# 33 reworked third-party plugin loading: the pre-33 locations still load, but
+# are flagged as "Legacy" in the Plugin Manager and will be removed in OBS 34.
+set(OBS_SRTLA_OBS_VERSION_MAJOR "32" CACHE STRING
+    "OBS Studio major version the plugin is built and packaged for")
+set_property(CACHE OBS_SRTLA_OBS_VERSION_MAJOR PROPERTY STRINGS 32 33)
+if(NOT OBS_SRTLA_OBS_VERSION_MAJOR MATCHES "^[0-9]+$" OR
+   OBS_SRTLA_OBS_VERSION_MAJOR LESS 32)
+  message(FATAL_ERROR
+    "OBS_SRTLA_OBS_VERSION_MAJOR must be 32 or newer, got '${OBS_SRTLA_OBS_VERSION_MAJOR}'")
 endif()
-if(WIN32)
+if(OBS_SRTLA_OBS_VERSION_MAJOR GREATER_EQUAL 33)
+  set(OBS_SRTLA_OBS_MODERN_LAYOUT ON)
+else()
+  set(OBS_SRTLA_OBS_MODERN_LAYOUT OFF)
+endif()
+
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  # OBS 33 raised its own minimum macOS version to 13.
+  if(OBS_SRTLA_OBS_MODERN_LAYOUT)
+    set(_obs_srtla_osx_deployment_default "13.0")
+  else()
+    set(_obs_srtla_osx_deployment_default "12.0")
+  endif()
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "${_obs_srtla_osx_deployment_default}"
+      CACHE STRING "Minimum macOS deployment target")
+endif()
+if(WIN32 AND OBS_SRTLA_OBS_MODERN_LAYOUT)
+  # OBS 33: C:/ProgramData/obs-studio/plugins/<plugin>/<plugin>.dll with the
+  # module data in <plugin>/data.  The package is extracted into
+  # C:/ProgramData/obs-studio/plugins.
+  set(_obs_srtla_plugin_dir_default "${SRTLA_PLUGIN_NAME}")
+  set(_obs_srtla_data_dir_default "${SRTLA_PLUGIN_NAME}/data")
+elseif(WIN32)
   set(_obs_srtla_plugin_dir_default "obs-plugins/64bit")
   set(_obs_srtla_data_dir_default "data/obs-plugins")
 elseif(APPLE)
   # macOS plugins are installed as bundles. These cache variables remain
   # available for consumers that include the project from a larger build, but
-  # the plugin subdirectory owns the bundle's install layout.
+  # the plugin subdirectory owns the bundle's install layout.  The bundle
+  # location (~/Library/Application Support/obs-studio/plugins) is the same
+  # for OBS 32 and OBS 33.
   set(_obs_srtla_plugin_dir_default ".")
   set(_obs_srtla_data_dir_default ".")
+elseif(UNIX AND OBS_SRTLA_OBS_MODERN_LAYOUT)
+  # OBS 33 system plugin locations:
+  #   <prefix>/<libdir>/obs-modules/plugins/<plugin>.so
+  #   <prefix>/share/obs/obs-modules/plugins/<plugin>/
+  set(_obs_srtla_plugin_dir_default "${CMAKE_INSTALL_LIBDIR}/obs-modules/plugins")
+  set(_obs_srtla_data_dir_default "${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-modules/plugins")
 elseif(UNIX)
   set(_obs_srtla_plugin_dir_default "${CMAKE_INSTALL_LIBDIR}/obs-plugins")
   set(_obs_srtla_data_dir_default "${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins")
@@ -43,6 +81,19 @@ set(OBS_SRTLA_OBS_PLUGIN_DIR "${_obs_srtla_plugin_dir_default}" CACHE PATH
     "OBS plugin install directory")
 set(OBS_SRTLA_OBS_DATA_DIR "${_obs_srtla_data_dir_default}" CACHE PATH
     "OBS plugin data directory")
+
+# Concrete install locations of this plugin's data and metadata (README,
+# licenses).  On Windows with OBS 33+ the data directory already belongs to
+# this plugin; every other layout has a shared parent directory.
+if(WIN32 AND OBS_SRTLA_OBS_MODERN_LAYOUT)
+  set(OBS_SRTLA_PLUGIN_DATA_INSTALL_DIR "${OBS_SRTLA_OBS_DATA_DIR}")
+  set(OBS_SRTLA_PLUGIN_METADATA_INSTALL_DIR "${OBS_SRTLA_OBS_PLUGIN_DIR}")
+else()
+  set(OBS_SRTLA_PLUGIN_DATA_INSTALL_DIR
+      "${OBS_SRTLA_OBS_DATA_DIR}/${SRTLA_PLUGIN_NAME}")
+  set(OBS_SRTLA_PLUGIN_METADATA_INSTALL_DIR
+      "${OBS_SRTLA_OBS_PLUGIN_DIR}/${SRTLA_PLUGIN_NAME}")
+endif()
 set(OBS_SRTLA_USE_OBS_COMPAT_CONFIG OFF)
 set(_ffmpeg_root_default "")
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/obs-ffmpeg-dev/include/libavformat/avformat.h")
@@ -198,7 +249,7 @@ set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
 if(WIN32)
   set(CPACK_GENERATOR "ZIP")
-  set(CPACK_SYSTEM_NAME "obs32-windows-x64")
+  set(CPACK_SYSTEM_NAME "obs${OBS_SRTLA_OBS_VERSION_MAJOR}-windows-x64")
 elseif(APPLE)
   set(CPACK_GENERATOR "ZIP")
   set(_obs_srtla_package_arch "${CMAKE_OSX_ARCHITECTURES}")
@@ -212,7 +263,8 @@ elseif(APPLE)
   elseif(_obs_srtla_package_arch STREQUAL "aarch64")
     set(_obs_srtla_package_arch "arm64")
   endif()
-  set(CPACK_SYSTEM_NAME "macos-${_obs_srtla_package_arch}")
+  set(CPACK_SYSTEM_NAME
+      "obs${OBS_SRTLA_OBS_VERSION_MAJOR}-macos-${_obs_srtla_package_arch}")
   set(CPACK_PACKAGE_FILE_NAME
       "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_SYSTEM_NAME}")
 elseif(UNIX)
@@ -224,7 +276,8 @@ elseif(UNIX)
   elseif(_obs_srtla_package_arch STREQUAL "aarch64")
     set(_obs_srtla_package_arch "arm64")
   endif()
-  set(CPACK_SYSTEM_NAME "linux-${_obs_srtla_package_arch}")
+  set(CPACK_SYSTEM_NAME
+      "obs${OBS_SRTLA_OBS_VERSION_MAJOR}-linux-${_obs_srtla_package_arch}")
   set(CPACK_PACKAGE_FILE_NAME
       "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_SYSTEM_NAME}")
 else()
@@ -240,7 +293,7 @@ endif()
 if(APPLE)
   set(_obs_srtla_metadata_dir "${SRTLA_PLUGIN_NAME}.plugin/Contents/Resources/${SRTLA_PLUGIN_NAME}")
 else()
-  set(_obs_srtla_metadata_dir "${OBS_SRTLA_OBS_PLUGIN_DIR}/${SRTLA_PLUGIN_NAME}")
+  set(_obs_srtla_metadata_dir "${OBS_SRTLA_PLUGIN_METADATA_INSTALL_DIR}")
 endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
@@ -302,6 +355,33 @@ if(NOT TARGET OBS::libobs AND WIN32 AND
   message(STATUS "Using OBS runtime DLLs with generated import libraries from ${OBS_SRTLA_OBS_IMPORT_LIB_DIR}")
 endif()
 
+# A module built against a newer libobs is rejected by older OBS releases, so
+# the SDK must not be newer than the targeted OBS version.  An older SDK is
+# fine: OBS loads modules built against earlier libobs versions.
+set(_obs_srtla_sdk_major "")
+if(DEFINED libobs_VERSION_MAJOR AND NOT libobs_VERSION_MAJOR STREQUAL "")
+  set(_obs_srtla_sdk_major "${libobs_VERSION_MAJOR}")
+elseif(OBS_SRTLA_USE_OBS_COMPAT_CONFIG AND
+       EXISTS "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/obs-config.h")
+  file(STRINGS "${OBS_SRTLA_OBS_SOURCE_DIR}/libobs/obs-config.h"
+       _obs_srtla_api_major_line
+       REGEX "^#define[ \t]+LIBOBS_API_MAJOR_VER[ \t]+[0-9]+")
+  string(REGEX REPLACE ".*LIBOBS_API_MAJOR_VER[ \t]+([0-9]+).*" "\\1"
+         _obs_srtla_sdk_major "${_obs_srtla_api_major_line}")
+endif()
+if(_obs_srtla_sdk_major)
+  if(_obs_srtla_sdk_major GREATER OBS_SRTLA_OBS_VERSION_MAJOR)
+    message(FATAL_ERROR
+      "The OBS SDK is version ${_obs_srtla_sdk_major}, but OBS_SRTLA_OBS_VERSION_MAJOR "
+      "is ${OBS_SRTLA_OBS_VERSION_MAJOR}. OBS ${OBS_SRTLA_OBS_VERSION_MAJOR} would refuse "
+      "to load the module; set -DOBS_SRTLA_OBS_VERSION_MAJOR=${_obs_srtla_sdk_major}.")
+  endif()
+  message(STATUS
+    "Building for OBS ${OBS_SRTLA_OBS_VERSION_MAJOR} with libobs SDK ${_obs_srtla_sdk_major}")
+else()
+  message(STATUS "Building for OBS ${OBS_SRTLA_OBS_VERSION_MAJOR}")
+endif()
+
 if(NOT TARGET OBS::libobs)
   if(OBS_SRTLA_REQUIRE_PLUGIN)
     message(FATAL_ERROR "OBS development targets were not found; OBS_SRTLA_REQUIRE_PLUGIN is ON")
@@ -345,19 +425,19 @@ else()
             NAMES libavformat/avformat.h
             HINTS ${_obs_srtla_ffmpeg_include_hints})
   find_library(OBS_SRTLA_FFMPEG_AVFORMAT
-               NAMES avformat avformat.so.61 avformat.so.60 avformat.so.59
-                     avformat.61 avformat.60 avformat.59
-                     avformat-61 avformat-60 avformat-59
+               NAMES avformat avformat.so.62 avformat.so.61 avformat.so.60 avformat.so.59
+                     avformat.62 avformat.61 avformat.60 avformat.59
+                     avformat-62 avformat-61 avformat-60 avformat-59
                HINTS ${_obs_srtla_ffmpeg_library_hints})
   find_library(OBS_SRTLA_FFMPEG_AVCODEC
-               NAMES avcodec avcodec.so.61 avcodec.so.60 avcodec.so.59
-                     avcodec.61 avcodec.60 avcodec.59
-                     avcodec-61 avcodec-60 avcodec-59
+               NAMES avcodec avcodec.so.62 avcodec.so.61 avcodec.so.60 avcodec.so.59
+                     avcodec.62 avcodec.61 avcodec.60 avcodec.59
+                     avcodec-62 avcodec-61 avcodec-60 avcodec-59
                HINTS ${_obs_srtla_ffmpeg_library_hints})
   find_library(OBS_SRTLA_FFMPEG_AVUTIL
-               NAMES avutil avutil.so.59 avutil.so.58 avutil.so.57
-                     avutil.59 avutil.58 avutil.57
-                     avutil-59 avutil-58 avutil-57
+               NAMES avutil avutil.so.60 avutil.so.59 avutil.so.58 avutil.so.57
+                     avutil.60 avutil.59 avutil.58 avutil.57
+                     avutil-60 avutil-59 avutil-58 avutil-57
                HINTS ${_obs_srtla_ffmpeg_library_hints})
   if(NOT OBS_SRTLA_FFMPEG_INCLUDE_DIR OR NOT OBS_SRTLA_FFMPEG_AVFORMAT OR
      NOT OBS_SRTLA_FFMPEG_AVCODEC OR NOT OBS_SRTLA_FFMPEG_AVUTIL)

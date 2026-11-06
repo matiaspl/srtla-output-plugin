@@ -121,9 +121,22 @@ Current operational limitations:
 The release packages contain an unsigned macOS installation helper rather than
 a signed native installer. Close OBS before installing a package.
 
+Packages are built separately for OBS 32 and OBS 33; the package name contains
+`obs32` or `obs33`. Pick the one matching your OBS version. OBS 33 changed the
+third-party plugin locations on Windows and Linux. It still loads plugins from
+the OBS 32 locations, but marks them as "Legacy" in the Plugin Manager, and
+OBS 34 will stop loading them.
+
 ### Windows
 
-Extract the ZIP into the OBS installation directory, preserving the
+OBS 33: copy the contents of the ZIP's top-level folder into
+`C:\ProgramData\obs-studio\plugins`. The result should be
+`C:\ProgramData\obs-studio\plugins\srtla-output\srtla-output.dll`, with the
+plugin data in `C:\ProgramData\obs-studio\plugins\srtla-output\data`. If an
+OBS 32 copy of the plugin is installed under `C:\Program Files\obs-studio`,
+remove it.
+
+OBS 32: extract the ZIP into the OBS installation directory, preserving the
 `obs-plugins/64bit` and `data/obs-plugins` paths. The default directory is
 `C:\Program Files\obs-studio`.
 
@@ -169,10 +182,15 @@ codesign --force --deep --sign - "$plugin"
 ### Linux
 
 Extract the `tar.gz` into the same prefix used by OBS. The package follows the
-standard OBS layout and contains `lib*/obs-plugins/srtla-output.so` and
-`share/obs/obs-plugins/srtla-output/`. Distribution packages may use a
-different `lib` directory; set `OBS_SRTLA_OBS_PLUGIN_DIR` when building for
-that prefix.
+standard OBS layout for its OBS version:
+
+- OBS 33: `lib*/obs-modules/plugins/srtla-output.so` and
+  `share/obs/obs-modules/plugins/srtla-output/`;
+- OBS 32: `lib*/obs-plugins/srtla-output.so` and
+  `share/obs/obs-plugins/srtla-output/`.
+
+Distribution packages may use a different `lib` directory; set
+`OBS_SRTLA_OBS_PLUGIN_DIR` when building for that prefix.
 
 Start OBS and open **Docks > SRTLA Output**.
 
@@ -318,7 +336,18 @@ If you already have a compatible OBS SDK and dependency set, provide
 `OBS_SRTLA_MBEDTLS_ROOT`, and the Qt prefix directly instead of running the
 provisioning script.
 
-For macOS and Linux, provide an OBS 32 development prefix containing the
+### Targeting OBS 33
+
+The build targets OBS 32 by default. Pass `-DOBS_SRTLA_OBS_VERSION_MAJOR=33`
+to build against an OBS 33 SDK. This selects the OBS 33 plugin install layout
+and the `obs33` package name, and on macOS raises the default deployment
+target to 13.0. Configuration fails if the OBS SDK is newer than the targeted
+OBS version, because older OBS releases refuse to load such modules. OBS 33
+also requires FFmpeg 8, Qt 6.10 or newer, mbedTLS 3, and on Windows Visual
+Studio 2026 with Windows SDK 10.0.26100. `scripts/prepare-obs-ci.ps1` still
+provisions OBS 32.2.1.
+
+For macOS and Linux, provide an OBS 32 or OBS 33 development prefix containing the
 `libobs` and `obs-frontend-api` CMake packages, Qt6 Widgets, FFmpeg headers and
 libraries, and mbedTLS. The same cache variables used by the Windows build can
 be supplied directly:

@@ -19,7 +19,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
-  OBS_VERSION: "32"
   RUST_VERSION: "1.88.0"
 
 jobs:
@@ -44,37 +43,74 @@ jobs:
         run: cargo test --manifest-path third_party/srtla_send/Cargo.toml --workspace
 
   native-plugin:
-    name: OBS 32 plugin (${{ matrix.name }})
+    name: OBS ${{ matrix.obs }} plugin (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows x64
+            obs: "32"
             os: windows-2022
             platform: windows
             arch: x86_64
-            artifact: srtla-output-windows-x64
+            artifact: srtla-output-obs32-windows-x64
           - name: Linux x86_64
+            obs: "32"
             os: ubuntu-24.04
             platform: linux
             arch: x86_64
-            artifact: srtla-output-linux-x86_64
+            artifact: srtla-output-obs32-linux-x86_64
           - name: Linux arm64
+            obs: "32"
             os: ubuntu-26.04-arm
             platform: linux
             arch: arm64
-            artifact: srtla-output-linux-arm64
+            artifact: srtla-output-obs32-linux-arm64
           - name: macOS x86_64
+            obs: "32"
             os: macos-15-intel
             platform: macos
             arch: x86_64
-            artifact: srtla-output-macos-x86_64
+            artifact: srtla-output-obs32-macos-x86_64
           - name: macOS arm64
+            obs: "32"
             os: macos-15
             platform: macos
             arch: arm64
-            artifact: srtla-output-macos-arm64
+            artifact: srtla-output-obs32-macos-arm64
+          # OBS 33 builds Windows binaries with Visual Studio 2026 / SDK 26100
+          # (windows-2025 ships VS 2026) and dropped Ubuntu 24.04 support.
+          - name: Windows x64
+            obs: "33"
+            os: windows-2025
+            platform: windows
+            arch: x86_64
+            artifact: srtla-output-obs33-windows-x64
+          - name: Linux x86_64
+            obs: "33"
+            os: ubuntu-26.04
+            platform: linux
+            arch: x86_64
+            artifact: srtla-output-obs33-linux-x86_64
+          - name: Linux arm64
+            obs: "33"
+            os: ubuntu-26.04-arm
+            platform: linux
+            arch: arm64
+            artifact: srtla-output-obs33-linux-arm64
+          - name: macOS x86_64
+            obs: "33"
+            os: macos-15-intel
+            platform: macos
+            arch: x86_64
+            artifact: srtla-output-obs33-macos-x86_64
+          - name: macOS arm64
+            obs: "33"
+            os: macos-15
+            platform: macos
+            arch: arm64
+            artifact: srtla-output-obs33-macos-arm64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -82,16 +118,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
+      # The v2 action line is kept for OBS 32 so its toolchain (VS 2022
+      # generator chosen by this workflow) stays unchanged.  OBS 33 needs the
+      # v3 line, which provisions the OBS 33 SDK and its VS 2026 generator.
       - name: Provision OBS 32 development environment
-        id: obs-deps
-        if: matrix.platform != 'linux' || matrix.arch != 'arm64'
+        id: obs-deps-32
+        if: matrix.obs == '32' && (matrix.platform != 'linux' || matrix.arch != 'arm64')
         uses: norihiro/obs-studio-devel-action@4d9bd843ff3f720432ccab26bf913f1435bc6618
         with:
-          obs: ${{ env.OBS_VERSION }}
+          obs: ${{ matrix.obs }}
           qt: true
           arch: ${{ matrix.arch }}
+      - name: Provision OBS 33 development environment
+        id: obs-deps-33
+        if: matrix.obs == '33' && (matrix.platform != 'linux' || matrix.arch != 'arm64')
+        uses: norihiro/obs-studio-devel-action@85c32ef8fe72a23836e91f8ce87c29a17097a3f8
+        with:
+          obs: ${{ matrix.obs }}
+          qt: true
+          arch: ${{ matrix.arch }}
+      - name: Collect OBS development environment outputs
+        id: obs-deps
+        if: matrix.platform != 'linux' || matrix.arch != 'arm64'
+        shell: bash
+        env:
+          OPTIONS_32: ${{ steps.obs-deps-32.outputs.PLUGIN_CMAKE_OPTIONS }}
+          OPTIONS_33: ${{ steps.obs-deps-33.outputs.PLUGIN_CMAKE_OPTIONS }}
+          OPTIONS_PS_32: ${{ steps.obs-deps-32.outputs.PLUGIN_CMAKE_OPTIONS_PS }}
+          OPTIONS_PS_33: ${{ steps.obs-deps-33.outputs.PLUGIN_CMAKE_OPTIONS_PS }}
+          DEPLOYMENT_32: ${{ steps.obs-deps-32.outputs.MACOSX_DEPLOYMENT_TARGET }}
+          DEPLOYMENT_33: ${{ steps.obs-deps-33.outputs.MACOSX_DEPLOYMENT_TARGET }}
+        run: |
+          set -euo pipefail
+          if [[ '${{ matrix.obs }}' == '33' ]]; then
+            options="$OPTIONS_33" options_ps="$OPTIONS_PS_33" deployment="$DEPLOYMENT_33"
+          else
+            options="$OPTIONS_32" options_ps="$OPTIONS_PS_32" deployment="$DEPLOYMENT_32"
+          fi
+          {
+            echo "PLUGIN_CMAKE_OPTIONS=$options"
+            echo "PLUGIN_CMAKE_OPTIONS_PS=$options_ps"
+            echo "MACOSX_DEPLOYMENT_TARGET=$deployment"
+          } >> "$GITHUB_OUTPUT"
       - name: Provision OBS 32 development environment (Linux arm64)
-        if: matrix.platform == 'linux' && matrix.arch == 'arm64'
+        if: matrix.obs == '32' && matrix.platform == 'linux' && matrix.arch == 'arm64'
         shell: bash
         run: |
           set -euo pipefail
@@ -121,6 +191,43 @@ jobs:
               exit 1
               ;;
           esac
+      - name: Provision OBS 33 development environment (Linux arm64)
+        if: matrix.obs == '33' && matrix.platform == 'linux' && matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ubuntu 26.04 ships OBS 32; OBS 33 comes from the official OBS
+          # PPA, whose obs-studio package also carries the libobs and
+          # frontend API development files.  Do not mix it with the archive's
+          # libobs-dev.
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:obsproject/obs-studio
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libavcodec-dev \
+            libavdevice-dev \
+            libavfilter-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libmbedtls-dev \
+            libsimde-dev \
+            libswresample-dev \
+            libswscale-dev \
+            ninja-build \
+            obs-studio \
+            pkg-config \
+            qt6-base-dev
+          obs_version="$(dpkg-query -W -f='${Version}' obs-studio)"
+          case "$obs_version" in
+            33.*) ;;
+            *)
+              echo "Expected OBS 33 on the arm64 runner, found $obs_version" >&2
+              exit 1
+              ;;
+          esac
       - name: Install mbedTLS development package (Linux)
         if: matrix.platform == 'linux'
         shell: bash
@@ -139,18 +246,26 @@ jobs:
       - name: Configure Release build
         if: matrix.platform == 'windows'
         shell: pwsh
+        env:
+          OBS_PLUGIN_CMAKE_OPTIONS_PS: ${{ steps.obs-deps.outputs.PLUGIN_CMAKE_OPTIONS_PS }}
         run: |
           $cmakeArgs = @(
             '-S', '.',
             '-B', 'build',
-            '-G', 'Visual Studio 17 2022',
-            '-A', 'x64',
+            '-DOBS_SRTLA_OBS_VERSION_MAJOR=${{ matrix.obs }}',
             '-DOBS_SRTLA_BUILD_TESTS=ON',
             '-DOBS_SRTLA_BUILD_VENDOR_SRT=ON',
             '-DOBS_SRTLA_REQUIRE_PLUGIN=ON'
           )
-          $obsArgs = '${{ steps.obs-deps.outputs.PLUGIN_CMAKE_OPTIONS_PS }}'.Split(
-            ' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+          # The OBS 33 action options contain a quoted generator name
+          # (-G "Visual Studio 18 2026"), so split on whitespace outside
+          # double quotes and strip the quotes.
+          $obsOptions = $env:OBS_PLUGIN_CMAKE_OPTIONS_PS
+          $obsArgs = @([regex]::Matches($obsOptions, '"[^"]*"|\S+') |
+            ForEach-Object { $_.Value.Trim('"') })
+          if ($obsArgs -notcontains '-G') {
+            $cmakeArgs += @('-G', 'Visual Studio 17 2022', '-A', 'x64')
+          }
           cmake @cmakeArgs @obsArgs
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
       - name: Configure Release build (POSIX)
@@ -161,6 +276,7 @@ jobs:
           cmake_args=(
             -S .
             -B build
+            -DOBS_SRTLA_OBS_VERSION_MAJOR=${{ matrix.obs }}
             -DOBS_SRTLA_BUILD_TESTS=ON
             -DOBS_SRTLA_BUILD_VENDOR_SRT=ON
             -DOBS_SRTLA_REQUIRE_PLUGIN=ON
@@ -168,7 +284,11 @@ jobs:
           if [[ '${{ matrix.platform }}' == 'macos' ]]; then
             deployment_target='${{ steps.obs-deps.outputs.MACOSX_DEPLOYMENT_TARGET }}'
             if [[ -z "$deployment_target" ]]; then
-              deployment_target=12.0
+              if [[ '${{ matrix.obs }}' == '33' ]]; then
+                deployment_target=13.0
+              else
+                deployment_target=12.0
+              fi
             fi
             cmake_args+=(
               -G Xcode
@@ -234,10 +354,18 @@ jobs:
             throw "Expected one release ZIP, found $($archives.Count)"
           }
           $contents = @(tar -tf $archives[0].FullName)
-          if (-not ($contents | Where-Object { $_ -match '/obs-plugins/64bit/srtla-output\.dll$' })) {
+          if ('${{ matrix.obs }}' -eq '32') {
+            $dllPattern = '/obs-plugins/64bit/srtla-output\.dll$'
+            $localePattern = '/data/obs-plugins/srtla-output/locale/en-US\.ini$'
+          } else {
+            # OBS 33+: <plugin>/<plugin>.dll and <plugin>/data/
+            $dllPattern = '/srtla-output/srtla-output\.dll$'
+            $localePattern = '/srtla-output/data/locale/en-US\.ini$'
+          }
+          if (-not ($contents | Where-Object { $_ -match $dllPattern })) {
             throw 'The Windows package is missing the plugin DLL'
           }
-          if (-not ($contents | Where-Object { $_ -match '/data/obs-plugins/srtla-output/locale/en-US\.ini$' })) {
+          if (-not ($contents | Where-Object { $_ -match $localePattern })) {
             throw 'The Windows package is missing locale data'
           }
           Get-FileHash -Algorithm SHA256 -LiteralPath $archives[0].FullName |
@@ -262,8 +390,13 @@ jobs:
             linux)
               archive="$(find package -type f -name '*.tar.gz' -print -quit)"
               test -n "$archive"
-              tar -tzf "$archive" | grep '/srtla-output.so$' > /dev/null
-              tar -tzf "$archive" | grep '/srtla-output/locale/en-US.ini$' > /dev/null
+              if [[ '${{ matrix.obs }}' == '32' ]]; then
+                module_dir=obs-plugins
+              else
+                module_dir=obs-modules/plugins
+              fi
+              tar -tzf "$archive" | grep "/$module_dir/srtla-output\.so\$" > /dev/null
+              tar -tzf "$archive" | grep "/share/obs/$module_dir/srtla-output/locale/en-US\.ini\$" > /dev/null
               ;;
           esac
       - name: Upload package
@@ -310,8 +443,8 @@ jobs:
           cd artifacts
           shopt -s nullglob
           archives=(./*.zip ./*.tar.gz)
-          if (( ${#archives[@]} != 5 )); then
-            echo "Expected five native archives, found ${#archives[@]}" >&2
+          if (( ${#archives[@]} != 10 )); then
+            echo "Expected ten native archives, found ${#archives[@]}" >&2
             exit 1
           fi
           find . -maxdepth 1 -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print0 |
@@ -326,8 +459,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           assets=(artifacts/*.zip artifacts/*.tar.gz artifacts/SHA256SUMS.txt)
-          if (( ${#assets[@]} != 6 )); then
-            echo "Expected five archives and SHA256SUMS.txt, found ${#assets[@]} release assets" >&2
+          if (( ${#assets[@]} != 11 )); then
+            echo "Expected ten archives and SHA256SUMS.txt, found ${#assets[@]} release assets" >&2
             exit 1
           fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
