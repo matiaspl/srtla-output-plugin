@@ -20,6 +20,8 @@ concurrency:
 
 env:
   RUST_VERSION: "1.88.0"
+  # OBS source tag used to build the OBS 33 SDK where no prebuilt one exists.
+  OBS33_SOURCE_VERSION: "33.0.1"
 
 jobs:
   rust:
@@ -191,43 +193,91 @@ jobs:
               exit 1
               ;;
           esac
-      - name: Provision OBS 33 development environment (Linux arm64)
+      # Neither Ubuntu 26.04 (OBS 32) nor the OBS PPA (amd64 only) provides an
+      # OBS 33 SDK for arm64, so build libobs and the frontend API from the
+      # tagged OBS source.  The UI, core modules and scripting are disabled;
+      # only the SDK headers, libraries and CMake packages are needed.
+      - name: Install OBS 33 SDK build dependencies (Linux arm64)
         if: matrix.obs == '33' && matrix.platform == 'linux' && matrix.arch == 'arm64'
         shell: bash
         run: |
           set -euo pipefail
-          # Ubuntu 26.04 ships OBS 32; OBS 33 comes from the official OBS
-          # PPA, whose obs-studio package also carries the libobs and
-          # frontend API development files.  Do not mix it with the archive's
-          # libobs-dev.
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository -y ppa:obsproject/obs-studio
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
             cmake \
+            extra-cmake-modules \
+            git \
             libavcodec-dev \
             libavdevice-dev \
             libavfilter-dev \
             libavformat-dev \
             libavutil-dev \
+            libdrm-dev \
+            libegl-dev \
+            libgl-dev \
+            libglib2.0-dev \
+            libjansson-dev \
             libmbedtls-dev \
+            libpulse-dev \
             libsimde-dev \
             libswresample-dev \
             libswscale-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-xinput-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
             ninja-build \
-            obs-studio \
             pkg-config \
-            qt6-base-dev
-          obs_version="$(dpkg-query -W -f='${Version}' obs-studio)"
-          case "$obs_version" in
-            33.*) ;;
-            *)
-              echo "Expected OBS 33 on the arm64 runner, found $obs_version" >&2
-              exit 1
-              ;;
-          esac
+            qt6-base-dev \
+            uthash-dev \
+            uuid-dev \
+            zlib1g-dev
+      - name: Restore OBS 33 SDK (Linux arm64)
+        id: obs-sdk-cache
+        if: matrix.obs == '33' && matrix.platform == 'linux' && matrix.arch == 'arm64'
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/obs-sdk
+          key: obs-sdk-${{ env.OBS33_SOURCE_VERSION }}-${{ matrix.os }}-v1
+      - name: Build OBS 33 SDK (Linux arm64)
+        if: matrix.obs == '33' && matrix.platform == 'linux' && matrix.arch == 'arm64' && steps.obs-sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          OBS_SDK_PREFIX: ${{ runner.temp }}/obs-sdk
+          OBS_SOURCE_DIR: ${{ runner.temp }}/obs-studio
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$OBS33_SOURCE_VERSION" \
+            https://github.com/obsproject/obs-studio.git "$OBS_SOURCE_DIR"
+          cmake -S "$OBS_SOURCE_DIR" -B "$OBS_SOURCE_DIR/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$OBS_SDK_PREFIX" \
+            -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+            -DOBS_VERSION_OVERRIDE="$OBS33_SOURCE_VERSION" \
+            -DENABLE_FRONTEND=OFF \
+            -DENABLE_CORE_MODULES=OFF \
+            -DENABLE_SCRIPTING=OFF
+          cmake --build "$OBS_SOURCE_DIR/build" --parallel
+          cmake --install "$OBS_SOURCE_DIR/build"
+      - name: Use OBS 33 SDK (Linux arm64)
+        if: matrix.obs == '33' && matrix.platform == 'linux' && matrix.arch == 'arm64'
+        shell: bash
+        env:
+          OBS_SDK_PREFIX: ${{ runner.temp }}/obs-sdk
+        run: |
+          set -euo pipefail
+          config="$(find "$OBS_SDK_PREFIX" -name 'libobsConfigVersion.cmake' -print -quit)"
+          test -n "$config"
+          find "$OBS_SDK_PREFIX" -name 'obs-frontend-apiConfig.cmake' -print -quit | grep . > /dev/null
+          grep -E 'PACKAGE_VERSION "33\.' "$config" > /dev/null || {
+            echo "Expected an OBS 33 SDK, found:" >&2
+            grep 'PACKAGE_VERSION "' "$config" >&2
+            exit 1
+          }
+          echo "CMAKE_PREFIX_PATH=$OBS_SDK_PREFIX" >> "$GITHUB_ENV"
       - name: Install mbedTLS development package (Linux)
         if: matrix.platform == 'linux'
         shell: bash
