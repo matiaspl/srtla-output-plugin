@@ -240,8 +240,10 @@ SrtSession::SrtSession(SrtlaEngineHandle *engine, std::string host, std::uint16_
 	// Receive callbacks return within 10 ms. A shared wake latch cannot interrupt
 	// one already in progress and can leak an old socket's close into the next
 	// socket created by the reconnect loop, causing its first receive to fail.
-	// The optional hooks are unnecessary because CChannel::close waits for this
-	// bounded receive callback to return before srt_close completes.
+	// The optional hooks are unnecessary because the vendored libsrt closes the
+	// callback channel and waits for this bounded receive callback to return
+	// before srt_close completes, including for a broken socket its GC already
+	// retired. Impl (the opaque context) is therefore safe to free after stop().
 	impl_->transport.wake = nullptr;
 	impl_->transport.close = nullptr;
 }

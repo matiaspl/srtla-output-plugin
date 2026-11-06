@@ -54,6 +54,8 @@ modified by
 #include <iostream>
 #include <iomanip> // Logging
 #include <vector>
+#include <chrono>
+#include <thread>
 #include <cstring>
 #include <srt_compat.h>
 #include <csignal>
@@ -1046,8 +1048,14 @@ srt::EReadStatus srt::CChannel::recvfrom(sockaddr_any& w_addr, CPacket& w_packet
         SRT_TRANSPORT_V1 transport{};
         if (!beginExternalCallback(transport))
         {
+            // A closed embedded channel stays attached to its multiplexer
+            // until the GC destroys it, at least one GC period later.  The
+            // receive worker must keep running until then, so behave like an
+            // idle read timeout instead of reporting an error that would make
+            // the worker spin and flood the log.
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             w_packet.setLength(-1);
-            return RST_ERROR;
+            return RST_AGAIN;
         }
         const size_t capacity = CPacket::HDR_SIZE + CPacket::SRT_MAX_PAYLOAD_SIZE;
         std::vector<uint8_t> datagram(capacity);

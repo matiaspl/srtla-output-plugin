@@ -394,6 +394,21 @@ if(OBS_SRTLA_BUILD_TESTS)
       target_link_libraries(srt_transport_abi_test PRIVATE ${OBS_SRTLA_MBEDTLS_LIBRARIES})
     endif()
     add_test(NAME srt_transport_abi_test COMMAND srt_transport_abi_test)
+
+    add_executable(srt_transport_gc_close_test tests/srt_transport_gc_close_test.cpp)
+    target_include_directories(srt_transport_gc_close_test PRIVATE
+      third_party/irlserver-srt/srtcore
+      third_party/irlserver-srt/common
+      "${OBS_SRTLA_MBEDTLS_INCLUDE_DIR}"
+      "${CMAKE_CURRENT_BINARY_DIR}/third_party/irlserver-srt")
+    target_link_libraries(srt_transport_gc_close_test PRIVATE srt_static Threads::Threads)
+    if(OBS_SRTLA_MBEDTLS_LIBRARIES)
+      target_link_libraries(srt_transport_gc_close_test PRIVATE ${OBS_SRTLA_MBEDTLS_LIBRARIES})
+    endif()
+    if(WIN32)
+      target_link_libraries(srt_transport_gc_close_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME srt_transport_gc_close_test COMMAND srt_transport_gc_close_test)
   endif()
   add_executable(output_capture_lifecycle_test tests/output_capture_lifecycle_test.cpp)
   target_include_directories(output_capture_lifecycle_test PRIVATE plugin)

@@ -454,6 +454,12 @@ public: // internal API
     bool hasExternalTransport() const { return m_bExternalTransport; }
     const SRT_TRANSPORT_V1& externalTransport() const { return m_ExternalTransport; }
 
+    /// Close the callback-backed channel of an embedded transport and wait for
+    /// callbacks already in progress to return.  Idempotent; a no-op for
+    /// sockets that use a kernel UDP socket.  After it returns, libsrt no
+    /// longer calls into the transport's opaque context.
+    void closeExternalChannel();
+
     SRT_ATTR_REQUIRES(m_ConnectionLock)
     void sendSrtMsg(int cmd, uint32_t *srtdata_in = NULL, size_t srtlen_in = 0);
 

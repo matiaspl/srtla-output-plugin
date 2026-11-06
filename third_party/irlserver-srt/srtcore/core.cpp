@@ -468,6 +468,16 @@ int srt::CUDT::setExternalTransport(const SRT_TRANSPORT_V1* transport)
     return 0;
 }
 
+void srt::CUDT::closeExternalChannel()
+{
+    if (!m_bExternalTransport)
+        return;
+    if (m_pRcvQueue && m_pRcvQueue->m_pChannel)
+        m_pRcvQueue->m_pChannel->close();
+    else if (m_pSndQueue && m_pSndQueue->m_pChannel)
+        m_pSndQueue->m_pChannel->close();
+}
+
 int srt::CUDT::setExternalTransport(SRTSOCKET u, const SRT_TRANSPORT_V1* transport)
 {
     try
@@ -6616,13 +6626,7 @@ bool srt::CUDT::closeInternal() ATR_NOEXCEPT
     // Wake an embedded transport before waiting for the receiver thread.  A
     // callback-backed channel has no kernel socket whose close would unblock
     // recvfrom(); the transport close hook is the corresponding wakeup.
-    if (m_bExternalTransport)
-    {
-        if (m_pRcvQueue && m_pRcvQueue->m_pChannel)
-            m_pRcvQueue->m_pChannel->close();
-        else if (m_pSndQueue && m_pSndQueue->m_pChannel)
-            m_pSndQueue->m_pChannel->close();
-    }
+    closeExternalChannel();
 
     HLOGC(smlog.Debug, log << CONID() << "CLOSING STATE (closing=true). Acquiring connection lock");
 
