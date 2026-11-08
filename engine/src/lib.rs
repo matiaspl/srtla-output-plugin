@@ -1,6 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod abr;
+mod probe;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -16,6 +17,7 @@ use srtla_send::embedded::{
 };
 
 pub use abr::{AbrConfig, AbrController, AbrDecision, AbrSample, LinkCapacity, SrtCapacity};
+pub use probe::{ProbeConfig, ProbeController, ProbeOutcome, ProbeStep};
 
 const ENGINE_INPUT_CAPACITY: usize = 1024;
 const ENGINE_OUTPUT_CAPACITY: usize = 256;
@@ -151,11 +153,17 @@ struct EngineSnapshot {
     recommended_video_bps: u64,
     current_video_bps: u64,
     abr_state: String,
-    abr_queue_light_packets: u32,
-    abr_queue_heavy_packets: u32,
-    abr_queue_severe_packets: u32,
+    abr_rtt_floor_ms: u32,
     abr_rtt_increase_below_ms: u32,
     abr_rtt_decrease_above_ms: u32,
+    abr_rtt_heavy_above_ms: u32,
+    abr_queue_light_ms: u32,
+    abr_queue_heavy_ms: u32,
+    abr_queue_severe_ms: u32,
+    probe_active: bool,
+    probe_measured: bool,
+    probe_capacity_bps: u64,
+    probe_video_bps: u64,
     srt_session_state: String,
     srt_connected: bool,
     links: Vec<LinkSnapshot>,
@@ -351,6 +359,8 @@ struct Engine {
     session_error: String,
     srt_stats: SrtTransportStats,
     last_abr_decision: AbrDecision,
+    probe: Option<ProbeController>,
+    probe_outcome: Option<ProbeOutcome>,
     runner: Option<EmbeddedSender>,
 }
 
@@ -481,7 +491,9 @@ impl Engine {
                 self.current_video_bps
             }
         };
-        let abr_state = if decision_current {
+        let abr_state = if self.probe.is_some() {
+            "Startup probe".to_string()
+        } else if decision_current {
             self.last_abr_decision.control_state.clone()
         } else if !srt_connected {
             "Disconnected".to_string()
@@ -544,11 +556,17 @@ impl Engine {
             recommended_video_bps,
             current_video_bps: self.current_video_bps,
             abr_state,
-            abr_queue_light_packets: self.last_abr_decision.queue_light_packets,
-            abr_queue_heavy_packets: self.last_abr_decision.queue_heavy_packets,
-            abr_queue_severe_packets: self.last_abr_decision.queue_severe_packets,
+            abr_rtt_floor_ms: self.last_abr_decision.rtt_floor_ms,
             abr_rtt_increase_below_ms: self.last_abr_decision.rtt_increase_below_ms,
             abr_rtt_decrease_above_ms: self.last_abr_decision.rtt_decrease_above_ms,
+            abr_rtt_heavy_above_ms: self.last_abr_decision.rtt_heavy_above_ms,
+            abr_queue_light_ms: self.last_abr_decision.queue_light_ms,
+            abr_queue_heavy_ms: self.last_abr_decision.queue_heavy_ms,
+            abr_queue_severe_ms: self.last_abr_decision.queue_severe_ms,
+            probe_active: self.probe.is_some(),
+            probe_measured: self.probe_outcome.is_some_and(|o| o.measured),
+            probe_capacity_bps: self.probe_outcome.and_then(|o| o.capacity_bps).unwrap_or(0),
+            probe_video_bps: self.probe_outcome.map_or(0, |o| o.video_bps),
             srt_session_state,
             srt_connected,
             links: self
@@ -584,6 +602,29 @@ impl Engine {
         }
     }
 
+    fn srt_capacity(&self, now_ms: u64) -> SrtCapacity {
+        SrtCapacity {
+            ready: self.session_state == SESSION_CONNECTED
+                && now_ms.saturating_sub(self.srt_stats.sampled_at_ms) <= SRT_STATS_MAX_AGE_MS,
+            sampled_at_ms: self.srt_stats.sampled_at_ms,
+            bandwidth_bps: self.srt_stats.bandwidth_bps,
+            send_rate_bps: self.srt_stats.send_rate_bps,
+            send_buffer_ms: self.srt_stats.send_buffer_ms,
+            send_buffer_packets: self.srt_stats.send_buffer_packets,
+            rtt_ms: self.srt_stats.rtt_ms,
+            latency_ms: if self.srt_stats.latency_ms > 0 {
+                self.srt_stats.latency_ms
+            } else {
+                self.config.latency_ms.max(1)
+            },
+            retransmit_permille: self.srt_stats.retransmit_permille(),
+            dropped_bytes: self.srt_stats.dropped_bytes,
+            sent_unique_bytes: self.srt_stats.sent_unique_bytes,
+            packets_in_flight: self.srt_stats.packets_in_flight,
+            sender_loss_packets: self.srt_stats.sender_loss_packets,
+        }
+    }
+
     fn apply_abr(&mut self, now_ms: u64) -> AbrDecision {
         let links = self
             .config
@@ -613,23 +654,7 @@ impl Engine {
             now_ms,
             capacity_ready,
             all_links_down,
-            srt: SrtCapacity {
-                ready: self.session_state == SESSION_CONNECTED
-                    && now_ms.saturating_sub(self.srt_stats.sampled_at_ms) <= SRT_STATS_MAX_AGE_MS,
-                sampled_at_ms: self.srt_stats.sampled_at_ms,
-                bandwidth_bps: self.srt_stats.bandwidth_bps,
-                send_rate_bps: self.srt_stats.send_rate_bps,
-                send_buffer_ms: self.srt_stats.send_buffer_ms,
-                send_buffer_packets: self.srt_stats.send_buffer_packets,
-                rtt_ms: self.srt_stats.rtt_ms,
-                latency_ms: if self.srt_stats.latency_ms > 0 {
-                    self.srt_stats.latency_ms
-                } else {
-                    self.config.latency_ms.max(1)
-                },
-                retransmit_permille: self.srt_stats.retransmit_permille(),
-                dropped_bytes: self.srt_stats.dropped_bytes,
-            },
+            srt: self.srt_capacity(now_ms),
         });
         self.current_video_bps = decision.applied_bps;
         self.last_abr_decision = decision.clone();
@@ -694,6 +719,8 @@ pub extern "C" fn srtla_engine_create(config_json: *const c_char) -> *mut SrtlaE
         session_error: String::new(),
         srt_stats: SrtTransportStats::default(),
         last_abr_decision: AbrDecision::default(),
+        probe: None,
+        probe_outcome: None,
         runner: None,
     });
     Box::into_raw(Box::new(SrtlaEngineHandle {
@@ -712,8 +739,11 @@ pub extern "C" fn srtla_engine_start(handle: *mut SrtlaEngineHandle) -> i32 {
             engine.session_error.clear();
             engine.srt_stats = SrtTransportStats::default();
             engine.last_abr_decision = AbrDecision::default();
+            engine.probe = None;
+            engine.probe_outcome = None;
             let current_video_bps = engine.current_video_bps;
             engine.abr.reset_for_bitrate(current_video_bps);
+            engine.abr.forget_capacity();
             if engine.runner.is_none()
                 && engine
                     .config
@@ -735,6 +765,7 @@ pub extern "C" fn srtla_engine_stop(handle: *mut SrtlaEngineHandle) -> i32 {
     match with_engine(handle) {
         Some(mut engine) => {
             engine.running = false;
+            engine.probe = None;
             engine.session_state = SESSION_STOPPED;
             engine.session_error.clear();
             engine.srt_stats = SrtTransportStats::default();
@@ -1239,6 +1270,123 @@ pub extern "C" fn srtla_engine_apply_abr(handle: *mut SrtlaEngineHandle, now_ms:
     engine.apply_abr(now_ms).applied_bps
 }
 
+/// Result of one startup-probe step. Mirrors `SrtlaProbeStep` in the C header.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SrtlaProbeStep {
+    pub struct_size: u32,
+    /// Nonzero once the probe (including its drain pause) has finished.
+    pub done: u32,
+    /// Null-packet pacing rate to use until the next step.
+    pub send_rate_bps: u64,
+    /// Recommended starting video bitrate; valid when `done`.
+    pub video_bps: u64,
+    /// Measured end-to-end capacity (all media); 0 when not reached.
+    pub capacity_bps: u64,
+    /// Nonzero when `video_bps` comes from a measurement, not the fallback.
+    pub measured: u32,
+    pub reserved: u32,
+}
+
+/// Begin a startup bandwidth probe on a connected session. `budget_ms` of 0
+/// selects the default (2.5 s, plus up to 0.8 s to drain).
+#[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_probe_start(
+    handle: *mut SrtlaEngineHandle,
+    now_ms: u64,
+    budget_ms: u32,
+) -> i32 {
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    if !engine.running {
+        return -4;
+    }
+    let config = engine.abr.config().clone();
+    let audio_bps = engine.audio_bps;
+    let mut probe = ProbeController::new(ProbeConfig {
+        min_video_bps: config.min_bps,
+        max_video_bps: config.max_bps,
+        audio_bps,
+        budget_ms: u64::from(budget_ms),
+        fallback_video_bps: config.start_bps,
+    });
+    let srt = engine.srt_capacity(now_ms);
+    probe.step(now_ms, &srt);
+    engine.probe = Some(probe);
+    engine.probe_outcome = None;
+    0
+}
+
+/// Advance the probe using the SRT statistics most recently passed to
+/// `srtla_engine_update_srt_stats`. When it reports `done`, the ABR
+/// controller has been seeded with the result and the engine's current video
+/// bitrate set to `video_bps`.
+#[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_probe_step(
+    handle: *mut SrtlaEngineHandle,
+    now_ms: u64,
+    out: *mut SrtlaProbeStep,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    // SAFETY: the caller supplies a writable structure and advertises its
+    // byte size before any other field is written.
+    let struct_size = unsafe { (*out).struct_size } as usize;
+    if struct_size < std::mem::size_of::<SrtlaProbeStep>() {
+        return -1;
+    }
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    let srt = engine.srt_capacity(now_ms);
+    let audio_bps = engine.audio_bps;
+    let Some(probe) = engine.probe.as_mut() else {
+        return -4;
+    };
+    let step = probe.step(now_ms, &srt);
+    let mut result = SrtlaProbeStep {
+        struct_size: std::mem::size_of::<SrtlaProbeStep>() as u32,
+        send_rate_bps: step.send_rate_bps,
+        ..Default::default()
+    };
+    if let Some(outcome) = step.outcome {
+        let probe = engine.probe.take().expect("probe present");
+        if outcome.measured {
+            engine.abr.seed_from_probe(
+                now_ms,
+                outcome.video_bps,
+                outcome.capacity_bps.map(|c| c.saturating_sub(audio_bps)),
+                probe.estimator(),
+            );
+        } else {
+            engine.abr.set_current_bps(outcome.video_bps);
+        }
+        engine.current_video_bps = outcome.video_bps.max(1);
+        engine.last_abr_decision = AbrDecision::default();
+        engine.probe_outcome = Some(outcome);
+        result.done = 1;
+        result.send_rate_bps = 0;
+        result.video_bps = outcome.video_bps;
+        result.capacity_bps = outcome.capacity_bps.unwrap_or(0);
+        result.measured = u32::from(outcome.measured);
+    }
+    // SAFETY: size checked above.
+    unsafe { *out = result };
+    0
+}
+
+/// Abandon a running probe without seeding the controller.
+#[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_probe_cancel(handle: *mut SrtlaEngineHandle) -> i32 {
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    engine.probe = None;
+    0
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn srtla_engine_copy_stats_json(
     handle: *mut SrtlaEngineHandle,
@@ -1468,35 +1616,161 @@ mod tests {
         );
         assert_eq!(srtla_engine_set_video_bitrate(handle, 8_000_000), 0);
 
-        let stats = SrtlaSrtStats {
+        // Learn the idle RTT floor, then report RTT inflation.
+        let mut stats = SrtlaSrtStats {
             struct_size: std::mem::size_of::<SrtlaSrtStats>() as u32,
-            sampled_at_ms: 20,
             bandwidth_bps: 6_000_000,
             send_rate_bps: 8_128_000,
             sent_unique_bytes: 20_000,
-            rtt_ms: 450,
+            packets_in_flight: 40,
+            rtt_ms: 50,
+            send_buffer_ms: 60,
             latency_ms: 2_000,
             ..Default::default()
         };
+        assert_eq!(srtla_engine_set_max_video_bitrate(handle, 8_000_000), 0);
+        for now in (20..=400).step_by(20) {
+            stats.sampled_at_ms = now;
+            assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
+            assert_eq!(srtla_engine_apply_abr(handle, now), 8_000_000);
+        }
+        assert_eq!(srtla_engine_set_max_video_bitrate(handle, 20_000_000), 0);
+        stats.sampled_at_ms = 420;
+        stats.rtt_ms = 450;
+        stats.send_buffer_ms = 460;
         assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
-        assert_eq!(srtla_engine_apply_abr(handle, 20), 7_100_000);
+        let applied = srtla_engine_apply_abr(handle, 420);
+        assert!((500_000..8_000_000).contains(&applied), "applied {applied}");
 
         let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
         let mut out = vec![0 as c_char; needed];
         srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len());
         let json = unsafe { CStr::from_ptr(out.as_ptr()) }.to_string_lossy();
         assert!(json.contains(r#""link_capacity_bps":10000000"#));
-        assert!(json.contains(r#""srt_capacity_bps":0"#));
-        assert!(json.contains(r#""estimated_capacity_bps":0"#));
         assert!(json.contains(r#""srt_stats_ready":true"#));
         assert!(json.contains(r#""srt_rtt_ms":450"#));
-        assert!(json.contains(r#""abr_state":"Heavy congestion""#));
+        assert!(json.contains(r#""abr_rtt_floor_ms":50"#));
+        assert!(
+            json.contains(r#""abr_state":"Severe congestion""#)
+                || json.contains(r#""abr_state":"Heavy congestion""#),
+            "{json}"
+        );
 
         let short = SrtlaSrtStats {
             struct_size: 4,
             ..Default::default()
         };
         assert_eq!(srtla_engine_update_srt_stats(handle, &short), -1);
+        srtla_engine_destroy(handle);
+    }
+
+    fn probe_engine(max_bps: u64) -> *mut SrtlaEngineHandle {
+        let config = CString::new(format!(
+            r#"{{"links":[{{"id":1,"label":"a","enabled":true}}],"abr":{{"min_bps":500000,"start_bps":{max_bps},"max_bps":{max_bps}}},"audio_bps":128000}}"#
+        ))
+        .unwrap();
+        let handle = srtla_engine_create(config.as_ptr());
+        assert!(!handle.is_null());
+        assert_eq!(srtla_engine_start(handle), 0);
+        assert_eq!(srtla_engine_set_audio_bitrate(handle, 128_000), 0);
+        assert_eq!(
+            srtla_engine_set_session_state(handle, SESSION_CONNECTED, ptr::null()),
+            0
+        );
+        handle
+    }
+
+    fn stats_json(handle: *mut SrtlaEngineHandle) -> String {
+        let needed = srtla_engine_copy_stats_json(handle, ptr::null_mut(), 0);
+        let mut out = vec![0 as c_char; needed];
+        srtla_engine_copy_stats_json(handle, out.as_mut_ptr(), out.len());
+        unsafe { CStr::from_ptr(out.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn startup_probe_measures_the_path_and_seeds_the_controller() {
+        use crate::abr::sim::{Sim, SimConfig};
+        let handle = probe_engine(20_000_000);
+        let mut sim = Sim::new(SimConfig {
+            capacity: vec![(0, 5_000_000)],
+            ..SimConfig::default()
+        });
+        assert_eq!(srtla_engine_probe_start(handle, 0, 0), 0);
+        assert!(stats_json(handle).contains(r#""abr_state":"Startup probe""#));
+        let mut step = SrtlaProbeStep {
+            struct_size: std::mem::size_of::<SrtlaProbeStep>() as u32,
+            ..Default::default()
+        };
+        let mut rate = 0u64;
+        loop {
+            let (srt, _) = sim.step(rate as f64);
+            let stats = SrtlaSrtStats {
+                struct_size: std::mem::size_of::<SrtlaSrtStats>() as u32,
+                sampled_at_ms: srt.sampled_at_ms,
+                send_rate_bps: srt.send_rate_bps,
+                sent_unique_bytes: srt.sent_unique_bytes,
+                send_buffer_ms: srt.send_buffer_ms,
+                send_buffer_packets: srt.send_buffer_packets,
+                packets_in_flight: srt.packets_in_flight,
+                sender_loss_packets: srt.sender_loss_packets,
+                rtt_ms: srt.rtt_ms,
+                latency_ms: srt.latency_ms,
+                ..Default::default()
+            };
+            assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
+            assert_eq!(srtla_engine_probe_step(handle, sim.now_ms, &mut step), 0);
+            if step.done != 0 {
+                break;
+            }
+            rate = step.send_rate_bps;
+            assert!(sim.now_ms < 5_000, "probe did not finish");
+        }
+        assert_eq!(step.measured, 1);
+        assert!(
+            (4_000_000..=5_500_000).contains(&step.capacity_bps),
+            "{}",
+            step.capacity_bps
+        );
+        assert!(step.video_bps < 5_000_000 && step.video_bps >= 3_000_000);
+        let json = stats_json(handle);
+        assert!(json.contains(r#""probe_active":false"#));
+        assert!(json.contains(&format!(r#""probe_video_bps":{}"#, step.video_bps)));
+        assert!(json.contains(&format!(r#""current_video_bps":{}"#, step.video_bps)));
+        // A second step after completion reports no active probe.
+        assert_eq!(
+            srtla_engine_probe_step(handle, sim.now_ms + 20, &mut step),
+            -4
+        );
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn startup_probe_without_feedback_falls_back_and_can_be_cancelled() {
+        let handle = probe_engine(6_000_000);
+        let mut step = SrtlaProbeStep {
+            struct_size: std::mem::size_of::<SrtlaProbeStep>() as u32,
+            ..Default::default()
+        };
+        assert_eq!(srtla_engine_probe_start(handle, 0, 600), 0);
+        let mut now = 0;
+        while step.done == 0 {
+            now += 20;
+            assert_eq!(srtla_engine_probe_step(handle, now, &mut step), 0);
+            assert!(now < 2_000);
+        }
+        assert_eq!(step.measured, 0);
+        assert_eq!(step.video_bps, 6_000_000);
+
+        assert_eq!(srtla_engine_probe_start(handle, now, 0), 0);
+        assert_eq!(srtla_engine_probe_cancel(handle), 0);
+        assert_eq!(srtla_engine_probe_step(handle, now + 20, &mut step), -4);
+        let mut short = SrtlaProbeStep {
+            struct_size: 4,
+            ..Default::default()
+        };
+        assert_eq!(srtla_engine_probe_step(handle, now, &mut short), -1);
         srtla_engine_destroy(handle);
     }
 

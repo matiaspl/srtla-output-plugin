@@ -508,6 +508,9 @@ void set_telemetry_cell(QTableWidget *table, int row, int column, const QString 
 QString abr_sparkline_label(const QString &state)
 {
 	if (state == QStringLiteral("Increasing")) return QStringLiteral("Increasing");
+	if (state == QStringLiteral("Probing")) return QStringLiteral("Probing");
+	if (state == QStringLiteral("Settling")) return QStringLiteral("Settling");
+	if (state == QStringLiteral("Startup probe")) return QStringLiteral("Measuring");
 	if (state == QStringLiteral("Light congestion")) return QStringLiteral("Light");
 	if (state == QStringLiteral("Heavy congestion")) return QStringLiteral("Heavy");
 	if (state == QStringLiteral("Severe congestion")) return QStringLiteral("Severe");
@@ -519,6 +522,9 @@ QString abr_sparkline_label(const QString &state)
 double abr_sparkline_level(const QString &state)
 {
 	if (state == QStringLiteral("Increasing")) return 1.0;
+	if (state == QStringLiteral("Probing")) return 1.0;
+	if (state == QStringLiteral("Startup probe")) return 1.0;
+	if (state == QStringLiteral("Settling")) return 1.5;
 	if (state == QStringLiteral("Light congestion")) return 2.0;
 	if (state == QStringLiteral("Heavy congestion")) return 3.0;
 	if (state == QStringLiteral("Severe congestion")) return 4.0;
@@ -643,6 +649,9 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	add_encoder_choices(customVideoEncoder_, OBS_ENCODER_VIDEO);
 	customAudioEncoder_ = new QComboBox(connectionSettings_);
 	add_encoder_choices(customAudioEncoder_, OBS_ENCODER_AUDIO);
+	startupProbe_ = new QCheckBox(tr("Measure bandwidth before start"), connectionSettings_);
+	startupProbe_->setChecked(true);
+	startupProbe_->setToolTip(tr("With automatic bitrate, send MPEG-TS null packets for up to about three seconds before the encoder starts, so streaming begins at a measured bitrate"));
 	loadProfile();
 	connect(passphrase_, &QLineEdit::textChanged, this, [this] {
 		if (!secret_error_)
@@ -666,6 +675,7 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	settingsGrid->addWidget(customVideoEncoder_, 3, 3);
 	settingsGrid->addWidget(new QLabel(tr("Custom audio encoder"), connectionSettings_), 4, 2);
 	settingsGrid->addWidget(customAudioEncoder_, 4, 3);
+	settingsGrid->addWidget(startupProbe_, 4, 0, 1, 2);
 	layout->addWidget(connectionSettings_);
 	auto updateSettingsSummary = [this] {
 		const auto endpoint = url_->text().isEmpty() ? tr("No receiver URL") : url_->text();
@@ -1059,6 +1069,7 @@ void SrtlaDock::loadProfile()
 	select_combo_data(customVideoEncoder_, profile_string("CustomVideoEncoder"));
 	select_combo_data(customAudioEncoder_, profile_string("CustomAudioEncoder"));
 	autoBitrate_->setChecked(profile_bool("AutoBitrate", true));
+	startupProbe_->setChecked(profile_bool("StartupProbe", true));
 	manualBitrate_->setValue(profile_int("Bitrate", 1500));
 	int maximum_bitrate = profile_int("MaxBitrate", 6000);
 	if (maximum_bitrate == 100000)
@@ -1118,6 +1129,7 @@ bool SrtlaDock::saveProfile()
 	config_set_string(config, config_section, "CustomVideoEncoder", customVideoEncoder_->currentData().toString().toUtf8().constData());
 	config_set_string(config, config_section, "CustomAudioEncoder", customAudioEncoder_->currentData().toString().toUtf8().constData());
 	config_set_bool(config, config_section, "AutoBitrate", autoBitrate_->isChecked());
+	config_set_bool(config, config_section, "StartupProbe", startupProbe_->isChecked());
 	config_set_int(config, config_section, "Bitrate", manualBitrate_->value());
 	config_set_int(config, config_section, "MaxBitrate", maxBitrate_->value());
 	save_profile_config();
@@ -1538,6 +1550,7 @@ void SrtlaDock::toggleOutput()
 	}
 	obs_data_set_string(settings_, "enabled_links", enabled_links.c_str());
 	obs_data_set_bool(settings_, "auto_bitrate", autoBitrate_->isChecked());
+	obs_data_set_bool(settings_, "startup_probe", startupProbe_->isChecked());
 	obs_data_set_int(settings_, "bitrate", manualBitrate_->value());
 	obs_data_set_int(settings_, "min_bitrate", 500);
 	obs_data_set_int(settings_, "max_bitrate", maxBitrate_->value());
@@ -1678,12 +1691,24 @@ void SrtlaDock::refreshStatus()
 	metricValues_[5]->setText(tr("%1 / %2").arg(active).arg(links.size()));
 	metricValues_[5]->setToolTip(tr("Active network paths / all configured paths"));
 	updateOverviewSparklines();
-	metricSparklines_[0]->setToolTip(tr("Queue thresholds L/H/S: %1/%2/%3 packets | RTT grow below: %4 ms | RTT reduce above: %5 ms | SRT estimate: %6 kb/s | send: %7 kb/s | link capacity: %8 kb/s | offered: %9 kb/s | delivered: %10 kb/s | retransmissions: %11% | sender loss: %12 | dropped: %13 bytes")
-		.arg(root.value(QStringLiteral("abr_queue_light_packets")).toInteger())
-		.arg(root.value(QStringLiteral("abr_queue_heavy_packets")).toInteger())
-		.arg(root.value(QStringLiteral("abr_queue_severe_packets")).toInteger())
+	const auto probeCapacity = root.value(QStringLiteral("probe_capacity_bps")).toInteger();
+	const auto probeVideo = root.value(QStringLiteral("probe_video_bps")).toInteger();
+	const QString probeSummary = !root.value(QStringLiteral("probe_measured")).toBool() ? tr("not run") :
+		probeCapacity > 0 ? tr("%1 kb/s measured, started at %2 kb/s").arg(probeCapacity / 1000).arg(probeVideo / 1000) :
+		tr("maximum fits, started at %1 kb/s").arg(probeVideo / 1000);
+	metricSparklines_[0]->setToolTip(tr("Delivered end-to-end: %1 kb/s | learned ceiling: %2 kb/s | startup probe: %3 | RTT floor: %4 ms, grow below: %5 ms, reduce above: %6 / %7 ms | queue thresholds L/H/S: %8/%9/%10 ms")
+		.arg(root.value(QStringLiteral("srt_capacity_bps")).toInteger() / 1000)
+		.arg(root.value(QStringLiteral("estimated_capacity_bps")).toInteger() / 1000)
+		.arg(probeSummary)
+		.arg(root.value(QStringLiteral("abr_rtt_floor_ms")).toInteger())
 		.arg(root.value(QStringLiteral("abr_rtt_increase_below_ms")).toInteger())
 		.arg(root.value(QStringLiteral("abr_rtt_decrease_above_ms")).toInteger())
+		.arg(root.value(QStringLiteral("abr_rtt_heavy_above_ms")).toInteger())
+		.arg(root.value(QStringLiteral("abr_queue_light_ms")).toInteger())
+		.arg(root.value(QStringLiteral("abr_queue_heavy_ms")).toInteger())
+		.arg(root.value(QStringLiteral("abr_queue_severe_ms")).toInteger())
+		+ QStringLiteral("\n") +
+		tr("SRT estimate: %1 kb/s | send: %2 kb/s | link capacity: %3 kb/s | offered: %4 kb/s | delivered: %5 kb/s | retransmissions: %6% | sender loss: %7 | dropped: %8 bytes")
 		.arg(srtRaw / 1000)
 		.arg(root.value(QStringLiteral("srt_send_rate_bps")).toInteger() / 1000)
 		.arg(linkCapacity / 1000)

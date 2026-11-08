@@ -12,6 +12,7 @@
 #include "passphrase-store.hpp"
 #include "srt-session.hpp"
 
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -68,6 +70,7 @@ struct SrtlaOutput {
 	bool hevc = false;
 	bool opus = false;
 	std::atomic_bool auto_bitrate{true};
+	bool startup_probe = true;
 	bool shared_encoder = false;
 	std::string encoder_source = "streaming";
 	std::atomic<int> manual_bitrate_kbps{1500};
@@ -108,6 +111,12 @@ static int configured_manual_bitrate_kbps(obs_data_t *settings)
 	const int manual = settings && obs_data_has_user_value(settings, "bitrate") ?
 		static_cast<int>(obs_data_get_int(settings, "bitrate")) : 1500;
 	return std::clamp(manual, MIN_VIDEO_BITRATE_KBPS, MAX_MANUAL_BITRATE_KBPS);
+}
+
+static bool startup_probe_enabled(obs_data_t *settings)
+{
+	return !settings || !obs_data_has_user_value(settings, "startup_probe") ||
+		obs_data_get_bool(settings, "startup_probe");
 }
 
 static std::string json_escape(const std::string &value)
@@ -345,6 +354,7 @@ static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 	data->opus = settings && obs_data_get_string(settings, "audio_codec") &&
 		std::string(obs_data_get_string(settings, "audio_codec")) == "opus";
 	data->auto_bitrate.store(!settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate"));
+	data->startup_probe = startup_probe_enabled(settings);
 	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
 	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
 	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
@@ -390,6 +400,7 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	data->hevc = video_codec && std::string(video_codec) == "hevc";
 	data->opus = audio_codec && std::string(audio_codec) == "opus";
 	data->auto_bitrate.store(!settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate"));
+	data->startup_probe = startup_probe_enabled(settings);
 	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
 	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
 	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
@@ -467,6 +478,103 @@ static void stop_abr_worker(SrtlaOutput *data)
 }
 
 static void queue_fatal_output(SrtlaOutput *data, const std::string &error);
+
+static std::uint64_t steady_now_ms()
+{
+	return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+constexpr std::size_t TS_PACKET_BYTES = 188;
+constexpr std::size_t SRT_DATAGRAM_BYTES = 7 * TS_PACKET_BYTES;
+
+// Seven MPEG-TS null packets (PID 0x1FFF). Demuxers discard them by
+// definition, so they can load the path before any real media exists without
+// affecting what the receiver eventually decodes.
+static const std::array<std::uint8_t, SRT_DATAGRAM_BYTES> &null_ts_datagram()
+{
+	static const auto datagram = [] {
+		std::array<std::uint8_t, SRT_DATAGRAM_BYTES> bytes{};
+		for (std::size_t offset = 0; offset < bytes.size(); offset += TS_PACKET_BYTES) {
+			bytes[offset] = 0x47;     // sync byte
+			bytes[offset + 1] = 0x1F; // no TEI/PUSI/priority, PID high bits
+			bytes[offset + 2] = 0xFF; // PID 0x1FFF
+			bytes[offset + 3] = 0x10; // not scrambled, payload only
+			std::memset(bytes.data() + offset + 4, 0xFF, TS_PACKET_BYTES - 4);
+		}
+		return bytes;
+	}();
+	return datagram;
+}
+
+// Measure the path with null packets on the connected SRT session before the
+// encoder starts, so the first real frames are sent at a sustainable bitrate.
+// Runs on the starting thread and is bounded (about 3 s worst case). Returns
+// the measured starting video bitrate, or 0 when the probe did not complete
+// and the caller should use its normal starting bitrate.
+static std::uint64_t run_startup_probe(SrtlaOutput *data)
+{
+	if (!data->engine || !data->session || !data->session->connected())
+		return 0;
+	const auto started = steady_now_ms();
+	if (srtla_engine_probe_start(data->engine, started, 0) != 0)
+		return 0;
+	constexpr std::uint64_t stats_interval_ms = 20;
+	constexpr std::uint64_t hard_limit_ms = 5000;
+	const auto &datagram = null_ts_datagram();
+	SrtlaProbeStep step{};
+	step.struct_size = static_cast<std::uint32_t>(sizeof(step));
+	std::uint64_t rate_bps = 0;
+	std::uint64_t last_stats_ms = 0;
+	std::uint64_t last_send_ms = started;
+	double credit_bytes = 0.0;
+	for (;;) {
+		const auto now = steady_now_ms();
+		if (!data->session->connected() || now - started > hard_limit_ms) {
+			(void)srtla_engine_probe_cancel(data->engine);
+			blog(LOG_WARNING, "[srtla-output] Startup bandwidth probe abandoned");
+			return 0;
+		}
+		if (last_stats_ms == 0 || now - last_stats_ms >= stats_interval_ms) {
+			last_stats_ms = now;
+			SrtlaSrtStats stats{};
+			if (data->session->sample_stats(now, stats))
+				(void)srtla_engine_update_srt_stats(data->engine, &stats);
+			if (srtla_engine_probe_step(data->engine, now, &step) != 0)
+				return 0;
+			if (step.done)
+				break;
+			rate_bps = step.send_rate_bps;
+		}
+		// Pace by credit; never release more than one stats interval at once
+		// (coarse sleep granularity on some platforms).
+		const double bytes_per_ms = static_cast<double>(rate_bps) / 8000.0;
+		credit_bytes += bytes_per_ms * static_cast<double>(now - last_send_ms);
+		credit_bytes = std::min(credit_bytes,
+			bytes_per_ms * static_cast<double>(stats_interval_ms) + static_cast<double>(datagram.size()));
+		last_send_ms = now;
+		while (credit_bytes >= static_cast<double>(datagram.size())) {
+			if (!data->session->send_ts(datagram.data(), datagram.size())) {
+				credit_bytes = 0.0;
+				break;
+			}
+			credit_bytes -= static_cast<double>(datagram.size());
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	if (!step.measured) {
+		blog(LOG_INFO, "[srtla-output] Startup bandwidth probe got no SRT feedback; using the default start");
+		return 0;
+	}
+	if (step.capacity_bps)
+		blog(LOG_INFO, "[srtla-output] Startup probe measured %llu kb/s; starting video at %llu kb/s",
+		     static_cast<unsigned long long>(step.capacity_bps / 1000),
+		     static_cast<unsigned long long>(step.video_bps / 1000));
+	else
+		blog(LOG_INFO, "[srtla-output] Startup probe: maximum bitrate fits; starting video at %llu kb/s",
+		     static_cast<unsigned long long>(step.video_bps / 1000));
+	return step.video_bps;
+}
 
 static void start_abr_worker(SrtlaOutput *data)
 {
@@ -884,9 +992,18 @@ static bool srtla_output_start(void *opaque)
 			data->auto_bitrate.store(false);
 		}
 	}
+	// Probe the path with null packets before any encoder output exists, so
+	// automatic mode starts at a measured bitrate instead of the maximum.
+	std::uint64_t probed_video_bps = 0;
+	if (data->auto_bitrate.load() && data->startup_probe)
+		probed_video_bps = run_startup_probe(data);
 	apply_manual_bitrate(data);
-	int active_bitrate_kbps = data->auto_bitrate.load() ?
-		data->max_bitrate_kbps : data->manual_bitrate_kbps.load();
+	int active_bitrate_kbps = data->manual_bitrate_kbps.load();
+	if (data->auto_bitrate.load()) {
+		active_bitrate_kbps = probed_video_bps > 0 ?
+			std::clamp(static_cast<int>(probed_video_bps / 1000), data->min_bitrate_kbps, data->max_bitrate_kbps) :
+			data->max_bitrate_kbps;
+	}
 	if (data->auto_bitrate.load()) {
 		std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
 		if (auto *encoder = obs_output_get_video_encoder(data->output)) {
@@ -1010,6 +1127,7 @@ static void srtla_output_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "max_bitrate", DEFAULT_MAX_BITRATE_KBPS);
 	obs_data_set_default_int(settings, "audio_bitrate", 128);
 	obs_data_set_default_bool(settings, "auto_bitrate", true);
+	obs_data_set_default_bool(settings, "startup_probe", true);
 	obs_data_set_default_string(settings, "encoder_mode", "dedicated");
 	obs_data_set_default_string(settings, "encoder_source", "streaming");
 	obs_data_set_default_string(settings, "audio_mix", "track_1");
@@ -1038,6 +1156,7 @@ static obs_properties_t *srtla_output_properties(void *)
 	                       ABSOLUTE_MAX_BITRATE_KBPS, 50);
 	obs_properties_add_int(props, "audio_bitrate", "Audio bitrate (kb/s)", 32, 512, 8);
 	obs_properties_add_bool(props, "auto_bitrate", "Automatic bitrate");
+	obs_properties_add_bool(props, "startup_probe", "Measure bandwidth before starting (automatic bitrate)");
 	auto *encoder_source = obs_properties_add_list(props, "encoder_source", "Encoder source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(encoder_source, "Streaming", "streaming");
 	obs_property_list_add_string(encoder_source, "Recording", "recording");

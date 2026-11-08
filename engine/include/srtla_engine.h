@@ -19,7 +19,7 @@ typedef enum SrtlaSessionState {
 	SRTLA_SESSION_STOPPED = 5,
 } SrtlaSessionState;
 
-/* SRT feedback used by the BELABOX-style encoder controller. */
+/* SRT feedback used by the encoder bitrate controller and startup probe. */
 typedef struct SrtlaSrtStats {
 	uint32_t struct_size;
 	uint32_t reserved;
@@ -62,6 +62,28 @@ int32_t srtla_engine_set_max_video_bitrate(SrtlaEngineHandle *handle, uint64_t m
 int32_t srtla_engine_set_session_state(SrtlaEngineHandle *handle, SrtlaSessionState state,
 						       const char *error);
 uint64_t srtla_engine_apply_abr(SrtlaEngineHandle *handle, uint64_t now_ms);
+
+/* Startup bandwidth probe, run on a connected session before the encoder
+ * starts. The caller paces MPEG-TS null packets (PID 0x1FFF) at
+ * send_rate_bps, samples SRT statistics every ~20 ms into
+ * srtla_engine_update_srt_stats, and calls srtla_engine_probe_step after
+ * each sample. When done is nonzero, the ABR controller has been seeded and
+ * video_bps is the bitrate to start the encoder at. Step returns -4 when no
+ * probe is active. budget_ms of 0 selects the default (2.5 s plus up to
+ * 0.8 s for the probe's queue to drain). */
+typedef struct SrtlaProbeStep {
+	uint32_t struct_size;
+	uint32_t done;
+	uint64_t send_rate_bps;
+	uint64_t video_bps;
+	uint64_t capacity_bps;
+	uint32_t measured;
+	uint32_t reserved;
+} SrtlaProbeStep;
+
+int32_t srtla_engine_probe_start(SrtlaEngineHandle *handle, uint64_t now_ms, uint32_t budget_ms);
+int32_t srtla_engine_probe_step(SrtlaEngineHandle *handle, uint64_t now_ms, SrtlaProbeStep *out);
+int32_t srtla_engine_probe_cancel(SrtlaEngineHandle *handle);
 size_t srtla_engine_copy_stats_json(SrtlaEngineHandle *handle, char *output, size_t capacity);
 const char *srtla_engine_last_error(SrtlaEngineHandle *handle);
 

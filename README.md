@@ -18,9 +18,10 @@ does **not** ship a production receiver. For a local Windows smoke test, see
   monitoring the session.
 - Streaming or recording encoder reuse, plus independent custom encoders.
 - H.264 and HEVC video with AAC or Opus audio.
-- BELABOX-style automatic video bitrate control driven by end-to-end SRT RTT
-  and instantaneous sender-queue depth. Manual bitrate and maximum-bitrate
-  controls remain available.
+- Automatic video bitrate control driven by end-to-end SRT RTT, sender-queue
+  delay and the measured end-to-end delivery rate, with a pre-roll bandwidth
+  probe so streams start at a measured bitrate. Manual bitrate and
+  maximum-bitrate controls remain available.
 - Per-adapter IPv4 and IPv6 uplinks that can be enabled or disabled while the
   output is running. Newly discovered links are opt-in, and the last enabled
   link cannot be disabled.
@@ -204,7 +205,9 @@ Start OBS and open **Docks > SRTLA Output**.
    encoders, or **Custom** to create independent video and audio encoders.
 4. Select at least one operational network link.
 5. Choose automatic bitrate with a maximum, or disable it and set a manual
-   bitrate.
+   bitrate. With automatic bitrate, **Measure bandwidth before start** (in
+   the connection settings, on by default) probes the path for up to about
+   three seconds before the encoder starts.
 6. Select **Start**. `Live` requires both an established SRT session and at
    least one payload-eligible SRTLA link.
 
@@ -214,47 +217,98 @@ such as invalid socket, engine, encoder, muxer, or queue state.
 
 ## Automatic bitrate control
 
-The automatic controller ports the closed-loop congestion response from
-[BELABOX `belacoder`](https://github.com/BELABOX/belacoder/blob/master/belacoder.c)
-to Rust. While the output is active, it samples the SRT socket every 20 ms and
-observes:
+While the output is active the controller samples the SRT socket every 20 ms
+and observes:
 
-- the instantaneous number of unacknowledged packets in the SRT sender buffer;
 - end-to-end smoothed SRT RTT and the negotiated SRT latency;
-- the current SRT send rate, used only to express part of the queue threshold
-  in packets.
+- sender-queue delay (the time span of unacknowledged data in the SRT send
+  buffer);
+- the end-to-end delivery rate: unique payload sent minus the growth of data
+  in flight, i.e. what the receiver actually acknowledged, over the last half
+  second, compared with what was offered one RTT earlier.
 
-The controller learns moving queue and RTT baselines, positive jitter, RTT
-trend, and a slowly adapting minimum RTT. It does not use the SRT packet-pair
-bandwidth estimate or the sum of per-link SRTLA CC targets to select the encoder
-bitrate. Those values remain visible as diagnostics. SRTLA CC controls packet
-scheduling across links; end-to-end queue growth and RTT inflation determine
+It does not use the SRT packet-pair bandwidth estimate or the sum of per-link
+SRTLA CC targets to select the encoder bitrate; those remain diagnostics. SRTLA
+CC schedules packets across links; end-to-end RTT, queue and delivery decide
 whether the offered encoder rate is sustainable.
 
-Bitrate changes follow BELABOX's asymmetric control law:
+Baselines are windowed minimums over the last 10 s (RTT floor and queue floor)
+plus a noise estimate that is frozen while the path is congested, so a
+standing queue is never mistaken for the new normal. Congestion is classified
+against those baselines:
 
-- If RTT reaches one third of negotiated SRT latency, or queue growth crosses
-  the severe adaptive threshold, video immediately drops to the configured
-  minimum.
-- Under heavy congestion (RTT above one fifth of latency or a high queue), the
-  controller subtracts 100 kb/s plus 10% of its internal target, no more than
-  once every 250 ms.
-- Under light congestion (RTT or queue above its learned baseline), it
-  subtracts 100 kb/s, no more than once every 200 ms.
-- With RTT close to the learned minimum and no upward RTT trend, it adds
-  30 kb/s plus one thirtieth of the internal target, no more than once every
-  500 ms.
-- The internal target is clamped to the configured minimum and maximum. Values
-  applied to OBS are rounded down to 100 kb/s, while sub-step changes continue
-  accumulating internally.
+- **Light**: RTT or queue noticeably above its floor and either rising,
+  delivery falling behind what was offered, or elevated for more than 1.5 s. The target
+  drops by 5 % (at least 100 kb/s), or to 95 % of the measured delivery rate.
+- **Heavy**: RTT well above the floor or above a fifth of the latency, a
+  sender queue above a tenth of the latency budget, or delivery under 75 % of
+  what was offered. The target drops to 90 % of the measured delivery rate,
+  less what is needed to drain the standing queue within 1.5 s, and by at
+  least 10 %.
+- **Severe**: RTT at a third of the latency, or a queue at half of it. The
+  target drops to 80 % of the delivery rate less the drain allowance (at most
+  to 35 % of it). The configured minimum is only used when every link or the
+  SRT session is down.
 
-Automatic mode starts at the configured maximum, matching BELABOX. The default
-automatic maximum is 6000 kb/s and its range is capped at 30000 kb/s. This ceiling 
-does not limit the separate manual-bitrate setting. If the SRT session or
-every enabled link is down, the output falls to the minimum to avoid an
-unbounded queue. Missing or repeated statistics hold the current target rather
-than replaying a congestion event. Learned queue and RTT state is reset after a
-session transition.
+After any cut the controller **settles** for the encoder's reaction time plus
+one RTT (0.3 to 1.5 s) before cutting again. Within that window a further cut
+is made only when the measured delivery rate shows the previous cut was not
+enough by a wide margin. Increases are held until the hold expires and RTT and
+queue are back near their floors.
+
+The delivery rate measured while congested becomes the **ceiling**: the
+controller's memory of where the path saturates. Increases depend on it:
+
+- Far below the ceiling (or with none known) the target rises by 10 % every
+  250 ms, closing at least a quarter of the gap per step when a ceiling is
+  known, so a deep cut recovers in about a second.
+- Between 85 % and 97 % of the ceiling it approaches by 1.5 % every 500 ms.
+- At the ceiling it **dwells**, then probes above it by 2 %, 4 % and 8 % at
+  one-second intervals. If all three succeed the ceiling is dropped and the
+  fast ramp resumes. Each time congestion confirms the same ceiling the dwell
+  doubles (3 s up to 24 s), so a steady path settles instead of sawing.
+- When capacity collapses (the ceiling falls below 70 % of its value before
+  the congestion episode), the previous ceiling is remembered for a minute.
+  Once the path has been healthy for 1.5 s it is retried with the fast ramp,
+  once; a retry that fails within 10 s is not repeated.
+
+Values applied to OBS are rounded down to 100 kb/s while sub-step changes
+accumulate internally, and the target is always clamped to the configured
+minimum and maximum. Missing or repeated statistics hold the current target
+rather than replaying a congestion event. RTT and queue baselines are reset
+after a session transition; the ceiling is kept across reconnects and cleared
+when the output starts.
+
+### Startup bandwidth probe
+
+With automatic bitrate and **Measure bandwidth before start** enabled, the
+output connects the SRT session first and, before the encoder starts, sends
+MPEG-TS null packets (PID `0x1FFF`, which every demuxer discards) at a rising
+rate:
+
+1. 300 ms (at least two RTTs) at 1 Mb/s to learn the idle RTT and queue
+   floors;
+2. the rate then doubles about every 350 ms until RTT rises, more than 3 % of
+   packets are lost, the acknowledged rate falls behind the offered rate, or
+   110 % of the configured maximum is sustained;
+3. the probe pauses (up to 0.8 s) so the queue it built drains.
+
+The encoder starts at 80 % of the measured delivery capacity (or at the
+maximum if that fit without congestion), and the controller starts with that
+capacity as its ceiling. The probe is bounded to 2.5 s plus the drain pause.
+It runs while OBS is starting the output, so starting takes correspondingly
+longer. If the session drops or no SRT feedback arrives, the output starts at
+the configured maximum as before. The dock's ABR tooltip shows the probe
+result, the learned ceiling and the current thresholds.
+
+Automatic mode without the probe starts at the configured maximum. The default
+automatic maximum is 6000 kb/s and its range is capped at 30000 kb/s. This
+ceiling does not limit the separate manual-bitrate setting.
+
+The controller and probe are exercised in closed loop against a simulated
+bottleneck (encoder lag, SRT RTT smoothing, drop-tail buffer, retransmission)
+by the engine's unit tests; `cargo test simulation_report -- --nocapture`
+prints the scenario metrics.
 
 The per-link **NAK score** and **NAK rate** remain SRTLA steering signals, not
 end-to-end unrecovered packet loss. A NAK is a retransmission request, and the

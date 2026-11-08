@@ -63,6 +63,7 @@ private:
 	QComboBox *customVideoEncoder_ = nullptr;
 	QComboBox *customAudioEncoder_ = nullptr;
 	QCheckBox *autoBitrate_ = nullptr;
+	QCheckBox *startupProbe_ = nullptr;
 	QSpinBox *manualBitrate_ = nullptr;
 	QSpinBox *maxBitrate_ = nullptr;
 	QLabel *state_ = nullptr;
