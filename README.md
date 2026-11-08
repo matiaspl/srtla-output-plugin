@@ -272,6 +272,32 @@ controller's memory of where the path saturates. Increases depend on it:
   Once the path has been healthy for 1.5 s it is retried with the fast ramp,
   once; a retry that fails within 10 s is not repeated.
 
+### Moving and satellite links
+
+Cellular uplinks on a moving vehicle and LEO satellite terminals change
+capacity and base RTT continuously. The controller treats three situations
+specially so that transient events are not learned as the new capacity:
+
+- **Stalls.** When the acknowledged rate over the last 120 ms falls below a
+  third of what was offered (a handover, a momentary outage), cuts still
+  protect the queue but are not used to set the ceiling. If RTT and queue are
+  back near their floors within 2 s, the bitrate returns to 90 % of its
+  pre-stall value and the previous ceiling is restored at once.
+- **Base-RTT shifts.** RTT or queue that is elevated but no longer growing
+  (with delivery keeping up) is ambiguous: a standing queue or a new base RTT
+  after a handover. After 1.5 s the controller makes one drain-sized cut and
+  watches for a second. If the RTT excess does not shrink by at least a
+  quarter, it adopts the current RTT as the new floor and undoes the cuts made
+  in the last 6 s. Light and heavy congestion therefore require growth
+  evidence (rising RTT or queue, or delivery falling behind); the severe
+  limits, based on the latency budget, apply regardless.
+- **Stale ceilings.** The highest delivery rate in the last 30 s (including
+  the fast drain after a stall, which proves capacity) is kept as a capacity
+  memory. When the controller sits at a ceiling more than 30 % below it and
+  the path is healthy, after 1.5 s it doubles the ceiling (capped at the
+  memory) and ramps. A retry that hits congestion well below its target within
+  5 s doubles the wait before the next one, up to 12 s.
+
 Values applied to OBS are rounded down to 100 kb/s while sub-step changes
 accumulate internally, and the target is always clamped to the configured
 minimum and maximum. Missing or repeated statistics hold the current target
@@ -306,9 +332,16 @@ automatic maximum is 6000 kb/s and its range is capped at 30000 kb/s. This
 ceiling does not limit the separate manual-bitrate setting.
 
 The controller and probe are exercised in closed loop against a simulated
-bottleneck (encoder lag, SRT RTT smoothing, drop-tail buffer, retransmission)
-by the engine's unit tests; `cargo test simulation_report -- --nocapture`
-prints the scenario metrics.
+bottleneck (encoder lag, SRT RTT smoothing, a drop-tail FIFO, retransmission)
+by the engine's unit tests, including time-varying paths: a single cellular
+modem on a moving vehicle (capacity random walk, cell-edge fades, handovers
+that change base RTT), a three-modem bond, a drive past a tower and a LEO
+satellite with 15 s handovers. `cargo test simulation_report -- --nocapture`
+and `cargo test mobility_report -- --nocapture` print the metrics.
+
+On a single fading modem the bitrate can only be as low as the configured
+minimum plus audio; when capacity falls below that, the queue grows and the
+receiver drops late packets. Bonding several modems avoids most of this.
 
 The per-link **NAK score** and **NAK rate** remain SRTLA steering signals, not
 end-to-end unrecovered packet loss. A NAK is a retransmission request, and the

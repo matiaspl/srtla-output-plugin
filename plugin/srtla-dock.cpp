@@ -511,6 +511,9 @@ QString abr_sparkline_label(const QString &state)
 	if (state == QStringLiteral("Probing")) return QStringLiteral("Probing");
 	if (state == QStringLiteral("Settling")) return QStringLiteral("Settling");
 	if (state == QStringLiteral("Startup probe")) return QStringLiteral("Measuring");
+	if (state == QStringLiteral("Baseline check")) return QStringLiteral("Checking");
+	if (state == QStringLiteral("Restored after stall")) return QStringLiteral("Restored");
+	if (state == QStringLiteral("Link stall")) return QStringLiteral("Stall");
 	if (state == QStringLiteral("Light congestion")) return QStringLiteral("Light");
 	if (state == QStringLiteral("Heavy congestion")) return QStringLiteral("Heavy");
 	if (state == QStringLiteral("Severe congestion")) return QStringLiteral("Severe");
@@ -525,6 +528,9 @@ double abr_sparkline_level(const QString &state)
 	if (state == QStringLiteral("Probing")) return 1.0;
 	if (state == QStringLiteral("Startup probe")) return 1.0;
 	if (state == QStringLiteral("Settling")) return 1.5;
+	if (state == QStringLiteral("Baseline check")) return 1.5;
+	if (state == QStringLiteral("Restored after stall")) return 1.0;
+	if (state == QStringLiteral("Link stall")) return 3.0;
 	if (state == QStringLiteral("Light congestion")) return 2.0;
 	if (state == QStringLiteral("Heavy congestion")) return 3.0;
 	if (state == QStringLiteral("Severe congestion")) return 4.0;

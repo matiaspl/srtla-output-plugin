@@ -15,6 +15,9 @@ pub struct SimConfig {
     /// Step schedule of bottleneck capacity: (from_ms, bps).
     pub capacity: Vec<(u64, u64)>,
     pub base_rtt_ms: f64,
+    /// Optional step schedule of base RTT (from_ms, ms); overrides
+    /// `base_rtt_ms` from each step on. Models handovers.
+    pub base_rtt: Vec<(u64, f64)>,
     /// Peak-to-peak random RTT noise added to the bottleneck RTT.
     pub rtt_noise_ms: f64,
     /// Drop-tail buffer at the bottleneck, expressed as queueing time at the
@@ -34,6 +37,7 @@ impl Default for SimConfig {
         Self {
             capacity: vec![(0, 8_000_000)],
             base_rtt_ms: 60.0,
+            base_rtt: Vec::new(),
             rtt_noise_ms: 4.0,
             buffer_ms: 1_000.0,
             latency_ms: 2_000,
@@ -57,6 +61,10 @@ pub struct Sim {
     /// Bytes that left the bottleneck in each recent tick; they are
     /// acknowledged one base RTT later.
     served_ticks: std::collections::VecDeque<f64>,
+    /// Bottleneck FIFO: (enqueue time, bytes). Queueing delay is the age of
+    /// the oldest byte, so a stall delays packets by the stall's length
+    /// rather than by "bytes / momentary capacity".
+    fifo: std::collections::VecDeque<(u64, f64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -69,6 +77,8 @@ pub struct TracePoint {
     pub rtt_ms: f64,
     pub queue_ms: f64,
     pub lost_bytes: f64,
+    /// Approximate one-way delay (half base RTT plus bottleneck queueing).
+    pub one_way_ms: f64,
 }
 
 impl Sim {
@@ -83,6 +93,7 @@ impl Sim {
             retransmit_backlog: 0.0,
             rng: 0x2545_f491_4f6c_dd1d,
             served_ticks: std::collections::VecDeque::new(),
+            fifo: std::collections::VecDeque::new(),
         }
     }
 
@@ -94,6 +105,15 @@ impl Sim {
             .find(|(from, _)| *from <= t_ms)
             .map(|c| c.1)
             .unwrap_or(1)
+    }
+
+    pub fn base_rtt_at(&self, t_ms: u64) -> f64 {
+        self.cfg
+            .base_rtt
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= t_ms)
+            .map_or(self.cfg.base_rtt_ms, |b| b.1)
     }
 
     /// Uniform in [-1, 1).
@@ -117,8 +137,25 @@ impl Sim {
         let service = capacity / 8.0 * dt;
         let served = service.min(self.queue_bytes + arriving);
         self.queue_bytes = (self.queue_bytes + arriving - served).max(0.0);
+        if arriving > 0.0 {
+            self.fifo.push_back((self.now_ms, arriving));
+        }
+        let mut to_serve = served;
+        while to_serve > 0.0 {
+            let Some(front) = self.fifo.front_mut() else {
+                break;
+            };
+            if front.1 <= to_serve {
+                to_serve -= front.1;
+                self.fifo.pop_front();
+            } else {
+                front.1 -= to_serve;
+                to_serve = 0.0;
+            }
+        }
         self.served_ticks.push_back(served);
-        let pipe_ticks = ((self.cfg.base_rtt_ms / TICK_MS as f64).round() as usize).max(1);
+        let base_rtt = self.base_rtt_at(self.now_ms);
+        let pipe_ticks = ((base_rtt / TICK_MS as f64).round() as usize).max(1);
         while self.served_ticks.len() > pipe_ticks {
             self.served_ticks.pop_front();
         }
@@ -127,10 +164,31 @@ impl Sim {
             lost = self.queue_bytes - self.buffer_bytes;
             self.queue_bytes = self.buffer_bytes;
             self.retransmit_backlog += lost;
+            // Drop-tail: the newest bytes are discarded.
+            let mut to_drop = lost;
+            while to_drop > 0.0 {
+                let Some(back) = self.fifo.back_mut() else {
+                    break;
+                };
+                if back.1 <= to_drop {
+                    to_drop -= back.1;
+                    self.fifo.pop_back();
+                } else {
+                    back.1 -= to_drop;
+                    to_drop = 0.0;
+                }
+            }
         }
-        let queue_ms = self.queue_bytes * 8.0 / capacity * 1_000.0;
+        // Sojourn time of the head of the queue, plus this tick's service
+        // time for what is still queued.
+        let queue_ms = match self.fifo.front() {
+            Some((t, _)) if self.queue_bytes > 1.0 => {
+                (self.now_ms - t) as f64 + TICK_MS as f64 / 2.0
+            }
+            _ => 0.0,
+        };
         let noise = self.noise() * self.cfg.rtt_noise_ms / 2.0;
-        let rtt_true = self.cfg.base_rtt_ms + queue_ms + noise;
+        let rtt_true = base_rtt + queue_ms + noise;
         // SRT updates its smoothed RTT (7/8 EWMA) on every ACKACK, roughly
         // every 10 ms while data flows.
         for _ in 0..2 {
@@ -161,6 +219,7 @@ impl Sim {
             rtt_ms: self.srtt,
             queue_ms,
             lost_bytes: lost,
+            one_way_ms: base_rtt / 2.0 + queue_ms,
         };
         (stats, trace)
     }
@@ -509,6 +568,295 @@ fn debug_trace() {
                 d.rtt_heavy_above_ms,
                 d.control_state
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time-varying paths (mobile / satellite)
+// ---------------------------------------------------------------------------
+
+/// Small deterministic PRNG for scenario generation.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+    /// Uniform in [0, 1).
+    pub fn unit(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// Approximately standard normal.
+    pub fn normal(&mut self) -> f64 {
+        (0..6).map(|_| self.unit()).sum::<f64>() * 2.0_f64.sqrt() - 6.0 * 2.0_f64.sqrt() / 2.0
+    }
+}
+
+const STEP_MS: u64 = 250;
+
+/// Capacity schedule (from_ms, bps) and base-RTT schedule (from_ms, ms).
+pub type PathSchedule = (Vec<(u64, u64)>, Vec<(u64, f64)>);
+
+/// One cellular modem on a moving vehicle: log-normal capacity random walk
+/// around `mean_bps`, cell-edge fades, and handovers that briefly stall the
+/// link and change the base RTT.
+pub fn mobile_link(seed: u64, mean_bps: f64, duration_ms: u64) -> PathSchedule {
+    let mut rng = Rng::new(seed);
+    let mut capacity = Vec::new();
+    let mut rtt = Vec::new();
+    let mut log_c = mean_bps.ln();
+    let mut fade_until = 0;
+    let mut fade_depth = 1.0;
+    let mut next_handover = 15_000 + (rng.unit() * 20_000.0) as u64;
+    let mut handover_until = 0;
+    let mut base = 50.0 + rng.unit() * 40.0;
+    rtt.push((0, base));
+    let mut t = 0;
+    while t < duration_ms {
+        // Mean-reverting random walk: ~25 % moves within a couple of seconds.
+        log_c += (mean_bps.ln() - log_c) * 0.03 + rng.normal() * 0.07;
+        log_c = log_c.clamp((mean_bps * 0.25).ln(), (mean_bps * 2.2).ln());
+        if t >= fade_until && rng.unit() < 0.012 {
+            fade_until = t + 1_000 + (rng.unit() * 2_500.0) as u64;
+            fade_depth = 0.12 + rng.unit() * 0.25;
+        }
+        if t >= next_handover {
+            handover_until = t + 250 + (rng.unit() * 300.0) as u64;
+            next_handover = t + 15_000 + (rng.unit() * 25_000.0) as u64;
+            base = 40.0 + rng.unit() * 80.0;
+            rtt.push((handover_until, base));
+        }
+        let mut c = log_c.exp();
+        if t < fade_until {
+            c *= fade_depth;
+        }
+        if t < handover_until {
+            c = 30_000.0;
+        }
+        capacity.push((t, c as u64));
+        t += STEP_MS;
+    }
+    (capacity, rtt)
+}
+
+/// Sum several independently varying modems (SRTLA bonding of one carrier
+/// per modem). The bond's RTT follows the first modem.
+pub fn bonded_links(seed: u64, means: &[f64], duration_ms: u64) -> PathSchedule {
+    let links: Vec<_> = means
+        .iter()
+        .enumerate()
+        .map(|(i, m)| mobile_link(seed * 31 + i as u64, *m, duration_ms))
+        .collect();
+    let capacity = (0..links[0].0.len())
+        .map(|i| (links[0].0[i].0, links.iter().map(|l| l.0[i].1).sum()))
+        .collect();
+    (capacity, links[0].1.clone())
+}
+
+/// Driving past a tower: smooth swing between `low` and `high` bps.
+pub fn sinusoid(low: f64, high: f64, period_ms: f64, duration_ms: u64) -> Vec<(u64, u64)> {
+    (0..duration_ms / STEP_MS)
+        .map(|i| {
+            let t = i * STEP_MS;
+            let phase = (t as f64 / period_ms * std::f64::consts::TAU).sin();
+            (t, (low + (high - low) * (phase + 1.0) / 2.0) as u64)
+        })
+        .collect()
+}
+
+/// LEO satellite: capacity wanders, a short outage and RTT change at every
+/// 15 s satellite handover.
+pub fn leo(seed: u64, duration_ms: u64) -> PathSchedule {
+    let mut rng = Rng::new(seed);
+    let mut capacity = Vec::new();
+    let mut rtt = vec![(0, 45.0)];
+    let mut c: f64 = 18e6;
+    let mut t = 0;
+    while t < duration_ms {
+        c = (c * (1.0 + rng.normal() * 0.05)).clamp(8e6, 30e6);
+        let in_slot = t % 15_000;
+        let value = if in_slot < 200 { 50_000.0 } else { c };
+        if in_slot == 0 && t > 0 {
+            rtt.push((t + 200, 30.0 + rng.unit() * 40.0));
+        }
+        capacity.push((t, value as u64));
+        t += STEP_MS;
+    }
+    (capacity, rtt)
+}
+
+pub struct MobilityMetrics {
+    /// Mean video bitrate actually encoded, relative to an ideal controller
+    /// running at 90 % of instantaneous capacity (clipped to the maximum).
+    pub efficiency: f64,
+    /// Time the one-way delay exceeded the SRT latency (receiver drops).
+    pub glitch_ms: u64,
+    pub mean_rtt_ms: f64,
+    pub reversals: usize,
+    pub mean_video_bps: f64,
+}
+
+pub fn mobility_metrics(cfg: &SimConfig, trace: &[TracePoint], from_ms: u64) -> MobilityMetrics {
+    let window: Vec<_> = trace.iter().filter(|p| p.t_ms >= from_ms).collect();
+    let n = window.len().max(1) as f64;
+    let ideal: f64 = window
+        .iter()
+        .map(|p| {
+            (p.capacity_bps as f64 * 0.9 - cfg.audio_bps as f64)
+                .clamp(cfg.min_bps as f64, cfg.max_bps as f64)
+        })
+        .sum::<f64>()
+        / n;
+    let actual = window.iter().map(|p| p.encoder_bps).sum::<f64>() / n;
+    let glitch_ms = window
+        .iter()
+        .filter(|p| p.one_way_ms > f64::from(cfg.latency_ms))
+        .count() as u64
+        * TICK_MS;
+    let m = metrics(trace, from_ms, u64::MAX, cfg.audio_bps);
+    MobilityMetrics {
+        efficiency: actual / ideal,
+        glitch_ms,
+        mean_rtt_ms: m.mean_rtt_ms,
+        reversals: m.reversals,
+        mean_video_bps: actual,
+    }
+}
+
+pub fn mobility_scenarios() -> Vec<(&'static str, SimConfig)> {
+    const D: u64 = 180_000;
+    let mut out = Vec::new();
+    for seed in 1..=3u64 {
+        let (capacity, base_rtt) = mobile_link(seed, 6e6, D);
+        out.push((
+            [
+                "moto single modem #1",
+                "moto single modem #2",
+                "moto single modem #3",
+            ][seed as usize - 1],
+            SimConfig {
+                capacity,
+                base_rtt,
+                rtt_noise_ms: 15.0,
+                buffer_ms: 1_500.0,
+                max_bps: 12_000_000,
+                ..SimConfig::default()
+            },
+        ));
+    }
+    let (capacity, base_rtt) = bonded_links(7, &[4e6, 3e6, 3e6], D);
+    out.push((
+        "moto 3-modem bond",
+        SimConfig {
+            capacity,
+            base_rtt,
+            rtt_noise_ms: 15.0,
+            buffer_ms: 1_500.0,
+            max_bps: 15_000_000,
+            ..SimConfig::default()
+        },
+    ));
+    out.push((
+        "drive-by tower 3-9M / 20 s",
+        SimConfig {
+            capacity: sinusoid(3e6, 9e6, 20_000.0, D),
+            rtt_noise_ms: 8.0,
+            max_bps: 12_000_000,
+            ..SimConfig::default()
+        },
+    ));
+    let (capacity, base_rtt) = leo(11, D);
+    out.push((
+        "LEO satellite, 15 s handovers",
+        SimConfig {
+            capacity,
+            base_rtt,
+            rtt_noise_ms: 10.0,
+            buffer_ms: 300.0,
+            max_bps: 15_000_000,
+            ..SimConfig::default()
+        },
+    ));
+    out
+}
+
+#[test]
+fn mobility_report() {
+    eprintln!(
+        "{:<32} {:>6} {:>9} {:>9} {:>6} {:>9}",
+        "scenario", "eff", "glitch", "rtt", "rev", "video"
+    );
+    for (name, cfg) in mobility_scenarios() {
+        let mut sim = Sim::new(cfg.clone());
+        let start = 4_000_000;
+        let mut abr = controller_for(&cfg, start);
+        let trace = run_abr(&mut abr, &mut sim, start, 180_000);
+        let m = mobility_metrics(&cfg, &trace, 10_000);
+        eprintln!(
+            "{name:<32} {:>5.0}% {:>7} ms {:>6.0} ms {:>6} {:>6.2} Mb",
+            m.efficiency * 100.0,
+            m.glitch_ms,
+            m.mean_rtt_ms,
+            m.reversals,
+            m.mean_video_bps / 1e6
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn mobility_trace() {
+    let which: usize = std::env::var("SCENARIO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let from: u64 = std::env::var("FROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let to: u64 = std::env::var("TO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+    let every: u64 = std::env::var("EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let (name, cfg) = mobility_scenarios().remove(which);
+    eprintln!("{name}");
+    let mut sim = Sim::new(cfg.clone());
+    let mut abr = controller_for(&cfg, 4_000_000);
+    let mut target = 4_000_000u64;
+    let mut encoder = target as f64;
+    while sim.now_ms < to {
+        encoder += (target as f64 - encoder) * (TICK_MS as f64 / sim.cfg.encoder_tau_ms);
+        let offered =
+            encoder * (1.0 + sim.noise() * sim.cfg.encoder_noise) + sim.cfg.audio_bps as f64;
+        let (stats, point) = sim.step(offered);
+        let d = abr.decide(&sample_for(&cfg, sim.now_ms, target, stats.clone()));
+        target = d.applied_bps;
+        if sim.now_ms >= from && sim.now_ms.is_multiple_of(every) {
+            eprintln!(
+                "{:>6} cap={:>6} tgt={:>6} enc={:>6.0} rtt={:>5} owd={:>5.0} gp={:>6} ceil={:>6} mem={:>6} floor={:>4} {}",
+                sim.now_ms,
+                point.capacity_bps / 1000,
+                target / 1000,
+                encoder / 1000.0,
+                stats.rtt_ms,
+                point.one_way_ms,
+                d.srt_capacity_bps / 1000,
+                d.estimated_capacity_bps / 1000,
+                abr.capacity_memory_bps().unwrap_or(0) / 1000,
+                d.rtt_floor_ms,
+                d.control_state
+            );
+            if std::env::var("DEBUG").is_ok() {
+                eprintln!("        {}", abr.debug_state());
+            }
         }
     }
 }

@@ -57,14 +57,21 @@ const SAME_CEILING_PERMILLE: u64 = 70;
 /// the next one.
 const PROBE_INTERVAL_MS: u64 = 1_000;
 const PROBE_INITIAL_PERMILLE: u64 = 20;
-/// A ceiling drop below this fraction of the previous one is a collapse; the
-/// previous ceiling is remembered and retried once the path looks healthy.
-const COLLAPSE_PERMILLE: u64 = 700;
-const RECOVERY_DWELL_MS: u64 = 1_500;
-const RECOVERY_MEMORY_MS: u64 = 60_000;
-/// A collapse this soon after a restore means the restore failed; do not
-/// keep retrying the old capacity.
-const RESTORE_GRACE_MS: u64 = 10_000;
+/// Capacity memory: the highest delivery rate seen recently. On a moving
+/// link a ceiling learned in a fade is stale within seconds; when the
+/// controller sits at a ceiling well below this memory it retries higher.
+const MEMORY_WINDOW_MS: u64 = 30_000;
+const MEMORY_BUCKET_MS: u64 = 1_000;
+const MEMORY_RETRY_ABOVE_PERMILLE: u64 = 1_300;
+/// Each retry at most doubles the ceiling (bounding a failed retry's
+/// overshoot), capped at the memory.
+const MEMORY_RETRY_FACTOR: u64 = 2;
+const RESTORE_DWELL_MS: u64 = 1_500;
+const RESTORE_DWELL_MAX_MS: u64 = 12_000;
+/// Congestion this soon after a retry, well below the retried ceiling,
+/// means the retry failed.
+const RESTORE_GRACE_MS: u64 = 5_000;
+const RESTORE_FAILED_BELOW_PERMILLE: u64 = 700;
 const PROBE_MAX_PERMILLE: u64 = 80;
 
 // Decrease law.
@@ -84,6 +91,22 @@ const SETTLE_MAX_MS: u64 = 1_500;
 const INCREASE_HOLD_MIN_MS: u64 = 1_000;
 const STARTUP_HOLD_MS: u64 = 1_000;
 const ELEVATED_PERSIST_MS: u64 = 1_500;
+/// Delivery below this fraction of what was offered is a stall (handover,
+/// momentary outage), not a capacity measurement.
+const STALL_RATIO: f64 = 0.35;
+/// Short window so a sub-second stall is recognised while it happens.
+const STALL_WINDOW_MS: u64 = 120;
+/// A stall episode that has drained within this time is restored to the
+/// pre-stall bitrate and ceiling instead of being learned.
+const STALL_RESTORE_WINDOW_MS: u64 = 2_000;
+const STALL_RESTORE_PERMILLE: u64 = 900;
+/// How long a baseline check waits for its cut to drain a standing queue.
+const BASELINE_CHECK_MS: u64 = 1_000;
+/// If RTT excess over the floor shrank by less than this share during the
+/// check, the elevation was a base-RTT shift, not a queue.
+const BASELINE_SHIFT_KEEP: f64 = 0.75;
+/// Cuts made this recently before a detected base-RTT shift are undone.
+const BASELINE_UNDO_WINDOW_MS: u64 = 6_000;
 /// Feedback needed after a reset before the first increase.
 const WARMUP_MS: u64 = 200;
 
@@ -91,6 +114,9 @@ const STATE_DISCONNECTED: &str = "Disconnected";
 const STATE_WAITING: &str = "Waiting for SRT feedback";
 const STATE_HOLD: &str = "Hold";
 const STATE_SETTLING: &str = "Settling";
+const STATE_BASELINE_CHECK: &str = "Baseline check";
+const STATE_STALL: &str = "Link stall";
+const STATE_RESTORED: &str = "Restored after stall";
 const STATE_INCREASING: &str = "Increasing";
 const STATE_PROBING: &str = "Probing";
 const STATE_LIGHT_CONGESTION: &str = "Light congestion";
@@ -216,6 +242,7 @@ struct HistoryPoint {
     sent_bytes: u64,
     flight: u32,
     loss: u32,
+    queue_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -247,6 +274,8 @@ pub(crate) struct Estimator {
     rtt_fast: f64,
     rtt_dev: f64,
     seen_measured_rtt: bool,
+    /// (bucket start, max delivery rate) over MEMORY_WINDOW_MS.
+    delivery_max: VecDeque<(u64, u64)>,
 }
 
 fn push_bucket_min(buckets: &mut VecDeque<(u64, f64)>, now_ms: u64, value: f64) {
@@ -299,6 +328,7 @@ impl Estimator {
             sent_bytes: srt.sent_unique_bytes,
             flight: srt.packets_in_flight,
             loss: srt.sender_loss_packets,
+            queue_ms: f64::from(srt.send_buffer_ms),
         });
         while self
             .history
@@ -307,6 +337,34 @@ impl Estimator {
         {
             self.history.pop_front();
         }
+        if let Some(d) = self.delivery(DELIVERY_WINDOW_MS, 0) {
+            let start = now_ms / MEMORY_BUCKET_MS * MEMORY_BUCKET_MS;
+            match self.delivery_max.back_mut() {
+                Some((bucket, max)) if *bucket == start => *max = (*max).max(d.goodput_bps),
+                _ => self.delivery_max.push_back((start, d.goodput_bps)),
+            }
+            while self
+                .delivery_max
+                .front()
+                .is_some_and(|(bucket, _)| bucket + MEMORY_WINDOW_MS <= now_ms)
+            {
+                self.delivery_max.pop_front();
+            }
+        }
+    }
+
+    /// Highest delivery rate (all media) seen in the last 30 s.
+    pub fn delivery_memory_bps(&self) -> Option<u64> {
+        self.delivery_max.iter().map(|(_, v)| *v).max()
+    }
+
+    /// Adopt the current RTT and queue as the new floors (the path's base
+    /// RTT changed, e.g. after a handover).
+    pub fn rebase(&mut self, now_ms: u64, queue_ms: f64) {
+        self.rtt_buckets.clear();
+        self.queue_buckets.clear();
+        push_bucket_min(&mut self.rtt_buckets, now_ms, self.rtt_fast);
+        push_bucket_min(&mut self.queue_buckets, now_ms, queue_ms);
     }
 
     /// Forget short-term history but keep the learned RTT/queue baselines.
@@ -361,6 +419,19 @@ impl Estimator {
             .rev()
             .find(|p| p.t_ms + TREND_SPAN_MS <= newest.t_ms)
             .map(|p| newest.rtt_ms - p.rtt_ms)
+            .unwrap_or(0.0)
+    }
+
+    /// Sender-queue delay change over roughly the last 200 ms.
+    pub fn queue_trend_ms(&self) -> f64 {
+        let Some(newest) = self.history.back() else {
+            return 0.0;
+        };
+        self.history
+            .iter()
+            .rev()
+            .find(|p| p.t_ms + TREND_SPAN_MS <= newest.t_ms)
+            .map(|p| newest.queue_ms - p.queue_ms)
             .unwrap_or(0.0)
     }
 
@@ -451,7 +522,28 @@ struct Signals {
     heavy: bool,
     light: bool,
     building: bool,
+    stalled: bool,
+    /// Elevated RTT/queue without any growth evidence, for a while.
+    persistent: bool,
+    /// RTT and queue back near their floors.
+    drained: bool,
     healthy: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Episode {
+    started_ms: u64,
+    pre_target_bps: u64,
+    pre_ceiling_bps: Option<u64>,
+    stall: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BaselineCheck {
+    until_ms: u64,
+    rtt_ms: f64,
+    floor_ms: f64,
+    pre_target_bps: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -461,11 +553,14 @@ pub struct AbrController {
     last_srt_sample_ms: Option<u64>,
     estimator: Estimator,
     ceiling_bps: Option<u64>,
-    /// Ceiling before the last collapse and when it was recorded.
-    recovery: Option<(u64, u64)>,
+    /// When the ceiling was last raised from the capacity memory, and to
+    /// what.
     restored_at_ms: Option<u64>,
-    /// Ceiling when the current congestion episode began.
-    episode_ceiling_bps: Option<u64>,
+    restored_to_bps: u64,
+    restore_dwell_ms: u64,
+    audio_bps: u64,
+    episode: Option<Episode>,
+    baseline_check: Option<BaselineCheck>,
     probe_permille: u64,
     probe_dwell_since_ms: Option<u64>,
     probe_dwell_ms: u64,
@@ -487,9 +582,12 @@ impl AbrController {
             last_srt_sample_ms: None,
             estimator: Estimator::default(),
             ceiling_bps: None,
-            recovery: None,
             restored_at_ms: None,
-            episode_ceiling_bps: None,
+            restored_to_bps: 0,
+            restore_dwell_ms: RESTORE_DWELL_MS,
+            audio_bps: 0,
+            episode: None,
+            baseline_check: None,
             probe_permille: PROBE_INITIAL_PERMILLE,
             probe_dwell_since_ms: None,
             probe_dwell_ms: PROBE_DWELL_MS,
@@ -508,6 +606,26 @@ impl AbrController {
 
     pub fn ceiling_bps(&self) -> Option<u64> {
         self.ceiling_bps
+    }
+
+    #[cfg(test)]
+    pub fn debug_state(&self) -> String {
+        format!(
+            "int={} dwell={} rdwell={} since={:?} restored={:?} healthy={} hold_until={} settle_until={}",
+            self.internal_bitrate_bps / 1000,
+            self.probe_dwell_ms,
+            self.restore_dwell_ms,
+            self.probe_dwell_since_ms,
+            self.restored_at_ms,
+            self.signals.healthy,
+            self.increase_hold_until_ms,
+            self.settle_until_ms
+        )
+    }
+
+    /// Highest recent delivery rate (all media), if any.
+    pub fn capacity_memory_bps(&self) -> Option<u64> {
+        self.estimator.delivery_memory_bps()
     }
 
     /// Change the live video ceiling without discarding learned RTT and queue
@@ -540,6 +658,8 @@ impl AbrController {
         self.settle_until_ms = 0;
         self.increase_hold_until_ms = 0;
         self.elevated_since_ms = None;
+        self.episode = None;
+        self.baseline_check = None;
         self.last_control_state = STATE_WAITING;
         self.signals = Signals::default();
     }
@@ -548,8 +668,8 @@ impl AbrController {
     pub fn forget_capacity(&mut self) {
         self.ceiling_bps = None;
         self.probe_dwell_ms = PROBE_DWELL_MS;
-        self.recovery = None;
         self.restored_at_ms = None;
+        self.restore_dwell_ms = RESTORE_DWELL_MS;
         self.probe_permille = PROBE_INITIAL_PERMILLE;
     }
 
@@ -563,8 +683,8 @@ impl AbrController {
     ) {
         self.internal_bitrate_bps = video_bps.clamp(self.config.min_bps, self.config.max_bps);
         self.ceiling_bps = ceiling_video_bps.map(|c| c.max(self.config.min_bps));
-        self.recovery = None;
         self.restored_at_ms = None;
+        self.restore_dwell_ms = RESTORE_DWELL_MS;
         self.probe_permille = PROBE_INITIAL_PERMILLE;
         self.probe_dwell_since_ms = None;
         self.probe_dwell_ms = PROBE_DWELL_MS;
@@ -574,6 +694,8 @@ impl AbrController {
         self.settle_until_ms = 0;
         self.increase_hold_until_ms = now_ms.saturating_add(STARTUP_HOLD_MS);
         self.elevated_since_ms = None;
+        self.episode = None;
+        self.baseline_check = None;
     }
 
     pub fn decide(&mut self, sample: &AbrSample) -> AbrDecision {
@@ -612,6 +734,7 @@ impl AbrController {
             return self.decision(sample, link_capacity_bps, current, current, false, false);
         }
         self.last_srt_sample_ms = Some(sample.srt.sampled_at_ms);
+        self.audio_bps = sample.audio_bps;
         self.estimator.push(sample.now_ms, &sample.srt);
         let signals = self.classify(sample);
         self.signals = signals;
@@ -632,18 +755,77 @@ impl AbrController {
                 (video as f64 * factor - drain).max(video as f64 * floor_factor) as u64
             })
         };
-        let settling = now < self.settle_until_ms;
         let escalate = |target: u64| target < before * ESCALATE_BELOW_PERMILLE / 1_000;
 
+        // Resolve a pending baseline check: if the cut did not shrink the
+        // RTT excess, the path's base RTT moved (handover, satellite
+        // switch). Adopt it as the new floor and undo the recent cuts.
+        if let Some(check) = self.baseline_check
+            && now >= check.until_ms
+        {
+            self.baseline_check = None;
+            let excess_then = check.rtt_ms - check.floor_ms;
+            let excess_now = self.estimator.rtt_smoothed_ms() - check.floor_ms;
+            if excess_then > 0.0 && excess_now > excess_then * BASELINE_SHIFT_KEEP {
+                self.estimator
+                    .rebase(now, f64::from(sample.srt.send_buffer_ms));
+                let mut restore = check.pre_target_bps;
+                if let Some(episode) = self.episode
+                    && now < episode.started_ms + BASELINE_UNDO_WINDOW_MS
+                {
+                    restore = restore.max(episode.pre_target_bps);
+                    self.ceiling_bps = episode.pre_ceiling_bps.or(self.ceiling_bps);
+                }
+                self.internal_bitrate_bps = self.internal_bitrate_bps.max(restore);
+                self.episode = None;
+                self.settle_until_ms = now;
+                self.increase_hold_until_ms = now;
+                self.elevated_since_ms = None;
+                self.signals = self.classify(sample);
+            }
+        }
+        let signals = self.signals;
+        let before = self.internal_bitrate_bps;
+
+        // A short stall that has already drained: return to where we were.
+        if let Some(episode) = self.episode
+            && episode.stall
+            && signals.drained
+            && !signals.stalled
+            && now < episode.started_ms + STALL_RESTORE_WINDOW_MS
+        {
+            self.episode = None;
+            self.ceiling_bps = episode.pre_ceiling_bps;
+            let restore = episode.pre_target_bps * STALL_RESTORE_PERMILLE / 1_000;
+            self.internal_bitrate_bps = self.internal_bitrate_bps.max(restore);
+            self.settle_until_ms = now;
+            self.increase_hold_until_ms = now.saturating_add(INCREASE_HOLD_MIN_MS / 2);
+            self.last_control_state = STATE_RESTORED;
+            let applied_bps = rounded_bps(
+                self.internal_bitrate_bps
+                    .clamp(self.config.min_bps, self.config.max_bps),
+            )
+            .clamp(self.config.min_bps, self.config.max_bps);
+            return self.decision(sample, link_capacity_bps, current, applied_bps, false, true);
+        }
+
+        let settling = now < self.settle_until_ms;
         let mut emergency = false;
         let mut stressed = false;
+        if signals.severe || signals.heavy || signals.light {
+            self.baseline_check = None;
+        }
         if signals.severe && before > self.config.min_bps {
             stressed = true;
             let by_delivery = delivery_target(SEVERE_DELIVERY_FACTOR, SEVERE_DELIVERY_FLOOR);
             let target = by_delivery.map_or(before / 2, |t| t.min(before * 9 / 10));
             if !settling || by_delivery.is_some_and(escalate) {
-                self.decrease(now, target, video_goodput);
-                self.last_control_state = STATE_SEVERE_CONGESTION;
+                self.decrease(now, target, video_goodput, signals.stalled);
+                self.last_control_state = if signals.stalled {
+                    STATE_STALL
+                } else {
+                    STATE_SEVERE_CONGESTION
+                };
                 emergency = true;
             } else {
                 self.last_control_state = STATE_SETTLING;
@@ -655,8 +837,12 @@ impl AbrController {
                 .saturating_sub(DECREASE_MIN_BPS.max(before * HEAVY_DECREASE_PERMILLE / 1_000))
                 .min(by_delivery.unwrap_or(u64::MAX));
             if !settling || by_delivery.is_some_and(escalate) {
-                self.decrease(now, target, video_goodput);
-                self.last_control_state = STATE_HEAVY_CONGESTION;
+                self.decrease(now, target, video_goodput, signals.stalled);
+                self.last_control_state = if signals.stalled {
+                    STATE_STALL
+                } else {
+                    STATE_HEAVY_CONGESTION
+                };
             } else {
                 self.last_control_state = STATE_SETTLING;
             }
@@ -671,11 +857,46 @@ impl AbrController {
             if !settling {
                 // Light congestion means the knee is at or below the current
                 // target; never raise the ceiling estimate above it.
-                self.decrease(now, target, video_goodput.map(|g| g.min(before)));
+                self.decrease(
+                    now,
+                    target,
+                    video_goodput.map(|g| g.min(before)),
+                    signals.stalled,
+                );
                 self.last_control_state = STATE_LIGHT_CONGESTION;
             } else {
                 self.last_control_state = STATE_SETTLING;
             }
+        } else if signals.persistent && self.baseline_check.is_none() && !settling {
+            // Elevated but not growing: either a standing queue or a new
+            // base RTT. Cut enough to drain a queue and watch the RTT.
+            stressed = true;
+            let target = before
+                .saturating_sub(DECREASE_MIN_BPS.max(before * HEAVY_DECREASE_PERMILLE / 1_000))
+                .min(
+                    delivery_target(LIGHT_DELIVERY_FACTOR, HEAVY_DELIVERY_FLOOR)
+                        .unwrap_or(u64::MAX),
+                );
+            let rtt_ms = self.estimator.rtt_smoothed_ms();
+            let floor_ms = signals.thresholds.rtt_floor_ms;
+            // No ceiling update: this is a measurement, not congestion. Keep
+            // the episode that may need undoing if this is a base shift.
+            let episode = self.episode;
+            self.decrease(now, target, None, true);
+            if let Some(episode) = episode
+                && now < episode.started_ms + BASELINE_UNDO_WINDOW_MS
+            {
+                self.episode = Some(episode);
+            }
+            self.baseline_check = Some(BaselineCheck {
+                until_ms: now.saturating_add(BASELINE_CHECK_MS.max(self.settle_until_ms - now)),
+                rtt_ms,
+                floor_ms,
+                pre_target_bps: before,
+            });
+            self.last_control_state = STATE_BASELINE_CHECK;
+        } else if self.baseline_check.is_some() {
+            self.last_control_state = STATE_BASELINE_CHECK;
         } else if settling || now < self.increase_hold_until_ms {
             self.last_control_state = STATE_SETTLING;
         } else if signals.healthy {
@@ -723,12 +944,16 @@ impl AbrController {
         let delivery = est.delivery(DELIVERY_WINDOW_MS, floor as u64);
         let ratio = delivery.map(|d| d.ratio()).unwrap_or(1.0);
         let trend = est.rtt_trend_ms();
-        let rising = trend > 4.0_f64.max(dev * 1.5);
+        let rising =
+            trend > 4.0_f64.max(dev * 1.5) || est.queue_trend_ms() > 10.0_f64.max(dev * 3.0);
         let building = ratio < 0.92;
         let elevated = rtt > light_above_ms || queue > queue_light_ms;
+        // Increases blocked by RTT/queue that sit above the increase
+        // threshold without growing.
+        let blocked = est.rtt_smoothed_ms() > increase_below_ms || queue > queue_light_ms;
 
         let now = sample.now_ms;
-        let elevated_for = if elevated {
+        let elevated_for = if blocked && !rising && !building {
             let since = *self.elevated_since_ms.get_or_insert(now);
             now - since
         } else {
@@ -736,12 +961,22 @@ impl AbrController {
             0
         };
 
+        // RTT or queue above the floor only means congestion when something
+        // is growing; a flat elevation may be a new base RTT after a
+        // handover and is resolved by a baseline check instead.
+        let growth = rising || building;
+        let stalled = est
+            .delivery(STALL_WINDOW_MS, floor as u64)
+            .is_some_and(|d| d.offered_bps > 0 && d.ratio() < STALL_RATIO);
         let severe = rtt >= severe_rtt_ms || queue >= queue_severe_ms;
-        let heavy = rtt > heavy_above_ms
+        let heavy = ((rtt > heavy_above_ms
             || (rtt > latency / 5.0 && rtt > light_above_ms)
-            || queue > queue_heavy_ms
+            || queue > queue_heavy_ms)
+            && growth)
             || (ratio < 0.75 && rtt > light_above_ms);
-        let light = elevated && (rising || building || elevated_for >= ELEVATED_PERSIST_MS);
+        let light = elevated && growth;
+        let persistent = !growth && elevated_for >= ELEVATED_PERSIST_MS;
+        let drained = est.rtt_smoothed_ms() <= light_above_ms && queue <= queue_light_ms && !rising;
         let healthy = est.history_span_ms() >= WARMUP_MS
             && est.rtt_smoothed_ms().min(rtt) <= increase_below_ms
             && queue <= queue_light_ms
@@ -763,31 +998,45 @@ impl AbrController {
             heavy,
             light,
             building,
+            stalled,
+            persistent,
+            drained,
             healthy,
         }
     }
 
-    fn decrease(&mut self, now: u64, target: u64, video_goodput: Option<u64>) {
+    /// `stall`: the evidence is a stall or a measurement, so the ceiling is
+    /// left alone.
+    fn decrease(&mut self, now: u64, target: u64, video_goodput: Option<u64>, stall: bool) {
         let before = self.internal_bitrate_bps;
         let target = target.clamp(self.config.min_bps, before.max(self.config.min_bps));
         // A decrease after the previous one's hold has expired starts a new
         // congestion episode.
-        if now >= self.increase_hold_until_ms {
-            self.episode_ceiling_bps = self.ceiling_bps;
+        if now >= self.increase_hold_until_ms || self.episode.is_none() {
+            self.episode = Some(Episode {
+                started_ms: now,
+                pre_target_bps: before,
+                pre_ceiling_bps: self.ceiling_bps,
+                stall: false,
+            });
         }
-        if target < before {
+        if stall && let Some(episode) = self.episode.as_mut() {
+            episode.stall = true;
+        }
+        if target < before && !stall {
             // The delivery rate measured while congested is the capacity;
             // the current target may already have been cut below it.
             let congestion_point = video_goodput.unwrap_or(before).max(self.config.min_bps);
-            if let Some(previous) = self.episode_ceiling_bps {
-                let failed_restore = self
-                    .restored_at_ms
-                    .is_some_and(|at| now < at + RESTORE_GRACE_MS);
-                if congestion_point < previous * COLLAPSE_PERMILLE / 1_000 && !failed_restore {
-                    let remembered = self.recovery.map_or(previous, |(r, _)| r.max(previous));
-                    self.recovery = Some((remembered, now));
-                } else if failed_restore {
-                    self.recovery = None;
+            if let Some(at) = self.restored_at_ms {
+                self.restored_at_ms = None;
+                if now < at + RESTORE_GRACE_MS
+                    && congestion_point
+                        < self.restored_to_bps * RESTORE_FAILED_BELOW_PERMILLE / 1_000
+                {
+                    // The capacity memory was optimistic: wait longer next time.
+                    self.restore_dwell_ms = (self.restore_dwell_ms * 2).min(RESTORE_DWELL_MAX_MS);
+                } else {
+                    self.restore_dwell_ms = RESTORE_DWELL_MS;
                 }
             }
             let confirmed = self
@@ -833,19 +1082,34 @@ impl AbrController {
         match self.ceiling_bps {
             Some(ceiling) if internal >= ceiling * APPROACH_ZONE_PERMILLE / 1_000 => {
                 let dwell_since = *self.probe_dwell_since_ms.get_or_insert(now);
-                if let Some((remembered, at)) = self.recovery {
-                    if now >= at + RECOVERY_MEMORY_MS || remembered <= ceiling {
-                        self.recovery = None;
-                    } else if now >= dwell_since + RECOVERY_DWELL_MS {
-                        // The collapse has passed: retry the previous
-                        // capacity with the fast ramp instead of creeping up.
-                        self.recovery = None;
-                        self.restored_at_ms = Some(now);
-                        self.ceiling_bps = Some(remembered);
-                        self.probe_dwell_since_ms = None;
-                        self.last_control_state = STATE_INCREASING;
-                        return;
-                    }
+                if self
+                    .restored_at_ms
+                    .is_some_and(|at| now >= at + RESTORE_GRACE_MS)
+                    || (self.restored_at_ms.is_some()
+                        && internal >= self.restored_to_bps * FAST_ZONE_PERMILLE / 1_000)
+                {
+                    // The retried capacity held: retry promptly next time.
+                    self.restored_at_ms = None;
+                    self.restore_dwell_ms = RESTORE_DWELL_MS;
+                }
+                let memory = self
+                    .estimator
+                    .delivery_memory_bps()
+                    .map(|m| m.saturating_sub(self.audio_bps));
+                if let Some(memory) = memory
+                    && memory > ceiling * MEMORY_RETRY_ABOVE_PERMILLE / 1_000
+                    && now >= dwell_since + self.restore_dwell_ms
+                {
+                    // Recently the path delivered far more than this ceiling
+                    // (typical after a fade on a moving link): retry higher
+                    // with the fast ramp instead of creeping up.
+                    let retry = memory.min(ceiling * MEMORY_RETRY_FACTOR);
+                    self.restored_at_ms = Some(now);
+                    self.restored_to_bps = retry;
+                    self.ceiling_bps = Some(retry);
+                    self.probe_dwell_since_ms = None;
+                    self.last_control_state = STATE_INCREASING;
+                    return;
                 }
                 if now < dwell_since + self.probe_dwell_ms {
                     self.last_control_state = STATE_HOLD;
@@ -1059,12 +1323,92 @@ mod tests {
         let now = warm(&mut abr, 6_000_000, 25);
         let first = abr.decide(&sample(now, 6_000_000, 200));
         let held = abr.decide(&sample(now + 20, first.applied_bps, 220));
-        let later = abr.decide(&sample(now + 2_000, held.applied_bps, 220));
+        // Still rising once the settle time is over: cut again.
+        let later = abr.decide(&sample(now + 2_000, held.applied_bps, 300));
 
         assert_eq!(first.control_state, STATE_HEAVY_CONGESTION);
         assert_eq!(held.applied_bps, first.applied_bps);
         assert_eq!(held.control_state, STATE_SETTLING);
         assert!(later.applied_bps < held.applied_bps);
+    }
+
+    #[test]
+    fn a_base_rtt_shift_is_adopted_and_the_cut_undone() {
+        // Handover: base RTT steps from 50 to 140 ms and stays there, with
+        // delivery keeping up. One cut on the step is fine; the controller
+        // must then recognise the new baseline and return to the old rate.
+        let mut abr = controller(6_000_000);
+        let mut now = warm(&mut abr, 6_000_000, 50);
+        let mut current = 6_000_000;
+        let mut lowest = current;
+        for _ in 0..300 {
+            now += 20;
+            let d = abr.decide(&sample(now, current, 140));
+            current = d.applied_bps;
+            lowest = lowest.min(current);
+        }
+        let d = abr.decide(&sample(now + 20, current, 140));
+        assert!(d.rtt_floor_ms >= 130, "floor {}", d.rtt_floor_ms);
+        assert!(current >= 5_700_000, "stayed cut at {current}");
+        assert!(lowest >= 4_000_000, "walked down to {lowest}");
+    }
+
+    #[test]
+    fn a_short_stall_restores_the_previous_rate_and_ceiling() {
+        // LEO-style handover: ~25 Mb/s path, 200 ms outage.
+        let cfg = SimConfig {
+            capacity: vec![(0, 25_000_000), (20_000, 50_000), (20_200, 25_000_000)],
+            buffer_ms: 300.0,
+            max_bps: 15_000_000,
+            ..SimConfig::default()
+        };
+        let mut sim = Sim::new(cfg.clone());
+        let mut abr = sim::controller_for(&cfg, 15_000_000);
+        let trace = sim::run_abr(&mut abr, &mut sim, 15_000_000, 24_000);
+        let back = sim::time_to_reach(&trace, 20_200, 13_000_000).expect("restored");
+        assert!(back <= 2_500, "took {back} ms to return after the stall");
+        if let Some(ceiling) = abr.ceiling_bps() {
+            assert!(
+                ceiling >= 12_000_000,
+                "learned the stall as capacity: {ceiling}"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_and_satellite_paths_meet_targets() {
+        let scenarios = sim::mobility_scenarios();
+        let floors = [
+            // (efficiency, glitch ms) per scenario, with margin below the
+            // measured values: guards against regressions, not tuning goals.
+            (0.50, 300),
+            (0.38, 300),
+            (0.40, 1_500),
+            (0.62, 300),
+            (0.75, 0),
+            (1.00, 0),
+        ];
+        for ((name, cfg), (efficiency, glitch_ms)) in scenarios.into_iter().zip(floors) {
+            let mut sim = Sim::new(cfg.clone());
+            let mut abr = sim::controller_for(&cfg, 4_000_000);
+            let trace = sim::run_abr(&mut abr, &mut sim, 4_000_000, 180_000);
+            let m = sim::mobility_metrics(&cfg, &trace, 10_000);
+            assert!(
+                m.efficiency >= efficiency,
+                "{name}: efficiency {:.2}",
+                m.efficiency
+            );
+            assert!(
+                m.glitch_ms <= glitch_ms,
+                "{name}: glitches {} ms",
+                m.glitch_ms
+            );
+            assert!(
+                m.mean_rtt_ms < 200.0,
+                "{name}: mean RTT {:.0}",
+                m.mean_rtt_ms
+            );
+        }
     }
 
     #[test]
