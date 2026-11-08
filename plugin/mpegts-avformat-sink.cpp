@@ -303,7 +303,10 @@ bool MpegTsAvformatSink::write_packet(const encoder_packet *packet)
 	current_keyframe_ = packet->keyframe;
 	current_pts90k_ = av_packet->pts == AV_NOPTS_VALUE ? 0 :
 		to_90k(av_packet->pts, stream->time_base, AVRational{1, 90000});
-	const int result = av_interleaved_write_frame(format_, av_packet);
+	// OBS delivers encoded packets to outputs already interleaved by DTS.
+	// FFmpeg's interleaver would hold audio for up to max_interleave_delta
+	// (10 s) whenever video is shed under congestion, so write directly.
+	const int result = av_write_frame(format_, av_packet);
 	current_keyframe_ = false;
 	av_packet_free(&av_packet);
 	if (result < 0) {

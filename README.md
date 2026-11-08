@@ -305,6 +305,40 @@ rather than replaying a congestion event. RTT and queue baselines are reset
 after a session transition; the ceiling is kept across reconnects and cleared
 when the output starts.
 
+### Audio over video under congestion
+
+When the bitrate controller cannot keep the SRT send queue inside the latency
+budget (a sudden fade, or capacity below the configured minimum), the output
+stops feeding video into the muxer while audio continues. The picture
+freezes and recovers at a keyframe; sound is not interrupted. Audio is only a
+few percent of the stream, so protecting it costs almost nothing. This works
+in both automatic and manual bitrate mode.
+
+Queue pressure is the SRT sender-queue delay beyond the RTT floor, as a
+fraction of the latency left after the floor:
+
+- above 35 % (back below 25 %), frames that nothing references
+  (`OBS_NAL_PRIORITY_DISPOSABLE`, typically non-reference B-frames) are
+  dropped, once the encoder has shown that it sets OBS frame priorities;
+- above 55 % (back below 35 %), all video is dropped. Because delta frames
+  depend on earlier frames, video then resumes only at a keyframe;
+- a keyframe is sent only if, at the measured delivery rate, it keeps the
+  pressure under 80 %. A large keyframe on a thin link would arrive late and
+  only delay audio, so the picture stays frozen; small keyframes on a
+  congested link pass, giving a keyframe slideshow.
+
+After a reconnect or an overflow of the plugin's own bounded queue, video
+likewise resumes at the next keyframe with fresh MPEG-TS tables while audio
+keeps flowing; an overflowing queue drops its oldest datagrams, which would
+arrive late anyway. Shed frames are counted in OBS's dropped-frames statistic,
+and the dock shows **Audio only** in the ABR tile while video is paused, with
+counters and the current queue pressure in its tooltip. Keep the keyframe
+interval at 1–2 s so video recovers quickly.
+
+While video is paused the stream carries no video packets. FFmpeg places the
+MPEG-TS PCR on the video PID, so receivers that strictly require a regular PCR
+should be checked with this behaviour.
+
 ### Startup bandwidth probe
 
 With automatic bitrate and **Measure bandwidth before start** enabled, the

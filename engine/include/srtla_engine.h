@@ -84,6 +84,15 @@ typedef struct SrtlaProbeStep {
 int32_t srtla_engine_probe_start(SrtlaEngineHandle *handle, uint64_t now_ms, uint32_t budget_ms);
 int32_t srtla_engine_probe_step(SrtlaEngineHandle *handle, uint64_t now_ms, SrtlaProbeStep *out);
 int32_t srtla_engine_probe_cancel(SrtlaEngineHandle *handle);
+
+/* Video shedding: call for each encoded video frame (never audio) before
+ * muxing. Returns 1 to send the frame, 0 to drop it, -1 for an invalid
+ * handle. When the SRT send queue nears the latency budget, disposable
+ * frames are dropped first, then all video until a keyframe that can be
+ * delivered in time, so audio keeps flowing. drop_priority is OBS
+ * encoder_packet::drop_priority (OBS_NAL_PRIORITY_*). */
+int32_t srtla_engine_admit_video(SrtlaEngineHandle *handle, uint64_t now_ms, size_t size, bool keyframe,
+				 int32_t drop_priority);
 size_t srtla_engine_copy_stats_json(SrtlaEngineHandle *handle, char *output, size_t capacity);
 const char *srtla_engine_last_error(SrtlaEngineHandle *handle);
 

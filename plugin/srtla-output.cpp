@@ -48,7 +48,6 @@ struct SrtlaOutput {
 	std::condition_variable queue_changed;
 	std::deque<QueuedTsDatagram> queue;
 	std::uint64_t queue_bytes = 0;
-	bool drop_until_keyframe = false;
 	bool worker_stop = false;
 	std::thread worker;
 	std::atomic_bool abr_stop{false};
@@ -692,8 +691,8 @@ static void on_session_status(SrtlaOutput *data, SrtSession::Status status, cons
 		std::lock_guard<std::mutex> lock(data->queue_mutex);
 		data->queue.clear();
 		data->queue_bytes = 0;
-		data->drop_until_keyframe = true;
 	}
+	// Video resumes at the next keyframe with fresh tables; audio continues.
 	data->needs_muxer_reset.store(true);
 	data->queue_changed.notify_all();
 }
@@ -706,21 +705,21 @@ static void enqueue_datagram(SrtlaOutput *data, std::vector<std::uint8_t> bytes,
 	std::lock_guard<std::mutex> lock(data->queue_mutex);
 	constexpr std::uint64_t max_queue_bytes = 8ULL * 1024ULL * 1024ULL;
 	constexpr std::int64_t max_queue_duration = 2 * 90000;
-	if (data->drop_until_keyframe && !keyframe) {
-		data->dropped_frames.fetch_add(1);
-		return;
+	// Over the bound, the oldest datagrams would arrive late anyway: drop
+	// those and keep the newest (which carry the current audio). Datagrams
+	// mix audio and video, so the video they cut through cannot be decoded;
+	// video waits for the next keyframe while audio keeps flowing.
+	bool overflowed = false;
+	while (!data->queue.empty() &&
+	       (data->queue_bytes + bytes.size() > max_queue_bytes ||
+		pts90k - data->queue.front().pts90k > max_queue_duration)) {
+		data->queue_bytes -= data->queue.front().bytes.size();
+		data->queue.pop_front();
+		overflowed = true;
 	}
-	if (keyframe && data->drop_until_keyframe) {
-		data->queue.clear();
-		data->queue_bytes = 0;
-		data->drop_until_keyframe = false;
-	}
-	const auto duration = data->queue.empty() ? 0 : pts90k - data->queue.front().pts90k;
-	if (data->queue_bytes + bytes.size() > max_queue_bytes || duration > max_queue_duration) {
-		data->drop_until_keyframe = true;
+	if (overflowed) {
 		data->needs_muxer_reset.store(true);
 		data->dropped_frames.fetch_add(1);
-		return;
 	}
 	data->total_bytes.fetch_add(bytes.size());
 	data->queue_bytes += bytes.size();
@@ -754,7 +753,6 @@ static void start_worker(SrtlaOutput *data)
 					data->queue.clear();
 					data->queue_bytes = 0;
 					data->dropped_frames.fetch_add(1);
-					data->drop_until_keyframe = true;
 				}
 				data->needs_muxer_reset.store(true);
 				std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1027,7 +1025,6 @@ static bool srtla_output_start(void *opaque)
 	{
 		std::lock_guard<std::mutex> lock(data->queue_mutex);
 		data->queue.clear();
-		data->drop_until_keyframe = false;
 		data->needs_muxer_reset.store(false);
 		data->worker_stop = false;
 	}
@@ -1095,13 +1092,27 @@ static void srtla_output_encoded_packet(void *opaque, struct encoder_packet *pac
 	auto *data = static_cast<SrtlaOutput *>(opaque);
 	if (!data->running.load() || !packet || !packet->data || packet->size == 0)
 		return;
-	// After a reconnect the bounded queue drops everything until the next
-	// keyframe.  Do not let an intervening delta frame mark PAT/PMT as already
-	// emitted; otherwise the first accepted keyframe would lack fresh tables.
-	if (data->needs_muxer_reset.load() && !packet->keyframe)
-		return;
-	if (data->needs_muxer_reset.exchange(false) && data->muxer)
-		data->muxer->reset();
+	// Audio is never shed: it is a few percent of the stream and dropouts
+	// are far more disruptive than a frozen picture. Video is gated here,
+	// before muxing, so whole frames are dropped and audio is untouched.
+	if (packet->type == OBS_ENCODER_VIDEO) {
+		// After a reconnect or queue overflow, video resumes at the next
+		// keyframe with fresh PAT/PMT. Delta frames before it cannot be
+		// decoded and must not mark the tables as already emitted.
+		if (data->needs_muxer_reset.load() && !packet->keyframe) {
+			data->dropped_frames.fetch_add(1);
+			return;
+		}
+		// Under congestion, shed video so audio keeps arriving in time.
+		if (data->engine &&
+		    srtla_engine_admit_video(data->engine, steady_now_ms(), packet->size, packet->keyframe,
+					     packet->drop_priority) == 0) {
+			data->dropped_frames.fetch_add(1);
+			return;
+		}
+		if (data->needs_muxer_reset.exchange(false) && data->muxer)
+			data->muxer->reset();
+	}
 	if (!data->muxer || !data->muxer->write(packet)) {
 		const std::string error = data->muxer && !data->muxer->last_error().empty() ?
 			data->muxer->last_error() : "MPEG-TS muxer rejected an encoded packet";

@@ -2,6 +2,7 @@
 
 mod abr;
 mod probe;
+mod shed;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -18,6 +19,7 @@ use srtla_send::embedded::{
 
 pub use abr::{AbrConfig, AbrController, AbrDecision, AbrSample, LinkCapacity, SrtCapacity};
 pub use probe::{ProbeConfig, ProbeController, ProbeOutcome, ProbeStep};
+pub use shed::{PathState, ShedLevel, VideoShedder};
 
 const ENGINE_INPUT_CAPACITY: usize = 1024;
 const ENGINE_OUTPUT_CAPACITY: usize = 256;
@@ -164,6 +166,11 @@ struct EngineSnapshot {
     probe_measured: bool,
     probe_capacity_bps: u64,
     probe_video_bps: u64,
+    video_shed_state: String,
+    video_shed_pressure_permille: u32,
+    video_frames_shed: u64,
+    video_keyframes_shed: u64,
+    video_bytes_shed: u64,
     srt_session_state: String,
     srt_connected: bool,
     links: Vec<LinkSnapshot>,
@@ -361,6 +368,9 @@ struct Engine {
     last_abr_decision: AbrDecision,
     probe: Option<ProbeController>,
     probe_outcome: Option<ProbeOutcome>,
+    shedder: VideoShedder,
+    /// Transport baselines for shedding; independent of the bitrate mode.
+    shed_estimator: abr::Estimator,
     runner: Option<EmbeddedSender>,
 }
 
@@ -567,6 +577,12 @@ impl Engine {
             probe_measured: self.probe_outcome.is_some_and(|o| o.measured),
             probe_capacity_bps: self.probe_outcome.and_then(|o| o.capacity_bps).unwrap_or(0),
             probe_video_bps: self.probe_outcome.map_or(0, |o| o.video_bps),
+            video_shed_state: self.shedder.state_label().to_string(),
+            video_shed_pressure_permille: (self.shedder.pressure() * 1_000.0).clamp(0.0, 1e6)
+                as u32,
+            video_frames_shed: self.shedder.frames_shed,
+            video_keyframes_shed: self.shedder.keyframes_shed,
+            video_bytes_shed: self.shedder.bytes_shed,
             srt_session_state,
             srt_connected,
             links: self
@@ -623,6 +639,23 @@ impl Engine {
             packets_in_flight: self.srt_stats.packets_in_flight,
             sender_loss_packets: self.srt_stats.sender_loss_packets,
         }
+    }
+
+    fn shed_path(&self, now_ms: u64) -> Option<PathState> {
+        let srt = self.srt_capacity(now_ms);
+        if !srt.ready || srt.rtt_ms == 0 {
+            return None;
+        }
+        let floor = self.shed_estimator.rtt_floor_ms();
+        Some(PathState {
+            queue_ms: f64::from(srt.send_buffer_ms),
+            rtt_floor_ms: floor,
+            latency_ms: f64::from(srt.latency_ms),
+            delivery_bps: self
+                .shed_estimator
+                .delivery(500, floor as u64)
+                .map(|d| d.goodput_bps),
+        })
     }
 
     fn apply_abr(&mut self, now_ms: u64) -> AbrDecision {
@@ -721,6 +754,8 @@ pub extern "C" fn srtla_engine_create(config_json: *const c_char) -> *mut SrtlaE
         last_abr_decision: AbrDecision::default(),
         probe: None,
         probe_outcome: None,
+        shedder: VideoShedder::default(),
+        shed_estimator: abr::Estimator::default(),
         runner: None,
     });
     Box::into_raw(Box::new(SrtlaEngineHandle {
@@ -741,6 +776,8 @@ pub extern "C" fn srtla_engine_start(handle: *mut SrtlaEngineHandle) -> i32 {
             engine.last_abr_decision = AbrDecision::default();
             engine.probe = None;
             engine.probe_outcome = None;
+            engine.shedder = VideoShedder::default();
+            engine.shed_estimator = abr::Estimator::default();
             let current_video_bps = engine.current_video_bps;
             engine.abr.reset_for_bitrate(current_video_bps);
             engine.abr.forget_capacity();
@@ -1173,6 +1210,10 @@ pub extern "C" fn srtla_engine_update_srt_stats(
         latency_ms: stats.latency_ms,
         sender_loss_packets: stats.sender_loss_packets,
     };
+    if engine.session_state == SESSION_CONNECTED && stats.rtt_ms > 0 {
+        let srt = engine.srt_capacity(stats.sampled_at_ms);
+        engine.shed_estimator.push(stats.sampled_at_ms, &srt);
+    }
     0
 }
 
@@ -1241,6 +1282,7 @@ pub extern "C" fn srtla_engine_set_session_state(
     if previous_state != state {
         let current_video_bps = engine.current_video_bps;
         engine.abr.reset_for_bitrate(current_video_bps);
+        engine.shed_estimator = abr::Estimator::default();
     }
     engine.session_error = if error.is_null() {
         String::new()
@@ -1375,6 +1417,30 @@ pub extern "C" fn srtla_engine_probe_step(
     // SAFETY: size checked above.
     unsafe { *out = result };
     0
+}
+
+/// Decide whether one encoded video frame is sent (1) or shed (0) so that
+/// audio keeps flowing when the SRT queue nears the latency budget. Call it
+/// for video frames only, before muxing. `drop_priority` is the OBS
+/// `encoder_packet::drop_priority` (`OBS_NAL_PRIORITY_*`). Returns -1 for an
+/// invalid handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn srtla_engine_admit_video(
+    handle: *mut SrtlaEngineHandle,
+    now_ms: u64,
+    size: usize,
+    keyframe: bool,
+    drop_priority: i32,
+) -> i32 {
+    let Some(mut engine) = with_engine(handle) else {
+        return -1;
+    };
+    let path = engine.shed_path(now_ms);
+    i32::from(
+        engine
+            .shedder
+            .admit(path.as_ref(), size, keyframe, drop_priority),
+    )
 }
 
 /// Abandon a running probe without seeding the controller.
@@ -1742,6 +1808,52 @@ mod tests {
         assert_eq!(
             srtla_engine_probe_step(handle, sim.now_ms + 20, &mut step),
             -4
+        );
+        srtla_engine_destroy(handle);
+    }
+
+    #[test]
+    fn video_is_shed_when_the_sender_queue_nears_the_latency_budget() {
+        let handle = probe_engine(6_000_000);
+        let mut stats = SrtlaSrtStats {
+            struct_size: std::mem::size_of::<SrtlaSrtStats>() as u32,
+            sent_unique_bytes: 10_000,
+            packets_in_flight: 30,
+            rtt_ms: 60,
+            send_buffer_ms: 70,
+            latency_ms: 2_000,
+            ..Default::default()
+        };
+        // Learn the RTT floor on a healthy path; everything is sent.
+        for now in (20..=1_000).step_by(20) {
+            stats.sampled_at_ms = now;
+            assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
+        }
+        assert_eq!(srtla_engine_admit_video(handle, 1_000, 60_000, true, 3), 1);
+        assert_eq!(srtla_engine_admit_video(handle, 1_000, 8_000, false, 2), 1);
+        // Queue grows to 1.4 s of a 2 s budget: video pauses.
+        stats.sampled_at_ms = 1_020;
+        stats.send_buffer_ms = 1_400;
+        stats.rtt_ms = 70;
+        assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
+        assert_eq!(srtla_engine_admit_video(handle, 1_020, 8_000, false, 2), 0);
+        let json = stats_json(handle);
+        assert!(
+            json.contains("\"video_shed_state\":\"Video paused\""),
+            "{json}"
+        );
+        assert!(json.contains("\"video_frames_shed\":1"));
+        // Drained: delta frames still wait for the next keyframe.
+        stats.sampled_at_ms = 1_040;
+        stats.send_buffer_ms = 80;
+        assert_eq!(srtla_engine_update_srt_stats(handle, &stats), 0);
+        assert_eq!(srtla_engine_admit_video(handle, 1_040, 8_000, false, 2), 0);
+        assert_eq!(srtla_engine_admit_video(handle, 1_040, 60_000, true, 3), 1);
+        assert_eq!(srtla_engine_admit_video(handle, 1_040, 8_000, false, 2), 1);
+        assert!(stats_json(handle).contains("\"video_shed_state\":\"\""));
+        assert_eq!(
+            srtla_engine_admit_video(ptr::null_mut(), 0, 1, false, 0),
+            -1
         );
         srtla_engine_destroy(handle);
     }

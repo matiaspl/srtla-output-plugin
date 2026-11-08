@@ -1686,8 +1686,11 @@ void SrtlaDock::refreshStatus()
 	appendMetric(3, videoValue);
 	appendMetric(4, targetValue);
 	appendMetric(5, active);
-	metricValues_[0]->setText(abr_sparkline_label(abrState));
-	metricValues_[0]->setToolTip(abrState);
+	const auto shedState = root.value(QStringLiteral("video_shed_state")).toString();
+	metricValues_[0]->setText(shedState == QStringLiteral("Video paused") ? tr("Audio only") :
+		abr_sparkline_label(abrState));
+	metricValues_[0]->setToolTip(shedState.isEmpty() ? abrState :
+		tr("%1 — %2 (audio continues)").arg(abrState, shedState));
 	metricValues_[1]->setText(srtReady ? QStringLiteral("%1 / %2").arg(root.value(QStringLiteral("srt_rtt_ms")).toInteger()).arg(root.value(QStringLiteral("srt_latency_ms")).toInteger()) : QStringLiteral("--"));
 	metricValues_[1]->setToolTip(tr("Measured SRT RTT / configured latency, in milliseconds"));
 	metricValues_[2]->setText(srtReady ? tr("%1 pkt · %2 ms").arg(root.value(QStringLiteral("srt_send_buffer_packets")).toInteger()).arg(root.value(QStringLiteral("srt_send_buffer_ms")).toInteger()) : QStringLiteral("--"));
@@ -1713,6 +1716,12 @@ void SrtlaDock::refreshStatus()
 		.arg(root.value(QStringLiteral("abr_queue_light_ms")).toInteger())
 		.arg(root.value(QStringLiteral("abr_queue_heavy_ms")).toInteger())
 		.arg(root.value(QStringLiteral("abr_queue_severe_ms")).toInteger())
+		+ QStringLiteral("\n") +
+		tr("Video shed: %1 frames (%2 keyframes, %3 KB) | queue pressure: %4%")
+		.arg(root.value(QStringLiteral("video_frames_shed")).toInteger())
+		.arg(root.value(QStringLiteral("video_keyframes_shed")).toInteger())
+		.arg(root.value(QStringLiteral("video_bytes_shed")).toInteger() / 1024)
+		.arg(root.value(QStringLiteral("video_shed_pressure_permille")).toInteger() / 10)
 		+ QStringLiteral("\n") +
 		tr("SRT estimate: %1 kb/s | send: %2 kb/s | link capacity: %3 kb/s | offered: %4 kb/s | delivered: %5 kb/s | retransmissions: %6% | sender loss: %7 | dropped: %8 bytes")
 		.arg(srtRaw / 1000)
