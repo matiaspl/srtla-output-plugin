@@ -395,6 +395,53 @@ switches cause no late delivery. Step-ups take about 2–3 s (LTE → 5G) and
 drains at HSPA+ speed, and nothing sent afterwards can recall it. Video
 shedding shortens it by draining faster; bonding a second modem avoids it.
 
+### Bonded links
+
+Most SRTLA use is bonded, so a separate simulation (`engine/src/bond_sim.rs`)
+models each link and drives the vendored `srtla-core` scheduler directly on
+a simulated clock: link selection (enhanced mode, stall gating, quality,
+per-link congestion control and in-flight caps), batching, stall probes,
+keepalive RTT, window recovery and link phases, called in the order the
+embedded sender calls them. On top runs a model of SRT (cumulative ACKs,
+ACKACK RTT, NAKs held for the cross-link transit spread, retransmissions
+steered to the best link, both ends giving up past the latency), the
+encoder, this controller and video shedding. Each link has its own capacity,
+base RTT and jitter, a host queue and a modem buffer. Scenarios cover steady
+links, three moving modems, one modem entering an 8 s tunnel, one modem
+switching 5G/LTE/HSPA+, Starlink plus two modems, and two modems sharing a
+congested cell. `cargo test --release bond_report -- --ignored --nocapture`
+prints the results.
+
+What it showed:
+
+- On a bond the SRT send-buffer age jumps by tens of milliseconds from one
+  sample to the next, depending on which link carried the latest ACK. The
+  controller now tracks that noise and scales its queue thresholds with it;
+  before, it read the jitter as congestion and slid to the minimum on a
+  healthy 10 Mb/s bond.
+- The size of the sending host's queue (socket send buffer, interface
+  queue) made no difference in any bonded scenario, and the sender never
+  blocked on a full socket: the modem buffers absorb the backlog first.
+  Changing the sender's socket buffer size is therefore not worth doing.
+- Media is delivered on time in every scenario, including a link vanishing
+  into a tunnel: stall gating takes it out of rotation and SRT resends its
+  stuck packets over the other links within the latency.
+- How often the SRTLA receiver acknowledges packets matters. With the
+  classic receiver behaviour (an ACK every 10 packets per link) the
+  scheduler's in-flight caps under-use low-RTT links and a steady 10 Mb/s
+  bond carries about 6.5 Mb/s; a receiver that also flushes ACKs on a short
+  timer reaches about 8.5 Mb/s. Which behaviour production receivers have
+  should be checked.
+- On moving links, bond throughput is limited by the vendored scheduler's
+  per-link congestion control, not by this controller: after each fade a
+  link's target is cut, it climbs back by about 2 % per second and at most
+  to twice what the link currently carries, and the in-flight cap keeps the
+  link nearly idle meanwhile. With fades every few tens of seconds per link
+  the targets ratchet down and the bond carries only 1–2 Mb/s of roughly
+  10 Mb/s. This needs attention upstream (or in the vendored copy); the
+  fade model may also be harsher than real modems, which field logs would
+  show.
+
 On a single fading modem the bitrate can only be as low as the configured
 minimum plus audio; when capacity falls below that, the queue grows and the
 receiver drops late packets. Bonding several modems avoids most of this.

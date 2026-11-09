@@ -17,3 +17,7 @@ srtla_send = { path = "../third_party/srtla_send" }
 
 [dev-dependencies]
 proptest = "1"
+# Drive the real SRTLA scheduler (sans-IO) in the multi-link simulation.
+srtla-core = { path = "../third_party/srtla_send/crates/srtla-core", features = ["test-internals"] }
+srtla-protocol = { path = "../third_party/srtla_send/crates/srtla-protocol" }
+smallvec = "=2.0.0-alpha.12"

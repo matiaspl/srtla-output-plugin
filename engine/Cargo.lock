@@ -615,6 +615,7 @@ dependencies = [
  "rustc-hash",
  "smallvec 2.0.0-alpha.12",
  "srtla-protocol",
+ "tokio",
  "tracing",
 ]
 
@@ -625,6 +626,9 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "smallvec 2.0.0-alpha.12",
+ "srtla-core",
+ "srtla-protocol",
  "srtla_send",
  "tokio",
 ]

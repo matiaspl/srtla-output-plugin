@@ -1,6 +1,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod abr;
+#[cfg(test)]
+mod bond_sim;
 mod probe;
 mod shed;
 

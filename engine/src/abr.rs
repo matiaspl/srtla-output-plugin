@@ -297,6 +297,11 @@ pub(crate) struct Estimator {
     queue_buckets: VecDeque<(u64, f64)>,
     rtt_fast: f64,
     rtt_dev: f64,
+    /// Sender-queue delay smoothed over ~200 ms, and its noise. On a bond the
+    /// SRT send buffer jumps by tens of ms between samples depending on which
+    /// link carried the latest ACK; thresholds must allow for that.
+    queue_fast: f64,
+    queue_dev: f64,
     seen_measured_rtt: bool,
     /// (bucket start, max delivery rate) over MEMORY_WINDOW_MS.
     delivery_max: VecDeque<(u64, u64)>,
@@ -337,6 +342,18 @@ impl Estimator {
             && rtt > floor + 40.0_f64.max(floor * 0.4).max(self.rtt_dev * 5.0);
         if !congested {
             self.rtt_dev += ((rtt - self.rtt_fast).abs() - self.rtt_dev) * 0.05;
+        }
+        let queue = f64::from(srt.send_buffer_ms);
+        if self.queue_fast == 0.0 {
+            self.queue_fast = queue;
+        } else {
+            self.queue_fast += (queue - self.queue_fast) * 0.1;
+        }
+        let queue_floor = self.queue_buckets.iter().map(|(_, v)| *v).reduce(f64::min);
+        let queue_congested =
+            queue_floor.is_some_and(|f| queue > f + 80.0_f64.max(self.queue_dev * 6.0));
+        if !queue_congested {
+            self.queue_dev += ((queue - self.queue_fast).abs() - self.queue_dev) * 0.05;
         }
         if self.seen_measured_rtt {
             push_bucket_min(&mut self.rtt_buckets, now_ms, rtt);
@@ -432,6 +449,14 @@ impl Estimator {
     /// latest sample.
     pub fn rtt_smoothed_ms(&self) -> f64 {
         self.rtt_fast
+    }
+
+    pub fn queue_smoothed_ms(&self) -> f64 {
+        self.queue_fast
+    }
+
+    pub fn queue_deviation_ms(&self) -> f64 {
+        self.queue_dev
     }
 
     pub fn rtt_deviation_ms(&self) -> f64 {
@@ -576,6 +601,8 @@ struct Episode {
     pre_target_bps: u64,
     pre_ceiling_bps: Option<u64>,
     stall: bool,
+    /// When the stall was first seen; the restore window counts from here.
+    stall_seen_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -670,7 +697,9 @@ impl AbrController {
     #[cfg(test)]
     pub fn debug_state(&self) -> String {
         format!(
-            "int={} dwell={} rdwell={} since={:?} restored={:?} healthy={} hold_until={} settle_until={} path_ref={:?} recent={:?} elev_since={:?} check={}",
+            "paths={} ceil={:?} int={} dwell={} rdwell={} since={:?} restored={:?} healthy={} hold_until={} settle_until={} path_ref={:?} recent={:?} elev_since={:?} check={} sev={} heavy={} light={} build={} pers={} stall={} ratio={:?} qL/H={:.0}/{:.0}",
+            self.path_changes,
+            self.ceiling_bps.map(|c| c / 1000),
             self.internal_bitrate_bps / 1000,
             self.probe_dwell_ms,
             self.restore_dwell_ms,
@@ -682,7 +711,16 @@ impl AbrController {
             self.path_rtt_ms,
             self.estimator.rtt_recent_min_ms(PATH_FAST_WINDOW_MS),
             self.elevated_since_ms,
-            self.baseline_check.is_some()
+            self.baseline_check.is_some(),
+            self.signals.severe,
+            self.signals.heavy,
+            self.signals.light,
+            self.signals.building,
+            self.signals.persistent,
+            self.signals.stalled,
+            self.signals.delivery.map(|d| (d.ratio() * 100.0) as u32),
+            self.signals.thresholds.queue_light_ms,
+            self.signals.thresholds.queue_heavy_ms
         )
     }
 
@@ -805,6 +843,11 @@ impl AbrController {
 
         let now = sample.now_ms;
         let before = self.internal_bitrate_bps;
+        if signals.stalled
+            && let Some(episode) = self.episode.as_mut()
+        {
+            episode.stall_seen_ms.get_or_insert(now);
+        }
         let video_goodput = signals
             .delivery
             .map(|d| d.goodput_bps.saturating_sub(sample.audio_bps));
@@ -865,7 +908,7 @@ impl AbrController {
             && episode.stall
             && signals.drained
             && !signals.stalled
-            && now < episode.started_ms + STALL_RESTORE_WINDOW_MS
+            && now < episode.stall_seen_ms.unwrap_or(episode.started_ms) + STALL_RESTORE_WINDOW_MS
         {
             self.episode = None;
             self.ceiling_bps = episode.pre_ceiling_bps;
@@ -1010,20 +1053,30 @@ impl AbrController {
         // the floor; half the budget is severe even if the floor itself was
         // learned while congested.
         let severe_rtt_ms = (latency / 3.0).max(heavy_above_ms.min(latency / 2.0));
-        let queue_light_ms = queue_floor + 40.0_f64.max(floor * 0.3).max(dev * 4.0);
-        let queue_heavy_ms = queue_floor + 120.0_f64.max(floor * 0.8).max(latency / 10.0);
+        let queue_dev = est.queue_deviation_ms();
+        let queue_smoothed = est.queue_smoothed_ms();
+        let queue_light_ms = queue_floor
+            + 40.0_f64
+                .max(floor * 0.3)
+                .max(dev * 4.0)
+                .max(queue_dev * 4.0);
+        let queue_heavy_ms = queue_floor
+            + 120.0_f64
+                .max(floor * 0.8)
+                .max(latency / 10.0)
+                .max(queue_dev * 8.0);
         let queue_severe_ms = (latency / 2.0).max(queue_heavy_ms + 1.0);
 
         let delivery = est.delivery(DELIVERY_WINDOW_MS, floor as u64);
         let ratio = delivery.map(|d| d.ratio()).unwrap_or(1.0);
         let trend = est.rtt_trend_ms();
-        let rising =
-            trend > 4.0_f64.max(dev * 1.5) || est.queue_trend_ms() > 10.0_f64.max(dev * 3.0);
+        let rising = trend > 4.0_f64.max(dev * 1.5)
+            || est.queue_trend_ms() > 10.0_f64.max(dev * 3.0).max(queue_dev * 3.0);
         let building = ratio < 0.92;
-        let elevated = rtt > light_above_ms || queue > queue_light_ms;
+        let elevated = rtt > light_above_ms || queue_smoothed > queue_light_ms;
         // Increases blocked by RTT/queue that sit above the increase
         // threshold without growing.
-        let blocked = est.rtt_smoothed_ms() > increase_below_ms || queue > queue_light_ms;
+        let blocked = est.rtt_smoothed_ms() > increase_below_ms || queue_smoothed > queue_light_ms;
 
         let now = sample.now_ms;
         let elevated_for = if blocked && !rising && !building {
@@ -1044,15 +1097,16 @@ impl AbrController {
         let severe = rtt >= severe_rtt_ms || queue >= queue_severe_ms;
         let heavy = ((rtt > heavy_above_ms
             || (rtt > latency / 5.0 && rtt > light_above_ms)
-            || queue > queue_heavy_ms)
+            || queue_smoothed > queue_heavy_ms)
             && growth)
             || (ratio < 0.75 && rtt > light_above_ms);
         let light = elevated && growth;
         let persistent = !growth && elevated_for >= ELEVATED_PERSIST_MS;
-        let drained = est.rtt_smoothed_ms() <= light_above_ms && queue <= queue_light_ms && !rising;
+        let drained =
+            est.rtt_smoothed_ms() <= light_above_ms && queue_smoothed <= queue_light_ms && !rising;
         let healthy = est.history_span_ms() >= WARMUP_MS
             && est.rtt_smoothed_ms().min(rtt) <= increase_below_ms
-            && queue <= queue_light_ms
+            && queue_smoothed <= queue_light_ms
             && !rising
             && ratio >= 0.95;
 
@@ -1194,10 +1248,12 @@ impl AbrController {
                 pre_target_bps: before,
                 pre_ceiling_bps: self.ceiling_bps,
                 stall: false,
+                stall_seen_ms: None,
             });
         }
         if stall && let Some(episode) = self.episode.as_mut() {
             episode.stall = true;
+            episode.stall_seen_ms.get_or_insert(now);
         }
         if target < before && !stall {
             // The delivery rate measured while congested is the capacity;
@@ -1498,14 +1554,21 @@ mod tests {
     fn sender_queue_growth_drives_congestion_without_rtt_growth() {
         let mut abr = controller(6_000_000);
         let now = warm(&mut abr, 6_000_000, 25);
-        let mut queued = sample(now, 6_000_000, 50);
-        queued.srt.bandwidth_bps = 0;
-        queued.srt.send_buffer_ms = 400;
-
-        let decision = abr.decide(&queued);
-
-        assert_eq!(decision.control_state, STATE_HEAVY_CONGESTION);
-        assert!(decision.applied_bps < 6_000_000);
+        // A sustained rise (not a single noisy sample) of the sender queue
+        // must cut the bitrate, with no RTT growth at all.
+        let mut cut = None;
+        for i in 1..=15u32 {
+            let mut queued = sample(now + u64::from(i) * 20, 6_000_000, 50);
+            queued.srt.bandwidth_bps = 0;
+            queued.srt.send_buffer_ms = 60 + i * 30;
+            let decision = abr.decide(&queued);
+            if decision.applied_bps < 6_000_000 {
+                cut = Some(decision);
+                break;
+            }
+        }
+        let decision = cut.expect("queue growth never cut the bitrate");
+        assert!(decision.transport_stressed);
     }
 
     #[test]
