@@ -16,7 +16,8 @@ does **not** ship a production receiver. For a local Windows smoke test, see
 
 - An OBS dock for starting and stopping the output, selecting uplinks, and
   monitoring the session.
-- Streaming or recording encoder reuse, plus independent custom encoders.
+- Dedicated video and audio encoders owned by the output, chosen from the
+  encoders OBS provides, so OBS streaming and recording are never affected.
 - H.264 and HEVC video with AAC or Opus audio.
 - Automatic video bitrate control driven by end-to-end SRT RTT, sender-queue
   delay and the measured end-to-end delivery rate, with a pre-roll bandwidth
@@ -87,12 +88,12 @@ reconnect path, and bounded engine ABI are implemented.
 
 Current operational limitations:
 
-- Streaming and recording encoders can be reused only while their source OBS
-  output is stopped. Starting another OBS output that needs the same encoder
-  stops the SRTLA output to avoid conflicting capture ownership.
-- The Custom encoder path creates a dedicated encoder from that encoder's
-  defaults and applies the selected bitrate. It does not clone all settings
-  from the streaming or recording encoder.
+- The output always creates its own encoders from the selected encoder's
+  defaults and the chosen bitrate. Reusing OBS's streaming or recording
+  encoders is not supported: automatic bitrate, the startup probe and
+  congestion shedding reconfigure the encoder, which must not affect other
+  OBS outputs. OBS streaming, recording and the replay buffer can run
+  alongside the SRTLA output.
 - Network adapters are refreshed by polling once per second; native route-
   change notifications are not implemented yet.
 - Receiver interoperability has a local Windows relay smoke-test path, but no
@@ -111,8 +112,6 @@ Current operational limitations:
   those dependencies are unavailable.
 - Replace or augment one-second adapter polling with Windows route-change
   notifications.
-- Clone streaming/recording encoder settings into an independent dedicated
-  encoder.
 - Run extended hardware-encoder, multi-link, impairment, reconnect, and soak
   testing.
 - Complete upgrade and release-package QA.
@@ -201,8 +200,8 @@ Start OBS and open **Docks > SRTLA Output**.
 2. Enter the stream ID expected by the receiver and, if encryption is required,
    a 10–79-byte UTF-8 passphrase. The passphrase is stored unencrypted in the
    OBS profile on every supported platform.
-3. Choose **Streaming** or **Recording** to reuse that stopped OBS output's
-   encoders, or **Custom** to create independent video and audio encoders.
+3. Choose the video and audio encoders (in the connection settings). The
+   output creates its own instances of them.
 4. Select at least one operational network link.
 5. Choose automatic bitrate with a maximum, or disable it and set a manual
    bitrate. With automatic bitrate, **Measure bandwidth before start** (in

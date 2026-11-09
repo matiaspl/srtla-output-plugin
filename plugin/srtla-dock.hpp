@@ -33,7 +33,6 @@ public:
 	void refreshAdapters();
 	void stopOutput();
 	void reloadProfile();
-	bool sharesEncoderWith(struct obs_output *other) const;
 	QByteArray websocketStatusJson();
 	bool websocketSetOutputActive(bool active, QString &error);
 	bool websocketSetLinkEnabled(std::uint64_t linkId, bool enabled, QString &error);
@@ -59,7 +58,6 @@ private:
 	QLineEdit *streamId_ = nullptr;
 	QLineEdit *passphrase_ = nullptr;
 	QLabel *secret_warning_ = nullptr;
-	QComboBox *encoderSource_ = nullptr;
 	QComboBox *customVideoEncoder_ = nullptr;
 	QComboBox *customAudioEncoder_ = nullptr;
 	QCheckBox *autoBitrate_ = nullptr;

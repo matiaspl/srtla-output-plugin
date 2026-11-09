@@ -183,13 +183,6 @@ void select_combo_data(QComboBox *combo, const QString &value)
 	}
 }
 
-obs_output_t *get_encoder_source_output(const QString &source)
-{
-	if (source == QStringLiteral("recording"))
-		return obs_frontend_get_recording_output();
-	return obs_frontend_get_streaming_output();
-}
-
 obs_encoder_t *create_custom_video_encoder(const QString &id, int bitrate_kbps)
 {
 	const QByteArray encoder_id = id.toUtf8();
@@ -647,10 +640,6 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	secret_warning_ = new QLabel(tr("Passphrase is stored unencrypted in the OBS profile."), connectionSettings_);
 	secret_warning_->setWordWrap(true);
 	secret_warning_->setStyleSheet(QStringLiteral("color: #b36b00;"));
-	encoderSource_ = new QComboBox(connectionSettings_);
-	encoderSource_->addItem(tr("Streaming"), QStringLiteral("streaming"));
-	encoderSource_->addItem(tr("Recording"), QStringLiteral("recording"));
-	encoderSource_->addItem(tr("Custom"), QStringLiteral("custom"));
 	customVideoEncoder_ = new QComboBox(connectionSettings_);
 	add_encoder_choices(customVideoEncoder_, OBS_ENCODER_VIDEO);
 	customAudioEncoder_ = new QComboBox(connectionSettings_);
@@ -675,19 +664,15 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 	settingsGrid->addWidget(new QLabel(tr("Passphrase"), connectionSettings_), 1, 2);
 	settingsGrid->addWidget(passphrase_, 1, 3);
 	settingsGrid->addWidget(secret_warning_, 2, 1, 1, 3);
-	settingsGrid->addWidget(new QLabel(tr("Encoder source"), connectionSettings_), 3, 0);
-	settingsGrid->addWidget(encoderSource_, 3, 1);
-	settingsGrid->addWidget(new QLabel(tr("Custom video encoder"), connectionSettings_), 3, 2);
-	settingsGrid->addWidget(customVideoEncoder_, 3, 3);
-	settingsGrid->addWidget(new QLabel(tr("Custom audio encoder"), connectionSettings_), 4, 2);
-	settingsGrid->addWidget(customAudioEncoder_, 4, 3);
+	settingsGrid->addWidget(new QLabel(tr("Video encoder"), connectionSettings_), 3, 0);
+	settingsGrid->addWidget(customVideoEncoder_, 3, 1);
+	settingsGrid->addWidget(new QLabel(tr("Audio encoder"), connectionSettings_), 3, 2);
+	settingsGrid->addWidget(customAudioEncoder_, 3, 3);
 	settingsGrid->addWidget(startupProbe_, 4, 0, 1, 2);
 	layout->addWidget(connectionSettings_);
 	auto updateSettingsSummary = [this] {
 		const auto endpoint = url_->text().isEmpty() ? tr("No receiver URL") : url_->text();
-		auto encoder = encoderSource_->currentText();
-		if (encoderSource_->currentData().toString() == QStringLiteral("custom"))
-			encoder += QStringLiteral(" · %1 / %2").arg(customVideoEncoder_->currentText(), customAudioEncoder_->currentText());
+		const auto encoder = QStringLiteral("%1 / %2").arg(customVideoEncoder_->currentText(), customAudioEncoder_->currentText());
 		settingsSummary_->setText(QStringLiteral("%1  ·  %2").arg(endpoint, encoder));
 	};
 	connect(settingsToggle, &QToolButton::toggled, this, [this, settingsToggle](bool expanded) {
@@ -695,8 +680,6 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 		settingsToggle->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
 	});
 	connect(url_, &QLineEdit::textChanged, this, [updateSettingsSummary] { updateSettingsSummary(); });
-	connect(encoderSource_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-		[updateSettingsSummary](int) { updateSettingsSummary(); });
 	connect(customVideoEncoder_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
 		[updateSettingsSummary](int) { updateSettingsSummary(); });
 	connect(customAudioEncoder_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
@@ -888,15 +871,7 @@ SrtlaDock::SrtlaDock(QWidget *parent) : QWidget(parent)
 		if (settings_)
 			obs_data_set_int(settings_, "max_bitrate", bitrate_kbps);
 	});
-	connect(encoderSource_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-		const bool custom = encoderSource_->currentData().toString() == QStringLiteral("custom");
-		customVideoEncoder_->setEnabled(custom);
-		customAudioEncoder_->setEnabled(custom);
-	});
 	manualBitrate_->setEnabled(!autoBitrate_->isChecked());
-	const bool custom = encoderSource_->currentData().toString() == QStringLiteral("custom");
-	customVideoEncoder_->setEnabled(custom);
-	customAudioEncoder_->setEnabled(custom);
 	timer_ = new QTimer(this);
 	timer_->setInterval(1000);
 	connect(timer_, &QTimer::timeout, this, [this] {
@@ -1071,7 +1046,6 @@ void SrtlaDock::loadProfile()
 		passphrase = legacy.passphrase;
 	}
 	passphrase_->setText(passphrase);
-	select_combo_data(encoderSource_, profile_string("EncoderSource", QStringLiteral("streaming")));
 	select_combo_data(customVideoEncoder_, profile_string("CustomVideoEncoder"));
 	select_combo_data(customAudioEncoder_, profile_string("CustomAudioEncoder"));
 	autoBitrate_->setChecked(profile_bool("AutoBitrate", true));
@@ -1131,7 +1105,8 @@ bool SrtlaDock::saveProfile()
 	config_set_string(config, config_section, "PassphraseDpapi", "");
 	config_set_int(config, config_section, "LatencyMs", latency_ms_);
 	config_set_int(config, config_section, "Pbkeylen", pbkeylen_);
-	config_set_string(config, config_section, "EncoderSource", encoderSource_->currentData().toString().toUtf8().constData());
+	// Encoder reuse was removed; drop the obsolete key from older profiles.
+	config_remove_value(config, config_section, "EncoderSource");
 	config_set_string(config, config_section, "CustomVideoEncoder", customVideoEncoder_->currentData().toString().toUtf8().constData());
 	config_set_string(config, config_section, "CustomAudioEncoder", customAudioEncoder_->currentData().toString().toUtf8().constData());
 	config_set_bool(config, config_section, "AutoBitrate", autoBitrate_->isChecked());
@@ -1157,19 +1132,6 @@ void SrtlaDock::reloadProfile()
 	}
 	loadProfile();
 	refreshAdapters();
-}
-
-bool SrtlaDock::sharesEncoderWith(obs_output_t *other) const
-{
-	if (!output_ || !other || output_ == other)
-		return false;
-	const auto *video = obs_output_get_video_encoder(output_);
-	const auto *other_video = obs_output_get_video_encoder(other);
-	if (video && video == other_video)
-		return true;
-	const auto *audio = obs_output_get_audio_encoder(output_, 0);
-	const auto *other_audio = obs_output_get_audio_encoder(other, 0);
-	return audio && audio == other_audio;
 }
 
 void SrtlaDock::stopOutput()
@@ -1472,73 +1434,53 @@ void SrtlaDock::toggleOutput()
 	if (!settings_)
 		settings_ = obs_data_create();
 
-	const QString encoder_source = encoderSource_->currentData().toString();
-	const bool custom_encoder = encoder_source == QStringLiteral("custom");
-	obs_output_t *source_output = nullptr;
-	obs_encoder_t *video_encoder = nullptr;
-	obs_encoder_t *audio_encoder = nullptr;
-
-	if (!custom_encoder) {
-		source_output = get_encoder_source_output(encoder_source);
-		if (!source_output) {
-			state_->setText(tr("Error: selected OBS output unavailable"));
-			return;
-		}
-		if (obs_output_active(source_output)) {
-			obs_output_release(source_output);
-			state_->setText(tr("Error: stop the selected OBS output first"));
-			return;
-		}
-		video_encoder = obs_output_get_video_encoder(source_output);
-		audio_encoder = obs_output_get_audio_encoder(source_output, 0);
-	} else {
-		const QString video_id = customVideoEncoder_->currentData().toString();
-		if (video_id.isEmpty()) {
-			state_->setText(tr("Error: no custom video encoder available"));
-			return;
-		}
-		video_encoder = create_custom_video_encoder(video_id, manualBitrate_->value());
-		if (!video_encoder) {
-			state_->setText(tr("Error: custom video encoder could not be created"));
-			return;
-		}
-		const QString audio_id = customAudioEncoder_->currentData().toString();
-		if (!audio_id.isEmpty())
-			audio_encoder = create_custom_audio_encoder(audio_id, 128);
-		if (!audio_id.isEmpty() && !audio_encoder) {
-			obs_encoder_release(video_encoder);
-			state_->setText(tr("Error: custom audio encoder could not be created"));
-			return;
-		}
-	}
-
-	if (!video_encoder || !is_supported_video_codec(obs_encoder_get_codec(video_encoder))) {
-		if (custom_encoder && video_encoder)
-			obs_encoder_release(video_encoder);
-		if (custom_encoder && audio_encoder)
-			obs_encoder_release(audio_encoder);
-		if (source_output)
-			obs_output_release(source_output);
-		state_->setText(tr("Error: selected video encoder is not supported"));
-		return;
-	}
-	if (audio_encoder && !is_supported_audio_codec(obs_encoder_get_codec(audio_encoder))) {
-		if (custom_encoder)
-			obs_encoder_release(video_encoder);
-		if (custom_encoder)
-			obs_encoder_release(audio_encoder);
-		if (source_output)
-			obs_output_release(source_output);
-		state_->setText(tr("Error: selected audio encoder is not supported"));
-		return;
-	}
-
+	// Check what can fail without side effects before creating encoders.
 	if (secret_error_) {
 		state_->setText(tr("Error: passphrase could not be loaded; enter it again"));
 		return;
 	}
 	if (!saveProfile()) {
 		state_->setText(tr("Error: passphrase could not be saved"));
+		return;
+	}
+
+	// The output always uses its own encoders: bitrate control, the startup
+	// probe and congestion shedding reconfigure them, which must never touch
+	// OBS's streaming or recording encoders.
+	const QString video_id = customVideoEncoder_->currentData().toString();
+	if (video_id.isEmpty()) {
+		state_->setText(tr("Error: no video encoder available"));
+		return;
+	}
+	obs_encoder_t *video_encoder = create_custom_video_encoder(video_id, manualBitrate_->value());
+	if (!video_encoder) {
+		state_->setText(tr("Error: video encoder could not be created"));
+		return;
+	}
+	obs_encoder_t *audio_encoder = nullptr;
+	const QString audio_id = customAudioEncoder_->currentData().toString();
+	if (!audio_id.isEmpty())
+		audio_encoder = create_custom_audio_encoder(audio_id, 128);
+	// The output holds its own references once attached; release ours on
+	// every path out of this function.
+	auto release_encoders = [&] {
+		obs_encoder_release(video_encoder);
+		if (audio_encoder)
+			obs_encoder_release(audio_encoder);
+	};
+	if (!audio_id.isEmpty() && !audio_encoder) {
+		release_encoders();
+		state_->setText(tr("Error: audio encoder could not be created"));
+		return;
+	}
+	if (!is_supported_video_codec(obs_encoder_get_codec(video_encoder))) {
+		release_encoders();
+		state_->setText(tr("Error: selected video encoder is not supported"));
+		return;
+	}
+	if (audio_encoder && !is_supported_audio_codec(obs_encoder_get_codec(audio_encoder))) {
+		release_encoders();
+		state_->setText(tr("Error: selected audio encoder is not supported"));
 		return;
 	}
 	obs_data_set_string(settings_, "url", parse_legacy_url(url_->text()).endpoint.toUtf8().constData());
@@ -1564,8 +1506,6 @@ void SrtlaDock::toggleOutput()
 	obs_data_set_int(settings_, "latency_ms", latency_ms_);
 	obs_data_set_int(settings_, "pbkeylen", pbkeylen_);
 	obs_data_set_string(settings_, "scheduler", "enhanced");
-	obs_data_set_string(settings_, "encoder_source", encoder_source.toUtf8().constData());
-	obs_data_set_string(settings_, "encoder_mode", custom_encoder ? "dedicated" : "shared");
 	obs_data_set_string(settings_, "video_codec", obs_encoder_get_codec(video_encoder));
 	if (audio_encoder)
 		obs_data_set_string(settings_, "audio_codec", obs_encoder_get_codec(audio_encoder));
@@ -1573,23 +1513,13 @@ void SrtlaDock::toggleOutput()
 	if (!output_)
 		output_ = obs_output_create("srtla_output", "SRTLA Output", settings_, nullptr);
 	if (!output_) {
-		if (custom_encoder)
-			obs_encoder_release(video_encoder);
-		if (custom_encoder && audio_encoder)
-			obs_encoder_release(audio_encoder);
-		if (source_output)
-			obs_output_release(source_output);
+		release_encoders();
 		state_->setText(tr("Error: OBS output unavailable"));
 		return;
 	}
 	obs_output_set_video_encoder(output_, video_encoder);
 	obs_output_set_audio_encoder(output_, audio_encoder, 0);
-	if (custom_encoder)
-		obs_encoder_release(video_encoder);
-	if (custom_encoder && audio_encoder)
-		obs_encoder_release(audio_encoder);
-	if (source_output)
-		obs_output_release(source_output);
+	release_encoders();
 	obs_output_update(output_, settings_);
 	if (!obs_output_start(output_)) {
 		const char *error = obs_output_get_last_error(output_);

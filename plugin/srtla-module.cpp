@@ -23,19 +23,8 @@ static void frontend_event(enum obs_frontend_event event, void *)
 		dock->reloadProfile();
 		return;
 	}
-	obs_output_t *other = nullptr;
-	if (event == OBS_FRONTEND_EVENT_STREAMING_STARTING)
-		other = obs_frontend_get_streaming_output();
-	else if (event == OBS_FRONTEND_EVENT_RECORDING_STARTING)
-		other = obs_frontend_get_recording_output();
-	else if (event == OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTING)
-		other = obs_frontend_get_replay_buffer_output();
-	if (other) {
-		const bool conflict = dock->sharesEncoderWith(other);
-		obs_output_release(other);
-		if (conflict)
-			dock->stopOutput();
-	}
+	// The output always uses its own encoders, so OBS streaming, recording
+	// and replay buffer can run alongside it without conflict.
 }
 
 MODULE_EXPORT const char *obs_module_description(void)

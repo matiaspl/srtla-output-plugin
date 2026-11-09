@@ -3,7 +3,6 @@
 #include <obs-encoder.h>
 #include <obs-data.h>
 #include <obs-properties.h>
-#include <obs-frontend-api.h>
 
 #include "../engine/include/srtla_engine.h"
 #include "mpegts-avformat-sink.hpp"
@@ -70,14 +69,10 @@ struct SrtlaOutput {
 	bool opus = false;
 	std::atomic_bool auto_bitrate{true};
 	bool startup_probe = true;
-	bool shared_encoder = false;
-	std::string encoder_source = "streaming";
 	std::atomic<int> manual_bitrate_kbps{1500};
 	int min_bitrate_kbps = 500;
 	int max_bitrate_kbps = 6000;
 	std::uint64_t audio_bitrate_bps = 128000;
-	int original_bitrate_kbps = 0;
-	bool bitrate_overridden = false;
 };
 
 static std::mutex output_registry_mutex;
@@ -354,10 +349,6 @@ static void *srtla_output_create(obs_data_t *settings, obs_output_t *output)
 		std::string(obs_data_get_string(settings, "audio_codec")) == "opus";
 	data->auto_bitrate.store(!settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate"));
 	data->startup_probe = startup_probe_enabled(settings);
-	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
-	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
-	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
-	data->encoder_source = encoder_source && *encoder_source ? encoder_source : "streaming";
 	data->max_bitrate_kbps = configured_max_bitrate_kbps(settings);
 	data->min_bitrate_kbps = configured_min_bitrate_kbps(settings, data->max_bitrate_kbps);
 	data->manual_bitrate_kbps.store(configured_manual_bitrate_kbps(settings));
@@ -400,10 +391,6 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	data->opus = audio_codec && std::string(audio_codec) == "opus";
 	data->auto_bitrate.store(!settings || !obs_data_has_user_value(settings, "auto_bitrate") || obs_data_get_bool(settings, "auto_bitrate"));
 	data->startup_probe = startup_probe_enabled(settings);
-	const char *encoder_mode = settings ? obs_data_get_string(settings, "encoder_mode") : nullptr;
-	data->shared_encoder = encoder_mode && std::string(encoder_mode) == "shared";
-	const char *encoder_source = settings ? obs_data_get_string(settings, "encoder_source") : nullptr;
-	data->encoder_source = encoder_source && *encoder_source ? encoder_source : "streaming";
 	data->max_bitrate_kbps = configured_max_bitrate_kbps(settings);
 	data->min_bitrate_kbps = configured_min_bitrate_kbps(settings, data->max_bitrate_kbps);
 	data->manual_bitrate_kbps.store(configured_manual_bitrate_kbps(settings));
@@ -420,38 +407,18 @@ static void srtla_output_update(void *opaque, obs_data_t *settings)
 	if (data->pbkeylen != 16 && data->pbkeylen != 24 && data->pbkeylen != 32) data->pbkeylen = 16;
 }
 
-static void restore_shared_bitrate(SrtlaOutput *data)
-{
-	if (!data->output)
-		return;
-	std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
-	if (!data->bitrate_overridden)
-		return;
-	if (auto *encoder = obs_output_get_video_encoder(data->output)) {
-		if (auto *settings = obs_encoder_get_settings(encoder)) {
-			obs_data_set_int(settings, "bitrate", data->original_bitrate_kbps);
-			obs_encoder_update(encoder, settings);
-			obs_data_release(settings);
-		}
-	}
-	data->bitrate_overridden = false;
-}
-
+// The output always owns dedicated encoders, so their settings can be
+// changed freely and need no restoring afterwards.
 static void apply_manual_bitrate(SrtlaOutput *data)
 {
-	if (!data->output)
+	if (!data->output || data->auto_bitrate.load())
 		return;
 	std::lock_guard<std::mutex> bitrate_lock(data->bitrate_mutex);
 	if (auto *encoder = obs_output_get_video_encoder(data->output)) {
 		if (auto *settings = obs_encoder_get_settings(encoder)) {
-			if (!data->bitrate_overridden)
-				data->original_bitrate_kbps = static_cast<int>(obs_data_get_int(settings, "bitrate"));
-			if (!data->auto_bitrate.load()) {
-				obs_data_set_int(settings, "bitrate", data->manual_bitrate_kbps.load());
-				obs_encoder_update(encoder, settings);
-			}
+			obs_data_set_int(settings, "bitrate", data->manual_bitrate_kbps.load());
+			obs_encoder_update(encoder, settings);
 			obs_data_release(settings);
-			data->bitrate_overridden = true;
 		}
 	}
 }
@@ -774,7 +741,6 @@ static void srtla_output_destroy(void *opaque)
 	// SrtSession borrows the engine handle and its destructor reports a final
 	// status through that handle, so destroy the session before the engine.
 	data->session.reset();
-	restore_shared_bitrate(data);
 	data->muxer.reset();
 	{
 		std::lock_guard<std::mutex> lock(output_registry_mutex);
@@ -931,20 +897,6 @@ static bool srtla_output_start(void *opaque)
 		return false;
 	}
 	data->fatal_signal_queued.store(false);
-	if (data->shared_encoder) {
-		obs_output_t *source_output = data->encoder_source == "recording" ? obs_frontend_get_recording_output() :
-			obs_frontend_get_streaming_output();
-		if (!source_output) {
-			obs_output_set_last_error(data->output, "The selected shared OBS output is unavailable");
-			return false;
-		}
-		const bool busy = source_output != data->output && obs_output_active(source_output);
-		obs_output_release(source_output);
-		if (busy) {
-			obs_output_set_last_error(data->output, "The selected shared OBS encoder is already active");
-			return false;
-		}
-	}
 	// OBS has joined any previous end-data-capture worker by this point, so a
 	// stopped muxer can be safely released before the next session.
 	data->muxer.reset();
@@ -1019,8 +971,7 @@ static bool srtla_output_start(void *opaque)
 		obs_output_set_last_error(data->output, "SRTLA video bitrate initialization failed");
 		data->session.reset();
 		srtla_engine_stop(data->engine);
-		restore_shared_bitrate(data);
-		return false;
+			return false;
 	}
 	{
 		std::lock_guard<std::mutex> lock(data->queue_mutex);
@@ -1037,8 +988,7 @@ static bool srtla_output_start(void *opaque)
 		obs_output_set_last_error(data->output, "MPEG-TS muxer allocation failed");
 		data->session.reset();
 		srtla_engine_stop(data->engine);
-		restore_shared_bitrate(data);
-		return false;
+			return false;
 	}
 	data->running.store(true);
 	try {
@@ -1059,8 +1009,7 @@ static bool srtla_output_start(void *opaque)
 		data->session.reset();
 		if (data->engine)
 			srtla_engine_stop(data->engine);
-		restore_shared_bitrate(data);
-		data->muxer.reset();
+			data->muxer.reset();
 		return false;
 	}
 	return true;
@@ -1080,7 +1029,6 @@ static void srtla_output_stop(void *opaque, uint64_t ts)
 	data->session.reset();
 	if (data->engine)
 		srtla_engine_stop(data->engine);
-	restore_shared_bitrate(data);
 	data->muxer.reset();
 	std::lock_guard<std::mutex> lock(data->queue_mutex);
 	data->queue.clear();
@@ -1139,8 +1087,6 @@ static void srtla_output_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "audio_bitrate", 128);
 	obs_data_set_default_bool(settings, "auto_bitrate", true);
 	obs_data_set_default_bool(settings, "startup_probe", true);
-	obs_data_set_default_string(settings, "encoder_mode", "dedicated");
-	obs_data_set_default_string(settings, "encoder_source", "streaming");
 	obs_data_set_default_string(settings, "audio_mix", "track_1");
 	obs_data_set_default_int(settings, "pbkeylen", 16);
 	obs_data_set_default_string(settings, "scheduler", "enhanced");
@@ -1168,13 +1114,6 @@ static obs_properties_t *srtla_output_properties(void *)
 	obs_properties_add_int(props, "audio_bitrate", "Audio bitrate (kb/s)", 32, 512, 8);
 	obs_properties_add_bool(props, "auto_bitrate", "Automatic bitrate");
 	obs_properties_add_bool(props, "startup_probe", "Measure bandwidth before starting (automatic bitrate)");
-	auto *encoder_source = obs_properties_add_list(props, "encoder_source", "Encoder source", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(encoder_source, "Streaming", "streaming");
-	obs_property_list_add_string(encoder_source, "Recording", "recording");
-	obs_property_list_add_string(encoder_source, "Custom", "custom");
-	auto *encoder_mode = obs_properties_add_list(props, "encoder_mode", "Encoder mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(encoder_mode, "Dedicated", "dedicated");
-	obs_property_list_add_string(encoder_mode, "Shared", "shared");
 	auto *audio_mix = obs_properties_add_list(props, "audio_mix", "Audio mix", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(audio_mix, "Track 1", "track_1");
 	obs_properties_add_text(props, "passphrase", "Passphrase", OBS_TEXT_PASSWORD);
