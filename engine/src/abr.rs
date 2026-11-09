@@ -107,6 +107,30 @@ const BASELINE_CHECK_MS: u64 = 1_000;
 const BASELINE_SHIFT_KEEP: f64 = 0.75;
 /// Cuts made this recently before a detected base-RTT shift are undone.
 const BASELINE_UNDO_WINDOW_MS: u64 = 6_000;
+/// A move of the RTT floor by more than this share (and PATH_CHANGE_MIN_MS)
+/// from the floor the ceiling was learned on means the radio path changed
+/// (5G <-> LTE <-> HSPA+, a different satellite or cell): what was learned
+/// about capacity no longer applies.
+const PATH_CHANGE_RATIO: f64 = 0.30;
+const PATH_CHANGE_MIN_MS: f64 = 15.0;
+/// A faster path shows up in the RTT minimum over this window long before
+/// the 10 s floor would forget the old path.
+const PATH_FAST_WINDOW_MS: u64 = 1_000;
+/// Inter-RAT switches and satellite handovers come with a short stall. After
+/// one, the base RTT is re-measured (minimum RTT from PATH_CHECK_START_MS to
+/// PATH_CHECK_END_MS after the stall ends) and compared with the path
+/// before it.
+const PATH_CHECK_START_MS: u64 = 300;
+const PATH_CHECK_END_MS: u64 = 3_000;
+/// After moving to a faster path, ramp harder until the first congestion:
+/// the old rate is known to fit and the new limit is likely far above it.
+const PATH_BOOST_MS: u64 = 5_000;
+const PATH_BOOST_PERMILLE: u64 = 250;
+/// While boosting, the target stays within this multiple of the video rate
+/// actually being sent, so it cannot race ahead of the encoder's lag. Higher
+/// values shorten step-ups (2x: HSPA+ -> LTE in ~4.5 s instead of ~6.5 s in
+/// simulation) but risk a queue spike when a fade follows a handover.
+const PATH_BOOST_OFFERED_PERMILLE: u64 = 1_500;
 /// Feedback needed after a reset before the first increase.
 const WARMUP_MS: u64 = 200;
 
@@ -367,6 +391,11 @@ impl Estimator {
         push_bucket_min(&mut self.queue_buckets, now_ms, queue_ms);
     }
 
+    /// Forget the capacity memory (the path changed).
+    pub fn clear_capacity_memory(&mut self) {
+        self.delivery_max.clear();
+    }
+
     /// Forget short-term history but keep the learned RTT/queue baselines.
     pub fn carry_baselines(&self) -> Self {
         Self {
@@ -407,6 +436,17 @@ impl Estimator {
 
     pub fn rtt_deviation_ms(&self) -> f64 {
         self.rtt_dev
+    }
+
+    /// Lowest RTT sample within the last `window_ms` (at most the retained
+    /// history).
+    pub fn rtt_recent_min_ms(&self, window_ms: u64) -> Option<f64> {
+        let newest = self.history.back()?.t_ms;
+        self.history
+            .iter()
+            .filter(|p| p.t_ms + window_ms >= newest)
+            .map(|p| p.rtt_ms)
+            .reduce(f64::min)
     }
 
     /// RTT change over roughly the last 200 ms.
@@ -539,6 +579,14 @@ struct Episode {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct PathCheck {
+    pre_reference_ms: f64,
+    stall_end_ms: Option<u64>,
+    min_rtt_ms: f64,
+    reported_faster: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct BaselineCheck {
     until_ms: u64,
     rtt_ms: f64,
@@ -559,6 +607,12 @@ pub struct AbrController {
     restored_to_bps: u64,
     restore_dwell_ms: u64,
     audio_bps: u64,
+    /// RTT floor of the path the ceiling and memory describe.
+    path_rtt_ms: Option<f64>,
+    path_changes: u64,
+    boost_until_ms: u64,
+    path_check: Option<PathCheck>,
+    offered_video_bps: Option<u64>,
     episode: Option<Episode>,
     baseline_check: Option<BaselineCheck>,
     probe_permille: u64,
@@ -586,6 +640,11 @@ impl AbrController {
             restored_to_bps: 0,
             restore_dwell_ms: RESTORE_DWELL_MS,
             audio_bps: 0,
+            path_rtt_ms: None,
+            path_changes: 0,
+            boost_until_ms: 0,
+            path_check: None,
+            offered_video_bps: None,
             episode: None,
             baseline_check: None,
             probe_permille: PROBE_INITIAL_PERMILLE,
@@ -611,7 +670,7 @@ impl AbrController {
     #[cfg(test)]
     pub fn debug_state(&self) -> String {
         format!(
-            "int={} dwell={} rdwell={} since={:?} restored={:?} healthy={} hold_until={} settle_until={}",
+            "int={} dwell={} rdwell={} since={:?} restored={:?} healthy={} hold_until={} settle_until={} path_ref={:?} recent={:?} elev_since={:?} check={}",
             self.internal_bitrate_bps / 1000,
             self.probe_dwell_ms,
             self.restore_dwell_ms,
@@ -619,7 +678,11 @@ impl AbrController {
             self.restored_at_ms,
             self.signals.healthy,
             self.increase_hold_until_ms,
-            self.settle_until_ms
+            self.settle_until_ms,
+            self.path_rtt_ms,
+            self.estimator.rtt_recent_min_ms(PATH_FAST_WINDOW_MS),
+            self.elevated_since_ms,
+            self.baseline_check.is_some()
         )
     }
 
@@ -667,6 +730,7 @@ impl AbrController {
     /// Forget everything learned about the path (new output session).
     pub fn forget_capacity(&mut self) {
         self.ceiling_bps = None;
+        self.path_rtt_ms = None;
         self.probe_dwell_ms = PROBE_DWELL_MS;
         self.restored_at_ms = None;
         self.restore_dwell_ms = RESTORE_DWELL_MS;
@@ -784,8 +848,17 @@ impl AbrController {
                 self.signals = self.classify(sample);
             }
         }
+        self.track_path(now, signals.thresholds.rtt_floor_ms);
+        self.check_path_after_stall(now, f64::from(sample.srt.rtt_ms), signals.stalled);
         let signals = self.signals;
         let before = self.internal_bitrate_bps;
+        if signals.building || signals.light || signals.heavy || signals.severe {
+            // The new path is showing its limit: stop ramping hard.
+            self.boost_until_ms = 0;
+        }
+        self.offered_video_bps = signals
+            .delivery
+            .map(|d| d.offered_bps.saturating_sub(sample.audio_bps));
 
         // A short stall that has already drained: return to where we were.
         if let Some(episode) = self.episode
@@ -1005,6 +1078,109 @@ impl AbrController {
         }
     }
 
+    /// Number of radio-path changes detected (RTT floor moves).
+    pub fn path_changes(&self) -> u64 {
+        self.path_changes
+    }
+
+    /// Detect a change of radio path from a move of the RTT floor, and drop
+    /// everything learned about the old path's capacity. The controller then
+    /// ramps from its current rate until congestion finds the new limit; a
+    /// faster path is found in seconds instead of creeping up from a stale
+    /// ceiling, and a slower one is caught by congestion as usual.
+    fn track_path(&mut self, now: u64, floor_ms: f64) {
+        if floor_ms <= 0.0 || self.estimator.history_span_ms() < WARMUP_MS {
+            return;
+        }
+        let Some(reference) = self.path_rtt_ms else {
+            self.path_rtt_ms = Some(floor_ms);
+            return;
+        };
+        let threshold = PATH_CHANGE_MIN_MS.max(reference * PATH_CHANGE_RATIO);
+        // Faster: the recent RTT minimum drops well below the reference.
+        // Slower: the floor itself rises (after a baseline check adopted
+        // the new base RTT).
+        let recent = self
+            .estimator
+            .rtt_recent_min_ms(PATH_FAST_WINDOW_MS)
+            .unwrap_or(floor_ms);
+        let new_reference = if recent + threshold < reference {
+            recent
+        } else if floor_ms > reference + threshold {
+            floor_ms
+        } else {
+            return;
+        };
+        self.path_changed(now, new_reference, new_reference < reference);
+    }
+
+    /// Re-measure the base RTT after a stall and compare it with the path
+    /// before the stall.
+    fn check_path_after_stall(&mut self, now: u64, rtt_ms: f64, stalled: bool) {
+        if stalled {
+            match self.path_check.as_mut() {
+                Some(check) => check.stall_end_ms = None,
+                None => {
+                    if let Some(reference) = self.path_rtt_ms {
+                        self.path_check = Some(PathCheck {
+                            pre_reference_ms: reference,
+                            stall_end_ms: None,
+                            min_rtt_ms: f64::INFINITY,
+                            reported_faster: false,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+        let Some(mut check) = self.path_check else {
+            return;
+        };
+        let stall_end = *check.stall_end_ms.get_or_insert(now);
+        if now >= stall_end + PATH_CHECK_START_MS {
+            check.min_rtt_ms = check.min_rtt_ms.min(rtt_ms);
+        }
+        let reference = check.pre_reference_ms;
+        let threshold = PATH_CHANGE_MIN_MS.max(reference * PATH_CHANGE_RATIO);
+        if !check.reported_faster && check.min_rtt_ms + threshold < reference {
+            check.reported_faster = true;
+            self.path_changed(now, check.min_rtt_ms, true);
+        }
+        if now >= stall_end + PATH_CHECK_END_MS {
+            self.path_check = None;
+            if check.reported_faster {
+                self.path_rtt_ms = Some(check.min_rtt_ms);
+            } else if check.min_rtt_ms > reference + threshold {
+                self.path_changed(now, check.min_rtt_ms, false);
+            }
+            return;
+        }
+        self.path_check = Some(check);
+    }
+
+    fn path_changed(&mut self, now: u64, new_reference_ms: f64, faster: bool) {
+        self.path_rtt_ms = Some(new_reference_ms);
+        self.path_changes += 1;
+        if faster {
+            // The old path's rate fits the faster one: keep what a pending
+            // stall restore would have returned to, and ramp hard from there.
+            if let Some(episode) = self.episode {
+                let restore = episode.pre_target_bps * STALL_RESTORE_PERMILLE / 1_000;
+                self.internal_bitrate_bps = self.internal_bitrate_bps.max(restore);
+            }
+            self.boost_until_ms = now.saturating_add(PATH_BOOST_MS);
+        }
+        self.ceiling_bps = None;
+        self.estimator.clear_capacity_memory();
+        self.restored_at_ms = None;
+        self.restore_dwell_ms = RESTORE_DWELL_MS;
+        self.probe_dwell_ms = PROBE_DWELL_MS;
+        self.probe_dwell_since_ms = None;
+        self.probe_permille = PROBE_INITIAL_PERMILLE;
+        // A pending stall restore would reinstate the old path's ceiling.
+        self.episode = None;
+    }
+
     /// `stall`: the evidence is a stall or a measurement, so the ceiling is
     /// left alone.
     fn decrease(&mut self, now: u64, target: u64, video_goodput: Option<u64>, stall: bool) {
@@ -1053,6 +1229,9 @@ impl AbrController {
                 }
                 _ => congestion_point,
             });
+        }
+        if target < before {
+            self.boost_until_ms = 0;
         }
         self.internal_bitrate_bps = target;
         let rtt = self.estimator.rtt_ms() as u64;
@@ -1141,7 +1320,19 @@ impl AbrController {
             }
             ceiling => {
                 self.probe_dwell_since_ms = None;
-                let mut step = FAST_INCREASE_MIN_BPS.max(internal * FAST_INCREASE_PERMILLE / 1_000);
+                let boosting = now < self.boost_until_ms;
+                let permille = if boosting {
+                    PATH_BOOST_PERMILLE
+                } else {
+                    FAST_INCREASE_PERMILLE
+                };
+                let mut step = FAST_INCREASE_MIN_BPS.max(internal * permille / 1_000);
+                if boosting && let Some(offered) = self.offered_video_bps.filter(|o| *o > 0) {
+                    let cap = offered * PATH_BOOST_OFFERED_PERMILLE / 1_000;
+                    step = step
+                        .min(cap.saturating_sub(internal))
+                        .max(FAST_INCREASE_MIN_BPS.max(internal * FAST_INCREASE_PERMILLE / 1_000));
+                }
                 let mut next = internal.saturating_add(step);
                 if let Some(ceiling) = ceiling {
                     let zone_end = ceiling * FAST_ZONE_PERMILLE / 1_000;
@@ -1372,6 +1563,65 @@ mod tests {
                 ceiling >= 12_000_000,
                 "learned the stall as capacity: {ceiling}"
             );
+        }
+    }
+
+    #[test]
+    fn rat_switching_5g_lte_hspa_meets_targets() {
+        // 5G <-> LTE <-> HSPA+ back and forth (step-downs, step-ups, direct
+        // 5G <-> HSPA+ jumps, a 5 s 5G/LTE ping-pong), full system with video
+        // shedding, across seeds. Bounds sit above the worst observed values
+        // with margin: they guard against regressions.
+        use sim::{PhaseMetrics, Rat};
+        for seed in 1..=8 {
+            let (_, phases) = sim::run_rat_switching(seed, true);
+            let label = |p: &PhaseMetrics| {
+                format!(
+                    "seed {seed} {}s {}->{}",
+                    p.phase.start_ms / 1000,
+                    p.phase.from.map_or("start", |f| f.name()),
+                    p.phase.rat.name()
+                )
+            };
+            for p in &phases {
+                let Some(from) = p.phase.from else {
+                    continue;
+                };
+                let to = p.phase.rat;
+                let adapt = p.adapt_ms.unwrap_or(u64::MAX);
+                if from.mean_bps() > to.mean_bps() {
+                    // Step down: cut to the new capacity almost at once.
+                    assert!(adapt <= 700, "{}: step-down took {adapt} ms", label(p));
+                } else {
+                    let limit = match (from, to) {
+                        (Rat::Lte, Rat::Nr5g) => 4_500,
+                        _ => 8_000,
+                    };
+                    assert!(adapt <= limit, "{}: step-up took {adapt} ms", label(p));
+                }
+                let glitch_limit = match (from, to) {
+                    // Data queued in the modem at 5G/LTE rates drains at
+                    // HSPA+ rates; nothing sent afterwards can recall it.
+                    (Rat::Nr5g, Rat::HspaPlus) => 6_000,
+                    (Rat::Lte, Rat::HspaPlus) => 2_000,
+                    _ => 0,
+                };
+                assert!(
+                    p.glitch_ms <= glitch_limit,
+                    "{}: {} ms of late delivery",
+                    label(p),
+                    p.glitch_ms
+                );
+                assert!(p.reversals <= 14, "{}: {} reversals", label(p), p.reversals);
+                if p.phase.end_ms - p.phase.start_ms >= 20_000 {
+                    assert!(
+                        p.efficiency >= 0.55,
+                        "{}: efficiency {:.2}",
+                        label(p),
+                        p.efficiency
+                    );
+                }
+            }
         }
     }
 

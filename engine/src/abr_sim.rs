@@ -20,6 +20,9 @@ pub struct SimConfig {
     pub base_rtt: Vec<(u64, f64)>,
     /// Peak-to-peak random RTT noise added to the bottleneck RTT.
     pub rtt_noise_ms: f64,
+    /// Optional step schedule of RTT noise (from_ms, ms); overrides
+    /// `rtt_noise_ms` from each step on.
+    pub rtt_noise: Vec<(u64, f64)>,
     /// Drop-tail buffer at the bottleneck, expressed as queueing time at the
     /// initial capacity.
     pub buffer_ms: f64,
@@ -39,6 +42,7 @@ impl Default for SimConfig {
             base_rtt_ms: 60.0,
             base_rtt: Vec::new(),
             rtt_noise_ms: 4.0,
+            rtt_noise: Vec::new(),
             buffer_ms: 1_000.0,
             latency_ms: 2_000,
             audio_bps: 128_000,
@@ -187,7 +191,14 @@ impl Sim {
             }
             _ => 0.0,
         };
-        let noise = self.noise() * self.cfg.rtt_noise_ms / 2.0;
+        let noise_amplitude = self
+            .cfg
+            .rtt_noise
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= self.now_ms)
+            .map_or(self.cfg.rtt_noise_ms, |n| n.1);
+        let noise = self.noise() * noise_amplitude / 2.0;
         let rtt_true = base_rtt + queue_ms + noise;
         // SRT updates its smoothed RTT (7/8 EWMA) on every ACKACK, roughly
         // every 10 ms while data flows.
@@ -250,21 +261,67 @@ pub fn run_abr(
     start_bps: u64,
     duration_ms: u64,
 ) -> Vec<TracePoint> {
+    run_system(abr, sim, start_bps, duration_ms, false)
+}
+
+const KEYFRAME_INTERVAL_MS: u64 = 2_000;
+
+/// Closed loop with, optionally, the output's video shedding: a tick's video
+/// is offered only if the shedder admits it (a keyframe every 2 s); audio is
+/// always sent. With shedding, the trace's encoder rate is the video
+/// actually sent.
+pub fn run_system(
+    abr: &mut AbrController,
+    sim: &mut Sim,
+    start_bps: u64,
+    duration_ms: u64,
+    shed: bool,
+) -> Vec<TracePoint> {
     let mut target = start_bps;
     let mut encoder = start_bps as f64;
     let mut trace = Vec::new();
+    let mut shedder = crate::shed::VideoShedder::default();
+    let mut shed_estimator = Estimator::default();
+    let mut last_stats: Option<SrtCapacity> = None;
     let end = sim.now_ms + duration_ms;
     while sim.now_ms < end {
         let alpha = (TICK_MS as f64 / sim.cfg.encoder_tau_ms).min(1.0);
         encoder += (target as f64 - encoder) * alpha;
         let jitter = 1.0 + sim.noise() * sim.cfg.encoder_noise;
-        let offered = encoder * jitter + sim.cfg.audio_bps as f64;
+        let mut admitted = true;
+        if shed {
+            let keyframe = (sim.now_ms + TICK_MS).is_multiple_of(KEYFRAME_INTERVAL_MS);
+            let path = last_stats.as_ref().map(|srt| {
+                let floor = shed_estimator.rtt_floor_ms();
+                crate::shed::PathState {
+                    queue_ms: f64::from(srt.send_buffer_ms),
+                    rtt_floor_ms: floor,
+                    latency_ms: f64::from(srt.latency_ms),
+                    delivery_bps: shed_estimator
+                        .delivery(500, floor as u64)
+                        .map(|d| d.goodput_bps),
+                }
+            });
+            let bytes = (encoder / 8.0 * TICK_MS as f64 / 1_000.0) as usize;
+            let priority = if keyframe {
+                crate::shed::PRIORITY_HIGHEST
+            } else {
+                2
+            };
+            admitted = shedder.admit(path.as_ref(), bytes, keyframe, priority);
+        }
+        let video = if admitted { encoder * jitter } else { 0.0 };
+        let offered = video + sim.cfg.audio_bps as f64;
         let (stats, mut point) = sim.step(offered);
+        if shed {
+            shed_estimator.push(sim.now_ms, &stats);
+            last_stats = Some(stats.clone());
+        }
         let cfg = sim.cfg.clone();
         let decision = abr.decide(&sample_for(&cfg, sim.now_ms, target, stats));
         target = decision.applied_bps;
         point.target_bps = target;
-        point.encoder_bps = encoder;
+        point.encoder_bps = if admitted { encoder } else { 0.0 };
         trace.push(point);
     }
     trace
@@ -858,5 +915,357 @@ fn mobility_trace() {
                 eprintln!("        {}", abr.debug_state());
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Radio access technology switching (5G <-> LTE <-> HSPA+)
+// ---------------------------------------------------------------------------
+
+/// Uplink characteristics of one radio access technology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rat {
+    Nr5g,
+    Lte,
+    HspaPlus,
+}
+
+impl Rat {
+    pub fn name(self) -> &'static str {
+        match self {
+            Rat::Nr5g => "5G",
+            Rat::Lte => "LTE",
+            Rat::HspaPlus => "HSPA+",
+        }
+    }
+
+    /// Typical mean uplink throughput (mid-band NSA 5G, LTE, HSUPA).
+    pub fn mean_bps(self) -> f64 {
+        match self {
+            Rat::Nr5g => 25e6,
+            Rat::Lte => 7e6,
+            Rat::HspaPlus => 2e6,
+        }
+    }
+
+    pub fn base_rtt_ms(self) -> f64 {
+        match self {
+            Rat::Nr5g => 25.0,
+            Rat::Lte => 45.0,
+            Rat::HspaPlus => 110.0,
+        }
+    }
+
+    pub fn rtt_noise_ms(self) -> f64 {
+        match self {
+            Rat::Nr5g => 6.0,
+            Rat::Lte => 12.0,
+            Rat::HspaPlus => 30.0,
+        }
+    }
+
+    /// Inter-RAT transition stall: 5G NSA leg add/release is quick; moving
+    /// to or from 3G is a redirect/reselection and stalls for ~1 s.
+    pub fn stall_ms_to(self, to: Rat) -> u64 {
+        match (self, to) {
+            (Rat::Nr5g, Rat::Lte) => 150,
+            (Rat::Lte, Rat::Nr5g) => 100,
+            (Rat::Lte, Rat::HspaPlus) => 1_200,
+            (Rat::HspaPlus, Rat::Lte) => 800,
+            (Rat::Nr5g, Rat::HspaPlus) => 1_500,
+            (Rat::HspaPlus, Rat::Nr5g) => 900,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RatPhase {
+    pub rat: Rat,
+    pub from: Option<Rat>,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Scripted back-and-forth: step-downs, step-ups, direct 5G <-> HSPA+
+/// jumps, a 5 s 5G/LTE ping-pong and a short LTE -> HSPA+ -> LTE dip.
+pub fn rat_sequence() -> Vec<(Rat, u64)> {
+    use Rat::*;
+    let mut seq = vec![
+        (Nr5g, 30_000),
+        (Lte, 25_000),
+        (HspaPlus, 25_000),
+        (Lte, 20_000),
+        (Nr5g, 25_000),
+        (HspaPlus, 20_000),
+        (Nr5g, 20_000),
+    ];
+    for i in 0..8 {
+        seq.push((if i % 2 == 0 { Lte } else { Nr5g }, 5_000));
+    }
+    seq.extend([
+        (Lte, 10_000),
+        (HspaPlus, 10_000),
+        (Lte, 10_000),
+        (Nr5g, 25_000),
+    ]);
+    seq
+}
+
+/// Build the path for a RAT sequence: per-RAT capacity random walk
+/// (+/- ~15 %), base RTT and RTT noise, and a stall at every transition.
+pub fn rat_switching(seed: u64, sequence: &[(Rat, u64)]) -> (SimConfig, Vec<RatPhase>) {
+    let mut rng = Rng::new(seed);
+    let mut capacity = Vec::new();
+    let mut base_rtt = Vec::new();
+    let mut rtt_noise = Vec::new();
+    let mut phases = Vec::new();
+    let mut t = 0;
+    let mut previous: Option<Rat> = None;
+    for &(rat, duration) in sequence {
+        let start = t;
+        let stall = previous.map_or(0, |p| p.stall_ms_to(rat));
+        if stall > 0 {
+            capacity.push((t, 30_000));
+        }
+        let live = t + stall;
+        base_rtt.push((live, rat.base_rtt_ms()));
+        rtt_noise.push((live, rat.rtt_noise_ms()));
+        let mean = rat.mean_bps();
+        let mut log_c = mean.ln();
+        let mut step = live;
+        while step < start + duration {
+            log_c += (mean.ln() - log_c) * 0.1 + rng.normal() * 0.04;
+            log_c = log_c.clamp((mean * 0.7).ln(), (mean * 1.35).ln());
+            capacity.push((step, log_c.exp() as u64));
+            step += STEP_MS;
+        }
+        phases.push(RatPhase {
+            rat,
+            from: previous,
+            start_ms: start,
+            end_ms: start + duration,
+        });
+        previous = Some(rat);
+        t = start + duration;
+    }
+    let cfg = SimConfig {
+        capacity,
+        base_rtt,
+        rtt_noise,
+        base_rtt_ms: sequence[0].0.base_rtt_ms(),
+        rtt_noise_ms: sequence[0].0.rtt_noise_ms(),
+        // A modem buffer of fixed size: 400 ms at 5G rates is several
+        // seconds on HSPA+, as on real 3G bufferbloat.
+        buffer_ms: 400.0,
+        latency_ms: 2_000,
+        max_bps: 15_000_000,
+        ..SimConfig::default()
+    };
+    (cfg, phases)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PhaseMetrics {
+    pub phase: RatPhase,
+    /// Mean encoded video relative to 0.9 x capacity (clipped to the max).
+    pub efficiency: f64,
+    pub mean_video_bps: f64,
+    pub mean_capacity_bps: f64,
+    /// Time from the switch until the target is adapted: for a step down,
+    /// at or below 110 % of the new phase's ideal; for a step up, at least
+    /// 80 % of it. `None` if never within the phase.
+    pub adapt_ms: Option<u64>,
+    pub peak_one_way_ms: f64,
+    pub glitch_ms: u64,
+    pub reversals: usize,
+}
+
+pub fn phase_metrics(
+    cfg: &SimConfig,
+    trace: &[TracePoint],
+    phases: &[RatPhase],
+) -> Vec<PhaseMetrics> {
+    let ideal_of =
+        |cap: f64| (cap * 0.9 - cfg.audio_bps as f64).clamp(cfg.min_bps as f64, cfg.max_bps as f64);
+    phases
+        .iter()
+        .map(|phase| {
+            let window: Vec<_> = trace
+                .iter()
+                .filter(|p| p.t_ms > phase.start_ms && p.t_ms <= phase.end_ms)
+                .collect();
+            let n = window.len().max(1) as f64;
+            // Exclude the transition stall from the capacity averages.
+            let live: Vec<_> = window.iter().filter(|p| p.capacity_bps > 100_000).collect();
+            let ln = live.len().max(1) as f64;
+            let mean_capacity = live.iter().map(|p| p.capacity_bps as f64).sum::<f64>() / ln;
+            let ideal = live
+                .iter()
+                .map(|p| ideal_of(p.capacity_bps as f64))
+                .sum::<f64>()
+                / ln;
+            let mean_video = window.iter().map(|p| p.encoder_bps).sum::<f64>() / n;
+            let stepping_up = phase
+                .from
+                .is_none_or(|f| f.mean_bps() < phase.rat.mean_bps());
+            let adapt_ms = window
+                .iter()
+                .find(|p| {
+                    if stepping_up {
+                        p.target_bps as f64 >= ideal * 0.8
+                    } else {
+                        p.target_bps as f64 <= ideal * 1.1
+                    }
+                })
+                .map(|p| p.t_ms - phase.start_ms);
+            let m = metrics(trace, phase.start_ms, phase.end_ms, cfg.audio_bps);
+            PhaseMetrics {
+                phase: *phase,
+                efficiency: mean_video / ideal,
+                mean_video_bps: mean_video,
+                mean_capacity_bps: mean_capacity,
+                adapt_ms,
+                peak_one_way_ms: window.iter().map(|p| p.one_way_ms).fold(0.0, f64::max),
+                glitch_ms: window
+                    .iter()
+                    .filter(|p| p.one_way_ms > f64::from(cfg.latency_ms))
+                    .count() as u64
+                    * TICK_MS,
+                reversals: m.reversals,
+            }
+        })
+        .collect()
+}
+
+pub fn run_rat_switching(seed: u64, shed: bool) -> (SimConfig, Vec<PhaseMetrics>) {
+    let (cfg, phases) = rat_switching(seed, &rat_sequence());
+    let duration = phases.last().map_or(0, |p| p.end_ms);
+    let mut sim = Sim::new(cfg.clone());
+    let start = 6_000_000;
+    let mut abr = controller_for(&cfg, start);
+    let trace = run_system(&mut abr, &mut sim, start, duration, shed);
+    let metrics = phase_metrics(&cfg, &trace, &phases);
+    (cfg, metrics)
+}
+
+#[test]
+fn rat_switching_report() {
+    for shed in [false, true] {
+        eprintln!("-- video shedding {}", if shed { "on" } else { "off" });
+        rat_switching_table(&run_rat_switching(5, shed).1);
+    }
+}
+
+fn rat_switching_table(metrics: &[PhaseMetrics]) {
+    eprintln!(
+        "{:>7} {:<15} {:>8} {:>8} {:>5} {:>9} {:>9} {:>7} {:>4}",
+        "start", "switch", "cap", "video", "eff", "adapt", "peak owd", "glitch", "rev"
+    );
+    for m in metrics {
+        let switch = match m.phase.from {
+            Some(from) => format!("{}->{}", from.name(), m.phase.rat.name()),
+            None => m.phase.rat.name().to_string(),
+        };
+        eprintln!(
+            "{:>6.0}s {:<15} {:>5.1} Mb {:>5.1} Mb {:>4.0}% {:>9} {:>6.0} ms {:>4} ms {:>4}",
+            m.phase.start_ms as f64 / 1000.0,
+            switch,
+            m.mean_capacity_bps / 1e6,
+            m.mean_video_bps / 1e6,
+            m.efficiency * 100.0,
+            m.adapt_ms
+                .map_or("never".to_string(), |a| format!("{a} ms")),
+            m.peak_one_way_ms,
+            m.glitch_ms,
+            m.reversals
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn rat_switching_trace() {
+    let from: u64 = std::env::var("FROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let to: u64 = std::env::var("TO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+    let every: u64 = std::env::var("EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(250);
+    let (cfg, _) = rat_switching(5, &rat_sequence());
+    let mut sim = Sim::new(cfg.clone());
+    let mut abr = controller_for(&cfg, 6_000_000);
+    let mut target = 6_000_000u64;
+    let mut encoder = target as f64;
+    while sim.now_ms < to {
+        encoder += (target as f64 - encoder) * (TICK_MS as f64 / sim.cfg.encoder_tau_ms);
+        let offered =
+            encoder * (1.0 + sim.noise() * sim.cfg.encoder_noise) + sim.cfg.audio_bps as f64;
+        let (stats, point) = sim.step(offered);
+        let d = abr.decide(&sample_for(&cfg, sim.now_ms, target, stats.clone()));
+        target = d.applied_bps;
+        if sim.now_ms >= from && sim.now_ms.is_multiple_of(every) {
+            eprintln!(
+                "{:>6} cap={:>6} tgt={:>6} rtt={:>5} owd={:>5.0} gp={:>6} ceil={:>6} mem={:>6} floor={:>4} {}",
+                sim.now_ms,
+                point.capacity_bps / 1000,
+                target / 1000,
+                stats.rtt_ms,
+                point.one_way_ms,
+                d.srt_capacity_bps / 1000,
+                d.estimated_capacity_bps / 1000,
+                abr.capacity_memory_bps().unwrap_or(0) / 1000,
+                d.rtt_floor_ms,
+                d.control_state
+            );
+            if std::env::var("DEBUG").is_ok() {
+                eprintln!("        {}", abr.debug_state());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn rat_switching_seeds() {
+    for seed in 1..=8 {
+        let (_, m) = run_rat_switching(seed, true);
+        let worst = |f: &dyn Fn(&PhaseMetrics) -> bool, g: &dyn Fn(&PhaseMetrics) -> u64| {
+            m.iter().filter(|p| f(p)).map(g).max().unwrap_or(0)
+        };
+        let is = |from: Rat, to: Rat| {
+            move |p: &PhaseMetrics| p.phase.from == Some(from) && p.phase.rat == to
+        };
+        let adapt = |p: &PhaseMetrics| p.adapt_ms.unwrap_or(99_999);
+        let glitch = |p: &PhaseMetrics| p.glitch_ms;
+        let min_eff = m
+            .iter()
+            .filter(|p| p.phase.end_ms - p.phase.start_ms >= 20_000)
+            .map(|p| p.efficiency)
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "seed {seed}: down adapt {:>4} | 5G->LTE glitch {:>4} | LTE->5G adapt {:>5} | HSPA->LTE {:>5} | HSPA->5G {:>5} | LTE->HSPA glitch {:>5} | 5G->HSPA glitch {:>5} | min eff (long) {:.2} | max rev {}",
+            worst(
+                &|p| p
+                    .phase
+                    .from
+                    .is_some_and(|f| f.mean_bps() > p.phase.rat.mean_bps()),
+                &adapt
+            ),
+            worst(&is(Rat::Nr5g, Rat::Lte), &glitch),
+            worst(&is(Rat::Lte, Rat::Nr5g), &adapt),
+            worst(&is(Rat::HspaPlus, Rat::Lte), &adapt),
+            worst(&is(Rat::HspaPlus, Rat::Nr5g), &adapt),
+            worst(&is(Rat::Lte, Rat::HspaPlus), &glitch),
+            worst(&is(Rat::Nr5g, Rat::HspaPlus), &glitch),
+            min_eff,
+            m.iter().map(|p| p.reversals).max().unwrap_or(0)
+        );
     }
 }

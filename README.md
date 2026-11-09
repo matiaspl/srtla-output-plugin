@@ -297,6 +297,17 @@ specially so that transient events are not learned as the new capacity:
   memory) and ramps. A retry that hits congestion well below its target within
   5 s doubles the wait before the next one, up to 12 s.
 
+- **Path changes.** Switching between 5G, LTE and HSPA+ (or to another
+  cell or satellite) changes both capacity and base RTT. After every stall
+  the base RTT is re-measured (the minimum RTT 0.3–3 s after the stall), and
+  a clearly lower recent RTT minimum is detected at any time. When the base
+  RTT moves by more than 30 % (at least 15 ms) from the path the ceiling was
+  learned on, the ceiling and capacity memory are discarded. On a faster path
+  the pre-stall bitrate is kept and, for 5 s or until the path shows its
+  limit, the ramp rises by 25 % every 250 ms, but to at most 1.5× the rate
+  actually being sent so it cannot outrun the encoder. A slower path needs no
+  special step: congestion cuts within a few hundred milliseconds.
+
 Values applied to OBS are rounded down to 100 kb/s while sub-step changes
 accumulate internally, and the target is always clamped to the configured
 minimum and maximum. Missing or repeated statistics hold the current target
@@ -369,8 +380,20 @@ bottleneck (encoder lag, SRT RTT smoothing, a drop-tail FIFO, retransmission)
 by the engine's unit tests, including time-varying paths: a single cellular
 modem on a moving vehicle (capacity random walk, cell-edge fades, handovers
 that change base RTT), a three-modem bond, a drive past a tower and a LEO
-satellite with 15 s handovers. `cargo test simulation_report -- --nocapture`
-and `cargo test mobility_report -- --nocapture` print the metrics.
+satellite with 15 s handovers, and a 5G ↔ LTE ↔ HSPA+ switching sequence
+(per-technology uplink capacity, base RTT and jitter, handover stalls of
+0.1–1.5 s, a fixed-size modem buffer, step-downs, step-ups, direct 5G ↔
+HSPA+ jumps and a 5 s 5G/LTE ping-pong) run with video shedding across
+several random seeds. `cargo test simulation_report -- --nocapture`,
+`cargo test mobility_report -- --nocapture` and
+`cargo test rat_switching_report -- --nocapture` print the metrics.
+
+In that sequence, step-downs adapt within about 0.4 s and 5G ↔ LTE
+switches cause no late delivery. Step-ups take about 2–3 s (LTE → 5G) and
+3–7 s (from HSPA+). Dropping from 5G or LTE straight to HSPA+ still causes
+1–5 s of late delivery: data already queued in the modem at the faster rate
+drains at HSPA+ speed, and nothing sent afterwards can recall it. Video
+shedding shortens it by draining faster; bonding a second modem avoids it.
 
 On a single fading modem the bitrate can only be as low as the configured
 minimum plus audio; when capacity falls below that, the queue grows and the
