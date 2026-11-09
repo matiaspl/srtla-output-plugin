@@ -1569,17 +1569,18 @@ fn queue_experiment_report() {
     for (modem_name, modem) in [("256 KB", 256.0 * 1024.0), ("1 MB", 1024.0 * 1024.0)] {
         eprintln!("== modem buffer {modem_name}");
         eprintln!(
-            "{:<26} {:<26} {:>9} {:>8} {:>8} {:>10}",
-            "scenario", "host queue", "glitch", "on-time", "video", "abandoned"
+            "{:<26} {:<26} {:>9} {:>8} {:>8} {:>8} {:>10}",
+            "scenario", "host queue", "glitch", "on-time", "video", "late", "abandoned"
         );
         for (name, cfg, duration) in queue_experiment_scenarios() {
             for (host_name, host) in HOST_QUEUES {
                 let (stats, video) = run_queue_experiment(&cfg, duration, host, modem);
                 eprintln!(
-                    "{name:<26} {host_name:<26} {:>6} ms {:>7.2}% {:>5.2} Mb {:>7.0} KB",
+                    "{name:<26} {host_name:<26} {:>6} ms {:>7.2}% {:>5.2} Mb {:>5.0} KB {:>7.0} KB",
                     stats.glitch_ms,
                     stats.on_time_fraction * 100.0,
                     video / 1e6,
+                    stats.late_bytes / 1024.0,
                     stats.abandoned_bytes / 1024.0
                 );
             }
