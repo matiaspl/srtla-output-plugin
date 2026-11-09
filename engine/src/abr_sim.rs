@@ -33,6 +33,16 @@ pub struct SimConfig {
     pub encoder_noise: f64,
     pub min_bps: u64,
     pub max_bps: u64,
+    /// Two-stage queue model (opt-in): the sending host's queue (socket send
+    /// buffer, interface queue) holds at most this many bytes and feeds the
+    /// modem; when the modem buffer is full it back-pressures the host, and
+    /// only a full host queue drops (newest first). Lost packets are
+    /// retransmitted about one RTT later with their original timestamp, and
+    /// given up once older than the latency, as SRT does. `None` keeps the
+    /// single drop-tail bottleneck used by the other scenarios.
+    pub host_queue_bytes: Option<f64>,
+    /// Modem buffer for the two-stage model, in bytes.
+    pub modem_buffer_bytes: f64,
 }
 
 impl Default for SimConfig {
@@ -50,8 +60,44 @@ impl Default for SimConfig {
             encoder_noise: 0.15,
             min_bps: 500_000,
             max_bps: 20_000_000,
+            host_queue_bytes: None,
+            modem_buffer_bytes: 256.0 * 1024.0,
         }
     }
+}
+
+/// Media in flight in the two-stage model.
+#[derive(Clone, Copy, Debug)]
+struct Chunk {
+    /// When the media was first sent (retransmissions keep it).
+    media_ms: u64,
+    /// When this copy entered the host queue.
+    enqueued_ms: u64,
+    bytes: f64,
+}
+
+#[derive(Default)]
+struct TwoStage {
+    host: std::collections::VecDeque<Chunk>,
+    host_bytes: f64,
+    modem: std::collections::VecDeque<Chunk>,
+    modem_bytes: f64,
+    retransmit: std::collections::VecDeque<(u64, Chunk)>,
+    /// 100 ms slices of media (by send time) that arrived late or never.
+    bad_slices: std::collections::BTreeSet<u64>,
+    produced_bytes: f64,
+    on_time_bytes: f64,
+    late_bytes: f64,
+    abandoned_bytes: f64,
+}
+
+/// Delivery quality of the two-stage model over a window of media time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeliveryStats {
+    pub glitch_ms: u64,
+    pub on_time_fraction: f64,
+    pub late_bytes: f64,
+    pub abandoned_bytes: f64,
 }
 
 pub struct Sim {
@@ -69,6 +115,7 @@ pub struct Sim {
     /// the oldest byte, so a stall delays packets by the stall's length
     /// rather than by "bytes / momentary capacity".
     fifo: std::collections::VecDeque<(u64, f64)>,
+    two_stage: TwoStage,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -98,7 +145,197 @@ impl Sim {
             rng: 0x2545_f491_4f6c_dd1d,
             served_ticks: std::collections::VecDeque::new(),
             fifo: std::collections::VecDeque::new(),
+            two_stage: TwoStage::default(),
         }
+    }
+
+    /// Late or lost media in the two-stage model, for media sent in
+    /// [from_ms, to_ms).
+    pub fn delivery_stats(&self, from_ms: u64, to_ms: u64) -> DeliveryStats {
+        let t = &self.two_stage;
+        let slices = t
+            .bad_slices
+            .range(from_ms / 100..to_ms.div_ceil(100))
+            .count() as u64;
+        let delivered = t.on_time_bytes + t.late_bytes + t.abandoned_bytes;
+        DeliveryStats {
+            glitch_ms: slices * 100,
+            on_time_fraction: if delivered > 0.0 {
+                t.on_time_bytes / delivered
+            } else {
+                1.0
+            },
+            late_bytes: t.late_bytes,
+            abandoned_bytes: t.abandoned_bytes,
+        }
+    }
+
+    fn step_two_stage(&mut self, offered_bps: f64, host_cap: f64) -> (SrtCapacity, TracePoint) {
+        self.now_ms += TICK_MS;
+        let now = self.now_ms;
+        let dt = TICK_MS as f64 / 1_000.0;
+        let capacity = self.capacity_at(now) as f64;
+        let base_rtt = self.base_rtt_at(now);
+        let latency = u64::from(self.cfg.latency_ms);
+        let modem_cap = self.cfg.modem_buffer_bytes;
+        let srtt = self.srtt;
+        let t = &mut self.two_stage;
+
+        // Retransmissions that are due; SRT gives up on data past the latency.
+        let mut retransmit_bytes = 0.0;
+        while t.retransmit.front().is_some_and(|(due, _)| *due <= now) {
+            let (_, chunk) = t.retransmit.pop_front().expect("front");
+            if now.saturating_sub(chunk.media_ms) > latency {
+                t.abandoned_bytes += chunk.bytes;
+                t.bad_slices.insert(chunk.media_ms / 100);
+            } else {
+                retransmit_bytes += chunk.bytes;
+                t.host_bytes += chunk.bytes;
+                t.host.push_back(Chunk {
+                    enqueued_ms: now,
+                    ..chunk
+                });
+            }
+        }
+        // New media.
+        let unique_bytes = offered_bps.max(0.0) / 8.0 * dt;
+        if unique_bytes > 0.0 {
+            t.produced_bytes += unique_bytes;
+            t.host_bytes += unique_bytes;
+            t.host.push_back(Chunk {
+                media_ms: now,
+                enqueued_ms: now,
+                bytes: unique_bytes,
+            });
+        }
+        // The modem sends what its grant allows.
+        let mut to_serve = capacity / 8.0 * dt;
+        let mut served = 0.0;
+        while to_serve > 0.0 {
+            let Some(front) = t.modem.front_mut() else {
+                break;
+            };
+            let part = front.bytes.min(to_serve);
+            let arrival = now as f64 + base_rtt / 2.0;
+            if arrival - front.media_ms as f64 <= latency as f64 {
+                t.on_time_bytes += part;
+            } else {
+                t.late_bytes += part;
+                t.bad_slices.insert(front.media_ms / 100);
+            }
+            front.bytes -= part;
+            to_serve -= part;
+            served += part;
+            t.modem_bytes -= part;
+            if front.bytes <= 1e-9 {
+                t.modem.pop_front();
+            }
+        }
+        // Host -> modem until the modem is full (USB back-pressure).
+        while t.modem_bytes < modem_cap {
+            let Some(front) = t.host.front_mut() else {
+                break;
+            };
+            let part = front.bytes.min(modem_cap - t.modem_bytes);
+            let mut moved = *front;
+            moved.bytes = part;
+            t.modem.push_back(moved);
+            t.modem_bytes += part;
+            t.host_bytes -= part;
+            front.bytes -= part;
+            if front.bytes <= 1e-9 {
+                t.host.pop_front();
+            }
+        }
+        // A full host queue drops the newest packets; SRT learns of the loss
+        // about one RTT later and resends them.
+        let mut lost = 0.0;
+        while t.host_bytes > host_cap {
+            let Some(back) = t.host.back_mut() else {
+                break;
+            };
+            let part = back.bytes.min(t.host_bytes - host_cap);
+            let mut dropped = *back;
+            dropped.bytes = part;
+            back.bytes -= part;
+            t.host_bytes -= part;
+            lost += part;
+            if back.bytes <= 1e-9 {
+                t.host.pop_back();
+            }
+            let due = now + srtt.max(base_rtt) as u64;
+            t.retransmit.push_back((due, dropped));
+        }
+        t.retransmit.make_contiguous().sort_by_key(|(due, _)| *due);
+
+        let oldest_queued = t
+            .modem
+            .front()
+            .map(|c| c.enqueued_ms)
+            .into_iter()
+            .chain(t.host.front().map(|c| c.enqueued_ms))
+            .min();
+        let queue_ms = oldest_queued.map_or(0.0, |e| (now - e) as f64 + TICK_MS as f64 / 2.0);
+        // SRT's send buffer spans the oldest unacknowledged media, including
+        // data waiting to be resent.
+        let oldest_unacked = t
+            .modem
+            .front()
+            .map(|c| c.media_ms)
+            .into_iter()
+            .chain(t.host.iter().map(|c| c.media_ms))
+            .chain(t.retransmit.iter().map(|(_, c)| c.media_ms))
+            .min();
+        let retransmit_pending: f64 = t.retransmit.iter().map(|(_, c)| c.bytes).sum();
+        let queued = t.host_bytes + t.modem_bytes + retransmit_pending;
+
+        self.served_ticks.push_back(served);
+        let pipe_ticks = ((base_rtt / TICK_MS as f64).round() as usize).max(1);
+        while self.served_ticks.len() > pipe_ticks {
+            self.served_ticks.pop_front();
+        }
+        let noise_amplitude = self
+            .cfg
+            .rtt_noise
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= now)
+            .map_or(self.cfg.rtt_noise_ms, |n| n.1);
+        let noise = self.noise() * noise_amplitude / 2.0;
+        let rtt_true = base_rtt + queue_ms + noise;
+        for _ in 0..2 {
+            self.srtt += (rtt_true - self.srtt) / 8.0;
+        }
+        let pipe_bytes: f64 = self.served_ticks.iter().sum();
+        let flight = (pipe_bytes + queued) / PAYLOAD;
+        let send_buffer_ms =
+            (self.srtt + 10.0).max(oldest_unacked.map_or(0.0, |m| (now - m) as f64 + 10.0));
+        let stats = SrtCapacity {
+            ready: true,
+            sampled_at_ms: now,
+            bandwidth_bps: capacity as u64,
+            send_rate_bps: (((unique_bytes + retransmit_bytes) * 8.0) / dt) as u64,
+            send_buffer_ms: send_buffer_ms as u32,
+            send_buffer_packets: (flight + unique_bytes / PAYLOAD / 2.0) as u32,
+            rtt_ms: self.srtt.max(1.0) as u32,
+            latency_ms: self.cfg.latency_ms,
+            retransmit_permille: 0,
+            dropped_bytes: 0,
+            sent_unique_bytes: unique_bytes as u64,
+            packets_in_flight: flight as u32,
+            sender_loss_packets: (lost / PAYLOAD) as u32,
+        };
+        let trace = TracePoint {
+            t_ms: now,
+            target_bps: 0,
+            encoder_bps: 0.0,
+            capacity_bps: capacity as u64,
+            rtt_ms: self.srtt,
+            queue_ms,
+            lost_bytes: lost,
+            one_way_ms: base_rtt / 2.0 + queue_ms,
+        };
+        (stats, trace)
     }
 
     pub fn capacity_at(&self, t_ms: u64) -> u64 {
@@ -131,6 +368,9 @@ impl Sim {
     /// Advance one tick with `offered_bps` of unique payload entering SRT and
     /// return the stats SRT would report at the end of the tick.
     pub fn step(&mut self, offered_bps: f64) -> (SrtCapacity, TracePoint) {
+        if let Some(host_cap) = self.cfg.host_queue_bytes {
+            return self.step_two_stage(offered_bps, host_cap);
+        }
         self.now_ms += TICK_MS;
         let dt = TICK_MS as f64 / 1_000.0;
         let capacity = self.capacity_at(self.now_ms) as f64;
@@ -1267,5 +1507,82 @@ fn rat_switching_seeds() {
             min_eff,
             m.iter().map(|p| p.reversals).max().unwrap_or(0)
         );
+    }
+}
+
+/// Scenarios for the host-queue experiment, with their durations.
+pub fn queue_experiment_scenarios() -> Vec<(&'static str, SimConfig, u64)> {
+    let mut out = Vec::new();
+    let (cfg, phases) = rat_switching(5, &rat_sequence());
+    out.push((
+        "5G/LTE/HSPA+ switching",
+        cfg,
+        phases.last().map_or(0, |p| p.end_ms),
+    ));
+    for (name, cfg) in mobility_scenarios().into_iter().take(3) {
+        out.push((name, cfg, 180_000));
+    }
+    out.push(("steady 8M", SimConfig::default(), 60_000));
+    out.push((
+        "dip 8->3->8M",
+        SimConfig {
+            capacity: vec![(0, 8_000_000), (20_000, 3_000_000), (35_000, 8_000_000)],
+            ..SimConfig::default()
+        },
+        70_000,
+    ));
+    out
+}
+
+pub fn run_queue_experiment(
+    cfg: &SimConfig,
+    duration_ms: u64,
+    host_queue_bytes: f64,
+    modem_buffer_bytes: f64,
+) -> (DeliveryStats, f64) {
+    let cfg = SimConfig {
+        host_queue_bytes: Some(host_queue_bytes),
+        modem_buffer_bytes,
+        ..cfg.clone()
+    };
+    let mut sim = Sim::new(cfg.clone());
+    let start = 4_000_000;
+    let mut abr = controller_for(&cfg, start);
+    let trace = run_system(&mut abr, &mut sim, start, duration_ms, true);
+    // Skip the first 10 s (start-up), and media too recent to have settled.
+    let stats = sim.delivery_stats(10_000, duration_ms.saturating_sub(3_000));
+    let window: Vec<_> = trace.iter().filter(|p| p.t_ms >= 10_000).collect();
+    let mean_video = window.iter().map(|p| p.encoder_bps).sum::<f64>() / window.len().max(1) as f64;
+    (stats, mean_video)
+}
+
+pub const HOST_QUEUES: [(&str, f64); 4] = [
+    ("1.3 MB (txqueuelen 1000)", 1_000.0 * 1_316.0),
+    ("256 KB", 256.0 * 1024.0),
+    ("120 KB (Linux default)", 120.0 * 1024.0),
+    ("32 KB", 32.0 * 1024.0),
+];
+
+#[test]
+#[ignore]
+fn queue_experiment_report() {
+    for (modem_name, modem) in [("256 KB", 256.0 * 1024.0), ("1 MB", 1024.0 * 1024.0)] {
+        eprintln!("== modem buffer {modem_name}");
+        eprintln!(
+            "{:<26} {:<26} {:>9} {:>8} {:>8} {:>10}",
+            "scenario", "host queue", "glitch", "on-time", "video", "abandoned"
+        );
+        for (name, cfg, duration) in queue_experiment_scenarios() {
+            for (host_name, host) in HOST_QUEUES {
+                let (stats, video) = run_queue_experiment(&cfg, duration, host, modem);
+                eprintln!(
+                    "{name:<26} {host_name:<26} {:>6} ms {:>7.2}% {:>5.2} Mb {:>7.0} KB",
+                    stats.glitch_ms,
+                    stats.on_time_fraction * 100.0,
+                    video / 1e6,
+                    stats.abandoned_bytes / 1024.0
+                );
+            }
+        }
     }
 }
