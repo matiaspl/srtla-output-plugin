@@ -629,6 +629,8 @@ impl Engine {
                 },
                 retransmit_permille: self.srt_stats.retransmit_permille(),
                 dropped_bytes: self.srt_stats.dropped_bytes,
+                sent_unique_bytes: self.srt_stats.sent_unique_bytes,
+                packets_in_flight: self.srt_stats.packets_in_flight,
             },
         });
         self.current_video_bps = decision.applied_bps;
